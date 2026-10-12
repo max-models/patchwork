@@ -28,18 +28,27 @@ class _Cell:
     rhs: float
 
 
-def _parent_patch(hierarchy: AMRHierarchy, patch: Patch) -> Patch:
-    """Find the coarser patch containing ``patch``."""
+def _parents(
+    hierarchy: AMRHierarchy, patch: Patch
+) -> list[tuple[Patch, tuple[tuple[int, int], tuple[int, int]]]]:
+    """The coarser patches under ``patch``, each with the cells of it they share.
+
+    The shared cells are a half-open box on the coarser level. A patch lies
+    within the patches of the level below, over one of them or several.
+    """
     ratio = hierarchy.refinement_ratio
+    coarse = tuple((lo // ratio, hi // ratio) for lo, hi in patch.box)
+    parents = []
     for parent in hierarchy.patches_at_level(patch.level - 1):
-        if all(
-            parent_lo * ratio <= child_lo and child_hi <= parent_hi * ratio
-            for (parent_lo, parent_hi), (child_lo, child_hi) in zip(
-                parent.box, patch.box, strict=True
-            )
-        ):
-            return parent
-    raise ValueError(f"patch at level {patch.level} has no parent")
+        shared = tuple(
+            (max(lo, p_lo), min(hi, p_hi))
+            for (lo, hi), (p_lo, p_hi) in zip(coarse, parent.box, strict=True)
+        )
+        if all(hi > lo for lo, hi in shared):
+            parents.append((parent, shared))
+    if not parents:
+        raise ValueError(f"patch at level {patch.level} has no parent")
+    return parents
 
 
 def solve_poisson(
@@ -54,8 +63,10 @@ def solve_poisson(
     This uses a cell-centered, conservative finite-volume operator. Coarse cells
     fully covered by a finer patch are omitted from the linear system; fluxes
     across coarse-fine faces use the exact overlap length and center distance.
-    The homogeneous or constant Dirichlet value is applied on all four domain
-    boundaries. The solve is replicated on each communicator rank after
+    The homogeneous or constant Dirichlet value is applied on the whole
+    boundary of the domain: the faces of its rectangle and, where the domain
+    does not fill it (``AMRHierarchy(base_boxes=...)``), the edges inside.
+    The solve is replicated on each communicator rank after
     collectively gathering the patch right-hand sides, which keeps this initial
     implementation simple and useful for serial and one-rank runs.
 
@@ -74,14 +85,10 @@ def solve_poisson(
     for child in patches:
         if child.level == 0:
             continue
-        parent = _parent_patch(hierarchy, child)
-        ratio = hierarchy.refinement_ratio
-        (i0, i1), (j0, j1) = child.box
-        covered[id(parent)].update(
-            (i, j)
-            for i in range(i0 // ratio, i1 // ratio)
-            for j in range(j0 // ratio, j1 // ratio)
-        )
+        for parent, ((i0, i1), (j0, j1)) in _parents(hierarchy, child):
+            covered[id(parent)].update(
+                (i, j) for i in range(i0, i1) for j in range(j0, j1)
+            )
 
     finest_scale = hierarchy.refinement_ratio**hierarchy.max_level
     dx0, dy0 = hierarchy.spacing(0)
@@ -121,6 +128,8 @@ def solve_poisson(
         positive[(1, y1)].append((index, x0, x1))
 
     diagonal = np.zeros(len(cells), dtype=float)
+    # how much of each cell's faces, [cell, axis, side], meets another cell
+    matched = np.zeros((len(cells), 2, 2), dtype=np.int64)
     rows: list[int] = []
     columns: list[int] = []
     entries: list[float] = []
@@ -140,6 +149,8 @@ def solve_poisson(
         conductance = face_length / distance
         diagonal[ia] += conductance
         diagonal[ib] += conductance
+        matched[ia, axis, 1] += face_ticks
+        matched[ib, axis, 0] += face_ticks
         rows.extend((ia, ib))
         columns.extend((ib, ia))
         entries.extend((-conductance, -conductance))
@@ -150,26 +161,22 @@ def solve_poisson(
             for low in low_faces:
                 connect(high, low, axis)
 
+    # What is left of a face is on the boundary of the domain: a face of the
+    # rectangle, or an edge inside it where the domain does not fill it.
     boundary_rhs = float(boundary_value)
+    base_spacing = (dx0, dy0)
     for index, cell in enumerate(cells):
-        (x0, y0), (x1, y1) = cell.lower, cell.upper
-        dx, dy = cell.spacing
-        if x0 == 0:
-            conductance = dy / (0.5 * dx)
-            diagonal[index] += conductance
-            b[index] += conductance * boundary_rhs
-        if x1 == finest_scale * hierarchy.base_shape[0]:
-            conductance = dy / (0.5 * dx)
-            diagonal[index] += conductance
-            b[index] += conductance * boundary_rhs
-        if y0 == 0:
-            conductance = dx / (0.5 * dy)
-            diagonal[index] += conductance
-            b[index] += conductance * boundary_rhs
-        if y1 == finest_scale * hierarchy.base_shape[1]:
-            conductance = dx / (0.5 * dy)
-            diagonal[index] += conductance
-            b[index] += conductance * boundary_rhs
+        for axis in range(2):
+            other = 1 - axis
+            ticks = cell.upper[other] - cell.lower[other]
+            for side in range(2):
+                free = ticks - matched[index, axis, side]
+                if free <= 0:
+                    continue
+                face_length = free / finest_scale * base_spacing[other]
+                conductance = face_length / (0.5 * cell.spacing[axis])
+                diagonal[index] += conductance
+                b[index] += conductance * boundary_rhs
 
     rows.extend(range(len(cells)))
     columns.extend(range(len(cells)))
@@ -187,22 +194,18 @@ def solve_poisson(
     ratio = hierarchy.refinement_ratio
     for level in range(hierarchy.max_level, 0, -1):
         for child in hierarchy.patches_at_level(level):
-            parent = _parent_patch(hierarchy, child)
-            (i0, i1), (j0, j1) = child.box
             child_values = values_by_patch[id(child)]
-            parent_values = values_by_patch[id(parent)]
-            reshaped = child_values.reshape(
+            restricted = child_values.reshape(
                 (child.shape[0] // ratio, ratio, child.shape[1] // ratio, ratio)
-            )
-            restricted = reshaped.mean(axis=(1, 3))
-            pi0, _ = i0 // ratio, i1 // ratio
-            pj0, _ = j0 // ratio, j1 // ratio
-            parent_box_i0 = parent.box[0][0]
-            parent_box_j0 = parent.box[1][0]
-            parent_values[
-                pi0 - parent_box_i0 : pi0 - parent_box_i0 + restricted.shape[0],
-                pj0 - parent_box_j0 : pj0 - parent_box_j0 + restricted.shape[1],
-            ] = restricted
+            ).mean(axis=(1, 3))
+            first = (child.box[0][0] // ratio, child.box[1][0] // ratio)
+            for parent, ((i0, i1), (j0, j1)) in _parents(hierarchy, child):
+                (p0, _), (q0, _) = parent.box
+                values_by_patch[id(parent)][i0 - p0 : i1 - p0, j0 - q0 : j1 - q0] = (
+                    restricted[
+                        i0 - first[0] : i1 - first[0], j0 - first[1] : j1 - first[1]
+                    ]
+                )
 
     for patch in patches:
         array = patch.field(potential)

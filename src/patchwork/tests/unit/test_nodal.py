@@ -350,3 +350,169 @@ def test_a_potential_known_only_up_to_a_constant_is_refused() -> None:
         NodalPoisson(mesh, faces={"x_lower": Dirichlet(0.0)})
     with pytest.raises(ValueError, match="unknown faces"):
         NodalPoisson(AMRHierarchy(base_shape=(4, 4)), faces={"left": Dirichlet(0.0)})
+
+
+# Domains that do not fill their rectangle ------------------------------------#
+
+
+def _ell(base: int = 16, levels: int = 0, **kwargs) -> AMRHierarchy:
+    """The square [-1, 1]^2 without its lower-right quadrant, patches at the corner."""
+    half = base // 2
+    mesh = AMRHierarchy(
+        base_shape=(base, base),
+        bounds=((-1.0, 1.0), (-1.0, 1.0)),
+        base_boxes=[((0, half), (0, base)), ((half, base), (half, base))],
+        **kwargs,
+    )
+    for level in range(1, levels + 1):
+        centre = base * 2**level // 2
+        width = base // 4
+        # two boxes around the corner: a patch is a rectangle inside the domain
+        mesh.add_patch(
+            level=level,
+            box=((centre - width, centre), (centre - width, centre + width)),
+        )
+        mesh.add_patch(
+            level=level, box=((centre, centre + width), (centre, centre + width))
+        )
+    return mesh
+
+
+def _corner_solution(x, y):
+    """Harmonic on the L and zero on its two inner edges; singular at the corner."""
+    theta = np.arctan2(y, x) % (2.0 * np.pi)
+    return np.hypot(x, y) ** (2.0 / 3.0) * np.sin(2.0 * theta / 3.0)
+
+
+def test_a_domain_of_several_boxes_has_a_boundary_inside_its_rectangle() -> None:
+    nodes = CompositeNodes(_ell(16))
+
+    # three quarters of the 16 x 16 cells, and the nodes on and around them
+    assert nodes.cell_span.size == 192
+    assert nodes.num_nodes == 17 * 17 - 8 * 8
+    inner = nodes.face_nodes("inner")
+    x, y = nodes.coordinates[inner].T
+    assert inner.size == 17
+    assert np.all(((x == 0.0) & (y <= 0.0)) | ((y == 0.0) & (x >= 0.0)))
+    assert nodes.face_measure("inner").sum() == pytest.approx(2.0)
+    # the faces of the rectangle are as long as the domain reaches them
+    lengths = {face: nodes.face_measure(face).sum() for face in FACES}
+    assert lengths == pytest.approx(
+        {"x_lower": 2.0, "x_upper": 1.0, "y_lower": 1.0, "y_upper": 2.0}
+    )
+    # a rectangle has no boundary inside
+    assert CompositeNodes(_mesh("nested")).face_nodes("inner").size == 0
+
+
+@pytest.mark.parametrize("levels", [0, 2])
+def test_an_l_shaped_domain_solves_as_a_square_with_a_body_in_its_corner(
+    levels: int,
+) -> None:
+    """Grounded inner edges: the same potential as with a grounded body there."""
+    faces = {face: Dirichlet(_corner_solution) for face in FACES}
+    ell = NodalPoisson(_ell(32, levels), faces=faces)
+    square = AMRHierarchy(base_shape=(32, 32), bounds=((-1.0, 1.0), (-1.0, 1.0)))
+    for level in range(1, levels + 1):
+        centre = 32 * 2**level // 2
+        square.add_patch(
+            level=level, box=((centre - 8, centre + 8), (centre - 8, centre + 8))
+        )
+    body = EmbeddedDirichlet(inside=lambda p: (p[0] >= 0.0) & (p[1] <= 0.0), value=0.0)
+    embedded = NodalPoisson(square, faces=faces, embedded=[body])
+
+    potentials = []
+    for solver in (ell, embedded):
+        potential = solver.solve(np.zeros(solver.nodes.num_nodes))
+        potentials.append(
+            dict(zip(map(tuple, solver.nodes.lattice.tolist()), potential, strict=True))
+        )
+    assert ell.free.size == embedded.free.size
+    assert ell.nodes.num_nodes < embedded.nodes.num_nodes
+    for point, value in potentials[0].items():
+        assert value == pytest.approx(potentials[1][point], abs=1e-12)
+
+
+def test_patches_at_the_corner_of_an_l_resolve_its_singularity() -> None:
+    faces = {face: Dirichlet(_corner_solution) for face in FACES}
+
+    def error(levels: int) -> tuple[float, int]:
+        solver = NodalPoisson(_ell(32, levels), faces=faces)
+        nodes = solver.nodes
+        x, y = nodes.coordinates.T
+        potential = solver.solve(np.zeros(nodes.num_nodes))
+        base = np.all(nodes.lattice % nodes.cell_span.max() == 0, axis=1)
+        return float(
+            np.abs(potential - _corner_solution(x, y))[base].max()
+        ), solver.free.size
+
+    coarse, coarse_unknowns = error(0)
+    refined, refined_unknowns = error(4)
+
+    assert refined < 0.1 * coarse
+    assert refined_unknowns < 2 * coarse_unknowns
+
+
+def test_no_flux_through_the_inner_edges_converges_at_second_order() -> None:
+    def exact(x, y):
+        return np.cos(np.pi * x) * np.cos(np.pi * y)  # flat across x = 0 and y = 0
+
+    faces = {**{face: Dirichlet(exact) for face in FACES}, "inner": Neumann(0.0)}
+    errors = []
+    for base in (16, 32, 64):
+        solver = NodalPoisson(_ell(base, 1), faces=faces)
+        x, y = solver.nodes.coordinates.T
+        potential = solver.solve(2.0 * np.pi**2 * exact(x, y))
+        errors.append(np.abs(potential - exact(x, y)).max())
+        # the inner edges are free: their nodes are unknowns
+        assert not solver.fixed[solver.nodes.face_nodes("inner")][1:-1].any()
+
+    assert errors[0] / errors[1] > 3.5 and errors[1] / errors[2] > 3.5
+
+
+@pytest.mark.parametrize("levels", [0, 2])
+def test_a_prescribed_flux_through_the_inner_edges_is_exact_for_a_linear_potential(
+    levels: int,
+) -> None:
+    def exact(x, y):
+        return 1.0 + x + 2.0 * y
+
+    def outward_derivative(x, y):
+        # out of the domain: +x on the edge x = 0, -y on the edge y = 0
+        return np.where(np.abs(x) < 1e-12, 1.0, -2.0)
+
+    solver = NodalPoisson(
+        _ell(16, levels),
+        faces={
+            **{face: Dirichlet(exact) for face in FACES},
+            "inner": Neumann(outward_derivative),
+        },
+    )
+    x, y = solver.nodes.coordinates.T
+
+    assert solver.solve(np.zeros(solver.nodes.num_nodes)) == pytest.approx(
+        exact(x, y), abs=1e-12
+    )
+
+
+def test_fields_outside_the_domain_are_zero_on_a_uniform_lattice() -> None:
+    mesh = _ell(8, 1)
+    nodes = CompositeNodes(mesh)
+    x, y = nodes.coordinates.T
+    values = 3.0 + x - 2.0 * y
+
+    lattice = (nodes.to_level(0) @ values).reshape(9, 9)
+    grid_x, grid_y = np.meshgrid(
+        np.linspace(-1, 1, 9), np.linspace(-1, 1, 9), indexing="ij"
+    )
+    outside = (grid_x > 0.0) & (grid_y < 0.0)
+    assert np.all(lattice[outside] == 0.0)
+    # on the domain and its edges, the corner included: the interpolant
+    assert lattice[~outside] == pytest.approx((3.0 + grid_x - 2.0 * grid_y)[~outside])
+    sampled = nodes.sample_patches(
+        [np.ones(patch.node_shape) for patch in mesh.patches], level=1
+    )
+    fine_x, fine_y = np.meshgrid(
+        np.linspace(-1, 1, 17), np.linspace(-1, 1, 17), indexing="ij"
+    )
+    assert np.all(sampled[(fine_x > 0.0) & (fine_y < 0.0)] == 0.0)
+    assert np.all(sampled[(fine_x <= 0.0) | (fine_y >= 0.0)] == 1.0)

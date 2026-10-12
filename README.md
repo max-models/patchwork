@@ -77,13 +77,32 @@ potential is continuous across patch boundaries.
 ![Potential around a small electrode, resolved by two nested
 patches](docs/public/figures/nodal_electrode.png)
 
+## Domains that are not rectangles
+
+The base level can be several boxes of cells. Their union is the domain,
+and the edges inside the bounding rectangle are a boundary of their own,
+`"inner"`:
+
+``` python
+mesh = AMRHierarchy(
+    base_shape=(32, 32),
+    bounds=((-1.0, 1.0), (-1.0, 1.0)),
+    base_boxes=[((0, 16), (0, 32)), ((16, 32), (16, 32))],  # an L
+)
+solver = NodalPoisson(mesh, faces={"x_upper": Dirichlet(1.0), "inner": Neumann(0.0)})
+```
+
+![Potential on an L-shaped domain with nested patches at its inner
+corner](docs/public/figures/l_shaped_domain.png)
+
 Patch boxes use half-open integer cell bounds on their own refinement
 level. The default refinement ratio is two. For runnable layouts and a
 manufactured composite solve, see
 [`examples/two_level_mesh.py`](examples/two_level_mesh.py),
 [`examples/nested_patches.py`](examples/nested_patches.py),
-[`examples/composite_poisson.py`](examples/composite_poisson.py), and
-[`examples/nodal_electrode.py`](examples/nodal_electrode.py).
+[`examples/composite_poisson.py`](examples/composite_poisson.py),
+[`examples/nodal_electrode.py`](examples/nodal_electrode.py), and
+[`examples/l_shaped_domain.py`](examples/l_shaped_domain.py).
 
 ## Install
 

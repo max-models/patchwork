@@ -29,8 +29,13 @@ import scipy.sparse.linalg
 if TYPE_CHECKING:
     from patchwork.mesh import AMRHierarchy, Patch
 
-#: The faces of the domain, as ``(axis, side)`` with side 0 the lower one.
+#: The faces of the domain's bounding rectangle, as ``(axis, side)`` with side 0
+#: the lower one.
 FACES = {"x_lower": (0, 0), "x_upper": (0, 1), "y_lower": (1, 0), "y_upper": (1, 1)}
+
+#: The rest of the boundary of a domain that does not fill its rectangle
+#: (``AMRHierarchy(base_boxes=...)``): the edges inside the rectangle.
+INNER = "inner"
 
 Value = float | Callable[[np.ndarray, np.ndarray], Any]
 
@@ -46,7 +51,8 @@ class Dirichlet:
 class Neumann:
     """A prescribed outward normal derivative on a domain face.
 
-    ``gradient`` is a number or ``gradient(x, y)``; zero is the natural condition.
+    ``gradient`` is a number or ``gradient(x, y)``, evaluated at the middle of
+    every cell edge on the face; zero is the natural condition.
     """
 
     gradient: Value = 0.0
@@ -115,12 +121,14 @@ class CompositeNodes:
         for patch in hierarchy.patches:
             span = ratio ** (finest - patch.level)
             (i0, _), (j0, _) = patch.box
+            (_, i1), (_, j1) = patch.box
             covered = np.zeros(patch.shape, dtype=bool)
-            for child in self._children(patch):
+            for child in hierarchy.patches_at_level(patch.level + 1):
+                # a finer patch may lie over several patches of this level
                 (c0, c1), (d0, d1) = child.box
                 covered[
-                    c0 // ratio - i0 : c1 // ratio - i0,
-                    d0 // ratio - j0 : d1 // ratio - j0,
+                    max(c0 // ratio, i0) - i0 : max(min(c1 // ratio, i1) - i0, 0),
+                    max(d0 // ratio, j0) - j0 : max(min(d1 // ratio, j1) - j0, 0),
                 ] = True
             i, j = np.nonzero(~covered)
             lowers.append(np.column_stack(((i + i0) * span, (j + j0) * span)))
@@ -150,20 +158,10 @@ class CompositeNodes:
         )
         self._find_hanging_nodes()
         self._leaf_map: np.ndarray | None = None
+        self._outside: dict[int, np.ndarray | None] = {}
+        self._find_boundary()
 
     # Construction -------------------------------------------------------------#
-    def _children(self, patch: Patch) -> list[Patch]:
-        """The patches one level finer that lie inside ``patch``."""
-        ratio = self.hierarchy.refinement_ratio
-        return [
-            child
-            for child in self.hierarchy.patches_at_level(patch.level + 1)
-            if all(
-                lo * ratio <= c_lo and c_hi <= hi * ratio
-                for (lo, hi), (c_lo, c_hi) in zip(patch.box, child.box, strict=True)
-            )
-        ]
-
     def _key(self, i: np.ndarray, j: np.ndarray) -> np.ndarray:
         """One integer per finest-lattice point, the same for periodic images."""
         i = np.asarray(i, dtype=np.int64)
@@ -272,32 +270,74 @@ class CompositeNodes:
             values[self.patch_nodes(patch)] = patch.field(name).to_numpy()
         return values
 
-    # Domain faces --------------------------------------------------------------#
+    # The boundary ----------------------------------------------------------------#
+    def _find_boundary(self) -> None:
+        """Find the cell edges on the boundary of the domain and name their face.
+
+        An edge of a leaf cell is on the boundary if there is no cell beyond
+        it: on a face of the bounding rectangle (``"x_lower"``, ...), or inside
+        the rectangle where the domain does not fill it (``"inner"``).
+        """
+        leaf = self._leaf_cells()
+        edges = {face: ([], [], [], []) for face in (*FACES, INNER)}
+        # the corners of the edge on each side of a cell: lower-left first
+        corners = {(0, 0): (0, 2), (0, 1): (1, 3), (1, 0): (0, 1), (1, 1): (2, 3)}
+        centre = self.cell_lower + 0.5 * self.cell_span[:, None]
+        for face, (axis, side) in FACES.items():
+            other = 1 - axis
+            beyond = self.cell_lower[:, axis] + (self.cell_span if side else -1)
+            at_rectangle = (beyond < 0) | (beyond >= self._cells[axis])
+            if self._periodic[axis]:
+                beyond = beyond % self._cells[axis]
+                at_rectangle[:] = False
+            index = [None, None]
+            index[axis] = np.clip(beyond, 0, self._cells[axis] - 1)
+            index[other] = self.cell_lower[:, other]
+            outside = at_rectangle | (leaf[index[0], index[1]] < 0)
+            midpoint = centre.copy()
+            midpoint[:, axis] += (0.5 if side else -0.5) * self.cell_span
+            first, second = corners[axis, side]
+            for name, cells in (
+                (face, np.nonzero(outside & at_rectangle)[0]),
+                (INNER, np.nonzero(outside & ~at_rectangle)[0]),
+            ):
+                edges[name][0].append(self.cell_corners[cells, first])
+                edges[name][1].append(self.cell_corners[cells, second])
+                edges[name][2].append(self.cell_size[cells, other])
+                edges[name][3].append(self._origin + midpoint[cells] * self._spacing)
+        self._boundary = {
+            face: (
+                np.concatenate(first),
+                np.concatenate(second),
+                np.concatenate(length),
+                np.concatenate(midpoint),
+            )
+            for face, (first, second, length, midpoint) in edges.items()
+        }
+
+    def face_edges(
+        self, face: str
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """The cell edges on a part of the boundary.
+
+        ``face`` is a face of the bounding rectangle (``"x_lower"``, ...) or
+        ``"inner"``. Returns the two end nodes of every edge, its length and its
+        midpoint ``(k, 2)``.
+        """
+        return self._boundary[face]
+
     def face_nodes(self, face: str) -> np.ndarray:
-        """Node numbers of the nodes on a domain face (``"x_lower"``, ...)."""
-        axis, side = FACES[face]
-        if self._periodic[axis]:
-            return np.zeros(0, dtype=np.int64)
-        position = self._cells[axis] if side else 0
-        return np.nonzero(self.lattice[:, axis] == position)[0]
+        """Node numbers of the nodes on a part of the boundary (see :meth:`face_edges`)."""
+        first, second, _, _ = self._boundary[face]
+        return np.unique(np.concatenate((first, second)))
 
     def face_measure(self, face: str) -> np.ndarray:
-        """Length of the face that belongs to every node: zero away from it."""
-        axis, side = FACES[face]
+        """Length of a part of the boundary that belongs to every node: zero away from it."""
+        first, second, length, _ = self._boundary[face]
         measure = np.zeros(self.num_nodes)
-        if self._periodic[axis]:
-            return measure
-        other = 1 - axis
-        edge = self.cell_lower[:, axis] + (self.cell_span if side else 0)
-        cells = np.nonzero(edge == (self._cells[axis] if side else 0))[0]
-        # the two corners of each cell on the face share its edge
-        pairs = {(0, 0): (0, 2), (0, 1): (1, 3), (1, 0): (0, 1), (1, 1): (2, 3)}
-        for corner in pairs[axis, side]:
-            np.add.at(
-                measure,
-                self.cell_corners[cells, corner],
-                0.5 * self.cell_size[cells, other],
-            )
+        # the two ends of an edge share it
+        np.add.at(measure, first, 0.5 * length)
+        np.add.at(measure, second, 0.5 * length)
         return measure
 
     # Interpolation ---------------------------------------------------------------#
@@ -377,7 +417,8 @@ class CompositeNodes:
 
         Each point takes the bilinear interpolant of the leaf cell it is in.
         Apply it to node values that have their hanging nodes filled (as
-        :meth:`NodalPoisson.solve` returns them).
+        :meth:`NodalPoisson.solve` returns them). A point outside the domain
+        gets an empty row: the value zero.
         """
         points = np.asarray(points, dtype=float)
         position = (points - self._origin[:, None]) / self._spacing[:, None]
@@ -392,7 +433,23 @@ class CompositeNodes:
                 wrapped = position[axis]
             cell.append(index)
             local.append(wrapped)
-        leaf = self._leaf_cells()[cell[0], cell[1]]
+        leaf_map = self._leaf_cells()
+        leaf = leaf_map[cell[0], cell[1]]
+        # a point on a lattice line may have its cell on the lower side only
+        # (the edge of a domain that does not fill its rectangle)
+        on_line = [local[axis] == np.floor(local[axis]) for axis in (0, 1)]
+        for step in ((1, 0), (0, 1), (1, 1)):
+            missing = leaf < 0
+            for axis in (0, 1):
+                if step[axis]:
+                    missing &= on_line[axis] & (cell[axis] > 0)
+            if not missing.any():
+                continue
+            leaf[missing] = leaf_map[
+                cell[0][missing] - step[0], cell[1][missing] - step[1]
+            ]
+        inside = leaf >= 0
+        leaf = np.where(inside, leaf, 0)
         span = self.cell_span[leaf]
         fraction = [
             (local[axis] - self.cell_lower[leaf, axis]) / span for axis in (0, 1)
@@ -405,6 +462,7 @@ class CompositeNodes:
                 for a in (0, 1)
             ]
         )
+        weights[~inside] = 0.0  # outside the domain: no value
         rows = np.repeat(np.arange(points.shape[1]), 4)
         matrix = sparse.coo_matrix(
             (weights.reshape(-1), (rows, self.cell_corners[leaf].reshape(-1))),
@@ -442,7 +500,8 @@ class CompositeNodes:
         of the lattice of ``level`` (the finest by default) takes its value from
         the finest patch whose nodes surround it, a patch's own boundary nodes
         included: by bilinear interpolation between the nodes of a coarser
-        patch, and directly from the coinciding node of a finer one.
+        patch, and directly from the coinciding node of a finer one. Nodes
+        outside a domain that does not fill its rectangle are zero.
 
         Returns an array of :meth:`level_shape` plus the further axes, ``out``
         if given.
@@ -477,7 +536,8 @@ class CompositeNodes:
         """:meth:`sample_patches` of one value per node."""
         ratio = self.hierarchy.refinement_ratio
         patches = self.hierarchy.patches
-        current = np.empty(self.level_shape(0), dtype=arrays[0].dtype)
+        # zero where the domain does not fill its rectangle
+        current = np.zeros(self.level_shape(0), dtype=arrays[0].dtype)
         for depth in range(level + 1):
             if depth:
                 for axis in range(2):
@@ -505,7 +565,42 @@ class CompositeNodes:
                 where.append(slice(start, stop))
                 source.append(slice(first, first + (stop - start) * stride, stride))
             current[tuple(where)] = array[tuple(source)]
+        outside = self._nodes_outside(level)
+        if outside is not None:
+            current[outside] = 0
         return current
+
+    def _nodes_outside(self, level: int) -> np.ndarray | None:
+        """The nodes of a level's lattice outside the domain; None if there are none."""
+        if level not in self._outside:
+            hierarchy = self.hierarchy
+            scale = hierarchy.refinement_ratio**level
+            cells = np.zeros(hierarchy.level_shape(level), dtype=bool)
+            for patch in hierarchy.patches_at_level(0):
+                (i0, i1), (j0, j1) = patch.box
+                cells[i0 * scale : i1 * scale, j0 * scale : j1 * scale] = True
+            if cells.all():
+                self._outside[level] = None
+            else:
+                # a node is in the domain if one of the cells around it is
+                around = cells
+                for axis in range(2):
+                    width = [(0, 0), (0, 0)]
+                    width[axis] = (1, 1)
+                    around = np.pad(
+                        around,
+                        width,
+                        mode="wrap" if self._periodic[axis] else "constant",
+                    )
+                inside = (
+                    around[:-1, :-1]
+                    | around[1:, :-1]
+                    | around[:-1, 1:]
+                    | around[1:, 1:]
+                )
+                shape = self.level_shape(level)
+                self._outside[level] = ~inside[: shape[0], : shape[1]]
+        return self._outside[level]
 
     def _refine(self, array: np.ndarray, axis: int, ratio: int) -> np.ndarray:
         """Linear interpolation of a lattice to ``ratio`` times as many cells on one axis."""
@@ -549,9 +644,11 @@ class NodalPoisson:
     triangular solves. ``faces`` maps ``"x_lower"``, ``"x_upper"``,
     ``"y_lower"``, ``"y_upper"`` to a :class:`Dirichlet` or :class:`Neumann`
     condition; a face that is not listed is a grounded Dirichlet face, and the
-    faces of a periodic axis take none. ``embedded`` are bodies at fixed
-    potentials (:class:`EmbeddedDirichlet`); where they overlap the last one
-    listed wins.
+    faces of a periodic axis take none. On a domain that does not fill its
+    rectangle (``AMRHierarchy(base_boxes=...)``) these are the parts of its
+    boundary on the rectangle's faces, and ``"inner"`` is the rest: the edges
+    inside the rectangle. ``embedded`` are bodies at fixed potentials
+    (:class:`EmbeddedDirichlet`); where they overlap the last one listed wins.
 
     Attributes:
         nodes: The :class:`CompositeNodes` of the hierarchy.
@@ -577,9 +674,11 @@ class NodalPoisson:
         self.nodes = CompositeNodes(hierarchy) if nodes is None else nodes
         self._embedded = tuple(embedded)
         self._min_fraction = float(min_fraction)
-        unknown = set(faces or ()) - set(FACES)
+        unknown = set(faces or ()) - set(FACES) - {INNER}
         if unknown:
-            raise ValueError(f"unknown faces {sorted(unknown)}; expected {list(FACES)}")
+            raise ValueError(
+                f"unknown faces {sorted(unknown)}; expected {[*FACES, INNER]}"
+            )
         self._faces: dict[str, Dirichlet | Neumann] = {}
         for face, (axis, _) in FACES.items():
             if hierarchy.periodic[axis]:
@@ -589,6 +688,8 @@ class NodalPoisson:
                     )
                 continue
             self._faces[face] = (faces or {}).get(face, Dirichlet(0.0))
+        # after the faces of the rectangle, which decide the nodes they share
+        self._faces[INNER] = (faces or {}).get(INNER, Dirichlet(0.0))
         self._assemble()
         self._update_values()
 
@@ -838,11 +939,15 @@ class NodalPoisson:
                 values[on_face] = _evaluate(condition.value, x[on_face], y[on_face])
                 decided[on_face] = True
             else:
-                measure = nodes.face_measure(face)
-                on_face = np.nonzero(measure)[0]
-                flux[on_face] += measure[on_face] * _evaluate(
-                    condition.gradient, x[on_face], y[on_face]
+                # the gradient at the middle of every boundary edge, shared by its ends
+                first, second, length, midpoint = nodes.face_edges(face)
+                through = (
+                    0.5
+                    * length
+                    * _evaluate(condition.gradient, midpoint[:, 0], midpoint[:, 1])
                 )
+                np.add.at(flux, first, through)
+                np.add.at(flux, second, through)
         body_values = np.array([body.value for body in self._embedded] or [0.0])
         solid = self._owner >= 0
         values[solid] = body_values[self._owner[solid]]

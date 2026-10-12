@@ -20,9 +20,18 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   patches, interpolation from and to a level's uniform lattice (`from_level`, `to_level`,
   `evaluation`) and `sample_patches` for patch-wise fields such as a gradient.
 - `examples/nodal_electrode.py`.
+- Domains that are not rectangles: `AMRHierarchy(base_boxes=...)` makes the base level a union
+  of boxes (an L, a T, a notch). The edges inside the bounding rectangle are the boundary
+  `"inner"`, which `NodalPoisson` takes a `Dirichlet` or `Neumann` condition for;
+  `solve_poisson` applies its boundary value there too. `CompositeNodes.face_edges` lists the
+  cell edges of every part of the boundary. `examples/l_shaped_domain.py`.
 
 ### Changed
 
+- A patch must lie within the patches of the level below, but no longer within one of them: it
+  may lie over several that touch.
+- A `Neumann` gradient is evaluated at the middle of every boundary cell edge instead of at the
+  nodes, so that two faces meeting at a corner each keep their own value.
 - `plot_patches` colours all patches on one scale and shades node-centered fields between
   their nodes.
 - `mpiarray` is taken from its `devel` branch instead of a pinned commit, so that patchwork

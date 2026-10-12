@@ -30,6 +30,14 @@ def _box(value: Sequence[Sequence[int]]) -> IndexBox:
     return result  # type: ignore[return-value]
 
 
+def _shared_cells(a: IndexBox, b: IndexBox) -> int:
+    """Number of cells two half-open boxes have in common."""
+    count = 1
+    for (x0, x1), (y0, y1) in zip(a, b, strict=True):
+        count *= max(min(x1, y1) - max(x0, y0), 0)
+    return count
+
+
 def _overlap(a: IndexBox, b: IndexBox) -> bool:
     """Return whether two half-open boxes overlap in their interiors."""
     return all(
@@ -105,14 +113,19 @@ class AMRHierarchy:
     """A 2D nested patch hierarchy with mpiarray-backed fields.
 
     Patch coordinates are integer cell bounds on their own refinement level.
-    A child patch's bounds must align with the parent level and be contained
-    within one parent patch. The refinement ratio is two by default. Fields
+    A child patch's bounds must align with the parent level and lie within the
+    patches of that level. The refinement ratio is two by default. Fields
     are cell-centered, or node-centered (one value per cell corner, see
     :meth:`allocate_field`). ``periodic`` flags the axes on which the last
     cell neighbours the first; the node-centered solver
     (:class:`~patchwork.nodal.NodalPoisson`) uses it. Without an MPI launcher,
     mpiarray supplies a serial communicator and the same interface works with a
     single process.
+
+    The domain is the rectangle of ``base_shape`` cells, or with ``base_boxes``
+    the union of those boxes of base cells: an L, a T, a rectangle with a notch.
+    The boxes are the patches of level zero. Where the domain does not fill
+    the rectangle, its edge is a boundary like the rectangle's own faces.
     """
 
     def __init__(
@@ -122,9 +135,14 @@ class AMRHierarchy:
         *,
         refinement_ratio: int = 2,
         periodic: tuple[bool, bool] = (False, False),
+        base_boxes: Sequence[Sequence[Sequence[int]]] | None = None,
         comm: Any = None,
     ) -> None:
-        """Create the base level: ``base_shape`` cells over the physical ``bounds``."""
+        """Create the base level: ``base_shape`` cells over the physical ``bounds``.
+
+        ``base_boxes`` are half-open boxes of base cells that do not overlap;
+        their union is the domain. By default it is the whole rectangle.
+        """
         if len(base_shape) != 2 or any(int(n) != n or n <= 0 for n in base_shape):
             raise ValueError("base_shape must contain two positive integer cell counts")
         if int(refinement_ratio) != refinement_ratio or refinement_ratio < 2:
@@ -141,9 +159,16 @@ class AMRHierarchy:
         self.periodic = (bool(periodic[0]), bool(periodic[1]))
         self.comm = mpa.default_comm() if comm is None else comm
         self._field_specs: dict[str, dict[str, Any]] = {}
-        self._patches: list[Patch] = [
-            Patch(level=0, box=((0, self.base_shape[0]), (0, self.base_shape[1])))
-        ]
+        whole = ((0, self.base_shape[0]), (0, self.base_shape[1]))
+        boxes = [whole] if base_boxes is None else [_box(box) for box in base_boxes]
+        if not boxes:
+            raise ValueError("base_boxes must hold at least one box")
+        for number, box in enumerate(boxes):
+            if any(hi > n for (_, hi), n in zip(box, self.base_shape, strict=True)):
+                raise ValueError(f"base box {box} exceeds the base shape {base_shape}")
+            if any(_overlap(box, other) for other in boxes[:number]):
+                raise ValueError(f"base box {box} overlaps another base box")
+        self._patches: list[Patch] = [Patch(level=0, box=box) for box in boxes]
 
     @property
     def lower_bound(self) -> tuple[float, float]:
@@ -191,8 +216,8 @@ class AMRHierarchy:
         """Add a non-overlapping, properly nested fine patch.
 
         ``box`` is half-open and measured in cells at ``level``. Bounds must
-        align to parent cells, and every patch above level one must be inside
-        a patch on the immediately coarser level.
+        align to the cells of the level below, and the patch must lie within
+        the patches of that level (it may span several that touch).
         """
         if level < 1 or int(level) != level:
             raise ValueError("fine patch level must be a positive integer")
@@ -212,18 +237,15 @@ class AMRHierarchy:
             raise ValueError(
                 f"patch {normalized} overlaps an existing level-{level} patch"
             )
-        parents = self.patches_at_level(level - 1)
-        if not any(
-            all(
-                parent_lo * ratio <= child_lo and child_hi <= parent_hi * ratio
-                for (parent_lo, parent_hi), (child_lo, child_hi) in zip(
-                    parent.box, normalized, strict=True
-                )
-            )
-            for parent in parents
-        ):
+        # every cell of the level below that the patch refines is in a patch there
+        coarse = tuple((lo // ratio, hi // ratio) for lo, hi in normalized)
+        covered = sum(
+            _shared_cells(coarse, parent.box)
+            for parent in self.patches_at_level(level - 1)
+        )
+        if covered != _shared_cells(coarse, coarse):
             raise ValueError(
-                f"patch {normalized} is not contained in a level-{level - 1} parent"
+                f"patch {normalized} is not contained in the level-{level - 1} patches"
             )
         patch = Patch(level=level, box=normalized)
         for name, spec in self._field_specs.items():

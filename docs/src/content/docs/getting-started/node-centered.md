@@ -53,6 +53,39 @@ solver = NodalPoisson(
 The problem needs at least one Dirichlet face or body: without one the
 potential is only known up to a constant, and the solver refuses it.
 
+## Domains that are not rectangles
+
+The base level can be several boxes instead of the whole rectangle. Their
+union is the domain: an L, a T, a rectangle with a notch.
+
+```python
+mesh = AMRHierarchy(
+    base_shape=(32, 32),
+    bounds=((-1.0, 1.0), (-1.0, 1.0)),
+    # the left half, and the upper half of the right half: an L
+    base_boxes=[((0, 16), (0, 32)), ((16, 32), (16, 32))],
+)
+mesh.add_patch(level=1, box=((24, 32), (24, 40)))  # left of the inner corner
+mesh.add_patch(level=1, box=((32, 40), (32, 40)))  # above and right of it
+
+solver = NodalPoisson(mesh, faces={"x_upper": Dirichlet(1.0), "inner": Neumann(0.0)})
+```
+
+The four named faces are then the parts of the boundary on the faces of the
+rectangle, and `"inner"` is the rest: the edges inside the rectangle, here the
+two edges that meet at the corner of the L. Like a face, `"inner"` takes a
+`Dirichlet` or a `Neumann` condition and is grounded if it is not listed. A
+patch must lie inside the domain; it may lie over several boxes that touch.
+
+![Potential on an L-shaped domain with nested patches at its inner corner](/patchwork/figures/l_shaped_domain.png)
+
+`examples/l_shaped_domain.py` solves the potential whose gradient is unbounded
+at the corner of the L: four nested levels there reach an error of 8e-4 with
+1 200 unknowns, where a uniform 128 x 128 mesh has 1.9e-3 with 12 000. On a
+uniform lattice (`to_level`, `sample_patches`) the nodes outside the domain are
+zero. `solve_poisson`, the cell-centered solver, takes such a domain too and
+applies its boundary value on the inner edges as well.
+
 ## Solving, and solving again
 
 ```python
