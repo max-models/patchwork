@@ -80,7 +80,7 @@ def solve_poisson(
         hierarchy.allocate_field(potential)
 
     patches = hierarchy.patches
-    right_sides = {id(p): p.field(rhs).to_numpy() for p in patches}
+    right_sides = {id(p): hierarchy.gather(p, rhs) for p in patches}
     covered: dict[int, set[tuple[int, int]]] = defaultdict(set)
     for child in patches:
         if child.level == 0:
@@ -207,7 +207,7 @@ def solve_poisson(
                     ]
                 )
 
-    for patch in patches:
+    for patch in hierarchy.local_patches:
         array = patch.field(potential)
         (i0, i1), (j0, j1) = array.layout.index_bounds
         array.local[...] = values_by_patch[id(patch)][i0:i1, j0:j1]

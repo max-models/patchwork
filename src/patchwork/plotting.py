@@ -41,7 +41,7 @@ def plot_patches(
     gathered: dict[int, Any] = {}
     if field is not None:
         for patch in hierarchy:
-            gathered[id(patch)] = patch.field(field).to_numpy(root=root)
+            gathered[id(patch)] = hierarchy.gather(patch, field, root=root)
     if rank != root:
         return None
 

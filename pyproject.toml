@@ -21,6 +21,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
+  "maybempi>=0.1.2",
   "mpiarray @ git+https://github.com/max-models/mpiarray@devel",
   "numpy",
   "scipy",

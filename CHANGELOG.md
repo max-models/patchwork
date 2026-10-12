@@ -27,6 +27,13 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cell edges of every part of the boundary. `examples/l_shaped_domain.py`,
   `examples/t_shaped_domain.py`.
 
+- A communicator per patch: `add_patch(..., ranks=...)` and `AMRHierarchy(base_ranks=...)` put
+  a patch on one rank or on several, over which mpiarray splits its fields;
+  `placement="balanced"` puts each new patch on the rank with the fewest cells. `Patch.ranks`,
+  `Patch.comm`, `Patch.is_local`, `AMRHierarchy.local_patches`, `cells_on_rank` and the
+  collective `gather(patch, name, root=None)`. Both Poisson solvers and `plot_patches` work
+  wherever the patches are. `Patch.local_node_coordinates` for filling node-centered fields.
+
 ### Changed
 
 - A patch must lie within the patches of the level below, but no longer within one of them: it

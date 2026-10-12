@@ -14,10 +14,11 @@ analysis](https://github.com/max-models/patchwork/actions/workflows/static_analy
 Patchwork is a small 2D block-structured adaptive mesh library. It
 stores cell-centered or node-centered fields on nested rectangular
 patches using [`mpiarray`](https://github.com/max-models/mpiarray). The
-same API works without MPI installed or launched; under `mpiexec`, patch
-arrays can be split across ranks after installing the optional `mpi`
-extra. Matplotlib plots make the level layout and each patch’s cell grid
-visible.
+same API works without MPI installed or launched; under `mpiexec`, after
+installing the optional `mpi` extra, each patch lives on the ranks you
+give it (one for a small patch, several for a large one) with a
+communicator of its own. Matplotlib plots make the level layout and each
+patch’s cell grid visible.
 
 It provides hierarchy construction, patch validation, mpiarray-backed
 field storage, plotting, and two composite Poisson solves:

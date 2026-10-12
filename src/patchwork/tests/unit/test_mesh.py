@@ -103,3 +103,46 @@ def test_patches_of_an_l_are_plotted() -> None:
 
     assert len(axes.collections) >= 3  # one image per patch
     matplotlib.pyplot.close(figure)
+
+
+def test_on_one_rank_every_patch_is_local_whatever_its_placement() -> None:
+    for placement in ("all", "balanced"):
+        mesh = AMRHierarchy(base_shape=(16, 16), base_boxes=ELL, placement=placement)
+        patch = mesh.add_patch(level=1, box=((12, 20), (20, 28)))
+        explicit = mesh.add_patch(level=1, box=((0, 8), (0, 8)), ranks=0)
+        mesh.allocate_field("phi")
+
+        assert all(p.ranks == (0,) and p.is_local for p in mesh.patches)
+        assert mesh.local_patches == mesh.patches
+        assert patch.comm is mesh.comm and explicit.comm is mesh.comm
+        assert mesh.cells_on_rank == (192 + 64 + 64,)
+        patch.field("phi").local[...] = 3.0
+        assert np.array_equal(mesh.gather(patch, "phi"), np.full((8, 8), 3.0))
+        assert np.array_equal(mesh.gather(patch, "phi", root=0), np.full((8, 8), 3.0))
+
+
+def test_ranks_of_a_patch_are_checked() -> None:
+    mesh = AMRHierarchy(base_shape=(16, 16))
+
+    with pytest.raises(ValueError, match="not all ranks of a communicator of 1"):
+        mesh.add_patch(level=1, box=((0, 8), (0, 8)), ranks=1)
+    with pytest.raises(ValueError, match="distinct and not empty"):
+        mesh.add_patch(level=1, box=((0, 8), (0, 8)), ranks=[0, 0])
+    with pytest.raises(ValueError, match="distinct and not empty"):
+        mesh.add_patch(level=1, box=((0, 8), (0, 8)), ranks=[])
+    with pytest.raises(ValueError, match="placement must be"):
+        AMRHierarchy(base_shape=(16, 16), placement="nearest")
+    with pytest.raises(ValueError, match="one entry per base box"):
+        AMRHierarchy(base_shape=(16, 16), base_boxes=ELL, base_ranks=[0])
+
+
+def test_the_nodes_of_a_rank_come_with_their_coordinates() -> None:
+    mesh = AMRHierarchy(base_shape=(4, 2), bounds=((0.0, 2.0), (0.0, 1.0)))
+    mesh.allocate_field("phi", centering="node")
+    (patch,) = mesh.patches
+
+    x, y = patch.local_node_coordinates(mesh, "phi")
+
+    assert x.shape == patch.field("phi").local.shape == (5, 3)
+    assert x[:, 0] == pytest.approx([0.0, 0.5, 1.0, 1.5, 2.0])
+    assert y[0] == pytest.approx([0.0, 0.5, 1.0])

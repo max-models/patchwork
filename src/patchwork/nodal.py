@@ -254,7 +254,7 @@ class CompositeNodes:
 
     def to_patches(self, values: np.ndarray, name: str) -> None:
         """Write node values ``(n,)`` into the node-centered field ``name``."""
-        for patch in self.hierarchy:
+        for patch in self.hierarchy.local_patches:
             array = patch.field(name)
             (i0, i1), (j0, j1) = array.layout.index_bounds
             array.local[...] = values[self.patch_nodes(patch)][i0:i1, j0:j1]
@@ -267,7 +267,7 @@ class CompositeNodes:
         """
         values = np.zeros(self.num_nodes)
         for patch in self.hierarchy.patches:  # coarse to fine: the finest wins
-            values[self.patch_nodes(patch)] = patch.field(name).to_numpy()
+            values[self.patch_nodes(patch)] = self.hierarchy.gather(patch, name)
         return values
 
     # The boundary ----------------------------------------------------------------#

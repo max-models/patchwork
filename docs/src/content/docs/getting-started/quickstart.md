@@ -48,9 +48,37 @@ embedded bodies, see [Node-centered Poisson](/patchwork/getting-started/node-cen
 
 ## MPI and serial use
 
-No MPI setup is required for a normal Python run. To distribute a patch array,
-launch the same script collectively, for example `mpiexec -n 2 python
+No MPI setup is required for a normal Python run. Under MPI, launch the same
+script on every rank, for example `mpiexec -n 2 python
 examples/two_level_mesh.py`. All ranks must construct the same hierarchy and
-allocate fields in the same order. The Poisson solves gather the patch
-fields and solve on every rank; coarse-fine halo exchange for user kernels is
-not part of this release.
+allocate fields in the same order.
+
+Each patch lives on some of the ranks and has a communicator of its own for
+them, over which mpiarray splits its fields:
+
+```python
+mesh = AMRHierarchy(base_shape=(64, 64))                       # the base: on every rank
+small = mesh.add_patch(level=1, box=((32, 64), (32, 64)), ranks=3)        # one rank
+large = mesh.add_patch(level=1, box=((64, 128), (0, 64)), ranks=(0, 1))   # two ranks
+mesh.allocate_field("density")
+
+for patch in mesh.local_patches:            # the patches this rank holds a part of
+    patch.field("density").local[...] = 1.0
+whole = mesh.gather(small, "density")       # the whole patch, on every rank
+```
+
+- `ranks` is one rank or several. Without it the hierarchy's `placement`
+  decides: `"all"` (the default) puts a patch on every rank, `"balanced"` on
+  the one rank that holds the fewest cells so far. `base_ranks` does the same
+  for the base boxes.
+- `patch.ranks` is the same on every rank; `patch.is_local` says whether this
+  rank holds a part, and `patch.comm` is then the patch's communicator.
+  Patches on the same group of ranks share one communicator.
+- `mesh.gather(patch, name, root=None)` is collective over the hierarchy's
+  communicator and returns the whole field on every rank, or on `root` only.
+- A field split over several ranks needs at least one cell per rank along its
+  first axis.
+
+The Poisson solves and `plot_patches` gather the patch fields and work
+wherever the patches are; the solve itself runs on every rank. Halo exchange
+between patches for user kernels is not part of this release.
