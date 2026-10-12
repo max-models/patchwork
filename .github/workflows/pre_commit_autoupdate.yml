@@ -1,0 +1,36 @@
+name: Pre-commit autoupdate
+
+# Weekly PR that bumps the hook revisions in .pre-commit-config.yaml.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  autoupdate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Update the hook revisions
+        run: |
+          pip install pre-commit
+          pre-commit autoupdate
+
+      - name: Open a pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: pre-commit-autoupdate
+          title: "chore: update pre-commit hooks"
+          commit-message: "chore: update pre-commit hooks"
+          body: Weekly `pre-commit autoupdate`.
+          labels: dependencies

@@ -1,0 +1,67 @@
+name: Test Setup Script
+
+on:
+  push:
+    branches:
+      - main
+      - devel
+  pull_request:
+    branches:
+      - main
+      - devel
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test-setup-script:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run setup script
+        run: |
+          bash setup_project.sh my-test-app
+
+      - name: Verify changes
+        run: |
+          # Check that src/app was moved to src/my_test_app
+          if [ ! -d "src/my_test_app" ]; then
+            echo "Error: src/my_test_app does not exist"
+            exit 1
+          fi
+
+          # Check that src/app no longer exists
+          if [ -d "src/app" ]; then
+            echo "Error: src/app still exists"
+            exit 1
+          fi
+
+          # Check that template-python was replaced in pyproject.toml
+          if grep -q "template-python" pyproject.toml; then
+            echo "Error: 'template-python' still found in pyproject.toml"
+            exit 1
+          fi
+
+          if ! grep -q "my-test-app" pyproject.toml; then
+            echo "Error: 'my-test-app' not found in pyproject.toml"
+            exit 1
+          fi
+
+          echo "✓ All checks passed!"
+
+      - name: Install project with new name
+        run: |
+          pip install --upgrade pip
+          pip install -e .
+
+      - name: Test renamed command works
+        run: |
+          my-test-app

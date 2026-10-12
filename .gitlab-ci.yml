@@ -1,0 +1,59 @@
+# This file is a template, and might need editing before it works on your project.
+# To contribute improvements to CI/CD templates, please follow the Development guide at:
+# https://docs.gitlab.com/ee/development/cicd/templates.html
+# This specific template is located at:
+# https://gitlab.com/gitlab-org/gitlab/-/blob/master/lib/gitlab/ci/templates/Python.gitlab-ci.yml
+
+# Official language image. Look for the different tagged releases at:
+# https://hub.docker.com/r/library/python/tags/
+image: python:latest
+
+# Change pip's cache directory to be inside the project directory since we can
+# only cache local items.
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+# https://pip.pypa.io/en/stable/topics/caching/
+cache:
+  paths:
+    - .cache/pip
+
+before_script:
+  - python --version ; pip --version # For debugging
+  - pip install uv
+  - uv sync --extra dev
+
+test:
+  script:
+    - uv run ruff check .
+    - uv run ruff format --check .
+    - uv run pyright src/
+    - uv run pytest --cov .
+
+build:
+  script:
+    - uv build
+  artifacts:
+    paths:
+      - dist/*
+
+pages:
+  image: node:22
+  before_script: []
+  script:
+    - apt-get update && apt-get install -y python3 python3-pip python3-venv
+    - pip install uv && uv sync --extra docs
+    - uv run python docs/tools/notebooks.py execute
+    - uv run python docs/tools/notebooks.py convert
+    - cd docs && npm ci && DOCS_PYTHON="$(pwd)/../.venv/bin/python" npm run build
+    - mv dist ../public
+  artifacts:
+    paths:
+      - public
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+deploy:
+  stage: deploy
+  script: echo "Define your deployment script!"
+  environment: production

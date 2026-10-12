@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: If you use this software, please cite it as below.
+type: software
+title: template-python
+authors:
+  - family-names: Lindqvist
+    given-names: Max
+version: 0.1.0
+date-released: "2026-10-05"
+repository-code: https://github.com/max-models/template-python
+url: https://max-models.github.io/template-python/
+license: MIT

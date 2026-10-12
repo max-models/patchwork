@@ -1,0 +1,43 @@
+---
+title: template-python
+description: Template repository for Python projects.
+template: splash
+hero:
+  tagline: A starting point for a Python package with tests, CI, tutorials and an Astro documentation site.
+  actions:
+    - text: Get started
+      link: /template-python/getting-started/installation/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/max-models/template-python
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
+
+## What is included
+
+<CardGrid>
+	<Card title="Package layout" icon="open-book">
+		A `src/` layout with a console entry point, `pytest` tests and a `pyproject.toml` ready for PyPI.
+	</Card>
+	<Card title="Continuous integration" icon="rocket">
+		GitHub Actions for tests, static analysis, tutorial execution, documentation and PyPI publishing.
+	</Card>
+	<Card title="Tutorials" icon="document">
+		Jupyter notebooks in `tutorials/` are executed and published as pages of this site.
+	</Card>
+	<Card title="API reference" icon="setting">
+		Every module, class and function is documented from the docstrings with starlight-pydocs.
+	</Card>
+</CardGrid>
+
+## Start here
+
+<CardGrid>
+	<LinkCard title="Installation" href="/template-python/getting-started/installation/" description="Create an environment and install the package." />
+	<LinkCard title="Quickstart" href="/template-python/getting-started/quickstart/" description="Run the command line entry point." />
+	<LinkCard title="Tutorials" href="/template-python/tutorials/" description="Executed notebooks with their outputs." />
+	<LinkCard title="API reference" href="/template-python/api/app/" description="Generated from the docstrings." />
+</CardGrid>

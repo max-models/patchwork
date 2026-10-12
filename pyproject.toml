@@ -1,0 +1,81 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+
+requires = [ "setuptools", "wheel" ]
+
+[project]
+name = "template-python"
+version = "0.1.0"
+description = "Template python repository."
+readme = "README.md"
+keywords = [ "python" ]
+license = { file = "LICENSE.txt" }
+authors = [ { name = "Max" } ]
+requires-python = ">=3.10"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "numpy",
+]
+
+optional-dependencies.dev = [
+  "jupyterlab",
+  "pre-commit",
+  "pyproject-fmt",
+  "pyright",
+  "ruff",
+  "template-python[test,docs]",
+]
+optional-dependencies.docs = [
+  "griffe",
+  "ipykernel",
+  "nbclient>=0.10",
+  "nbformat>=5.10",
+]
+optional-dependencies.test = [ "pytest", "pytest-cov" ]
+urls."Source" = "https://github.com/max-models/template-python"
+scripts.template-python = "app.main:main"
+
+[tool.setuptools.packages.find]
+where = [ "src" ]
+
+[tool.setuptools.package-data]
+"*" = [ "py.typed" ]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+extend-include = [ "*.ipynb" ]
+
+[tool.ruff.lint]
+# pycodestyle, pyflakes, isort, pyupgrade, bugbear and pydocstyle
+select = [ "B", "D", "E", "F", "I", "UP", "W" ]
+ignore = [ "E501" ] # line length is handled by the formatter
+pydocstyle.convention = "google"
+per-file-ignores."**/tests/**" = [ "D" ]
+per-file-ignores."*.ipynb" = [ "D" ]
+per-file-ignores."docs/tools/*" = [ "D" ]
+
+[tool.pyright]
+include = [ "src" ]
+exclude = [ "**/tests" ]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"
+
+[tool.pytest.ini_options]
+pythonpath = [ "src" ]
+testpaths = [ "src" ]
+addopts = "-ra"
+
+[tool.coverage.run]
+source = [ "app" ]
+omit = [ "*/tests/*" ]
+
+[tool.coverage.report]
+show_missing = true
