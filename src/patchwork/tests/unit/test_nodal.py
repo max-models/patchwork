@@ -494,6 +494,48 @@ def test_a_prescribed_flux_through_the_inner_edges_is_exact_for_a_linear_potenti
     )
 
 
+def test_a_t_shaped_domain_keeps_a_linear_potential_between_its_foot_and_its_top() -> (
+    None
+):
+    """A bar with a stem: fixed at the foot and the top, the right flux elsewhere."""
+    mesh = AMRHierarchy(
+        base_shape=(12, 8),
+        bounds=((-1.5, 1.5), (-1.0, 1.0)),
+        base_boxes=[((0, 12), (4, 8)), ((4, 8), (0, 4))],
+    )
+    # at both inner corners: in the bar across the corner, and in the stem
+    for corner, stem in ((8, (8, 12)), (16, (12, 16))):
+        mesh.add_patch(level=1, box=((corner - 4, corner + 4), (8, 12)))
+        mesh.add_patch(level=1, box=(stem, (4, 8)))
+
+    def exact(x, y):
+        return 2.0 - 3.0 * y
+
+    def outward_derivative(x, y):
+        # the underside of the bar (y = 0) faces down; the stem's walls are vertical
+        return np.where(np.abs(y) < 1e-12, 3.0, 0.0)
+
+    solver = NodalPoisson(
+        mesh,
+        faces={
+            "y_lower": Dirichlet(exact),
+            "y_upper": Dirichlet(exact),
+            "x_lower": Neumann(0.0),
+            "x_upper": Neumann(0.0),
+            "inner": Neumann(outward_derivative),
+        },
+    )
+    nodes = solver.nodes
+    x, y = nodes.coordinates.T
+
+    # the underside of the bar on both sides of the stem, and the stem's two walls
+    assert nodes.face_measure("inner").sum() == pytest.approx(2.0 + 2.0)
+    assert nodes.face_measure("y_lower").sum() == pytest.approx(1.0)
+    assert solver.solve(np.zeros(nodes.num_nodes)) == pytest.approx(
+        exact(x, y), abs=1e-12
+    )
+
+
 def test_fields_outside_the_domain_are_zero_on_a_uniform_lattice() -> None:
     mesh = _ell(8, 1)
     nodes = CompositeNodes(mesh)

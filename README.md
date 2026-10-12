@@ -101,8 +101,9 @@ manufactured composite solve, see
 [`examples/two_level_mesh.py`](examples/two_level_mesh.py),
 [`examples/nested_patches.py`](examples/nested_patches.py),
 [`examples/composite_poisson.py`](examples/composite_poisson.py),
-[`examples/nodal_electrode.py`](examples/nodal_electrode.py), and
-[`examples/l_shaped_domain.py`](examples/l_shaped_domain.py).
+[`examples/nodal_electrode.py`](examples/nodal_electrode.py),
+[`examples/l_shaped_domain.py`](examples/l_shaped_domain.py), and
+[`examples/t_shaped_domain.py`](examples/t_shaped_domain.py).
 
 ## Install
 

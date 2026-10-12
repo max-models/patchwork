@@ -24,7 +24,8 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   of boxes (an L, a T, a notch). The edges inside the bounding rectangle are the boundary
   `"inner"`, which `NodalPoisson` takes a `Dirichlet` or `Neumann` condition for;
   `solve_poisson` applies its boundary value there too. `CompositeNodes.face_edges` lists the
-  cell edges of every part of the boundary. `examples/l_shaped_domain.py`.
+  cell edges of every part of the boundary. `examples/l_shaped_domain.py`,
+  `examples/t_shaped_domain.py`.
 
 ### Changed
 

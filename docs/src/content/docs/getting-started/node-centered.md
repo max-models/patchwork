@@ -86,6 +86,14 @@ uniform lattice (`to_level`, `sample_patches`) the nodes outside the domain are
 zero. `solve_poisson`, the cell-centered solver, takes such a domain too and
 applies its boundary value on the inner edges as well.
 
+`examples/t_shaped_domain.py` is a T-shaped conductor: a bar with a stem, the
+foot of the stem at 1 V, the ends of the bar grounded and no flux through the
+other walls (`"inner": Neumann(0.0)`). Two nested levels at the two inner
+corners match a uniform mesh of four times the resolution, with 1 600 unknowns
+instead of 16 500.
+
+![Potential in a T-shaped conductor with nested patches at its two inner corners](/patchwork/figures/t_shaped_domain.png)
+
 ## Solving, and solving again
 
 ```python
