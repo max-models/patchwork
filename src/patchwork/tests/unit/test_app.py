@@ -1,5 +1,5 @@
 def test_import_app():
-    from app.main import main
+    from patchwork.main import main
 
     print("app imported")
     main()

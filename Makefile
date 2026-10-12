@@ -37,7 +37,7 @@ docs-notebooks:  ## execute the changed tutorials and convert all of them (FORCE
 	$(NOTEBOOKS) execute $(if $(FORCE),--force,)
 	$(NOTEBOOKS) convert
 
-docs-dev:  ## live preview at http://localhost:4321/template-python/
+docs-dev:  ## live preview at http://localhost:4321/patchwork/
 	$(NOTEBOOKS) convert
 	cd docs && $(DOCS_ENV) DOCS_VALIDATE_LINKS=false npm run dev
 

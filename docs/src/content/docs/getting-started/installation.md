@@ -1,6 +1,6 @@
 ---
 title: Installation
-description: Create a Python environment and install template-python.
+description: Create a Python environment and install patchwork.
 ---
 
 Create and activate a Python environment:
@@ -20,7 +20,7 @@ pip install -e .
 Run the code with:
 
 ```bash
-template-python
+patchwork
 ```
 
 ## Optional extras

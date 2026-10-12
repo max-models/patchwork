@@ -22,7 +22,7 @@ The site in `docs/` is built with [Astro](https://astro.build/) and
 ```bash
 make docs-install     # npm packages and the Python docs extra
 make docs-notebooks   # execute tutorials/*.ipynb and convert them to pages
-make docs-dev         # live preview at http://localhost:4321/template-python/
+make docs-dev         # live preview at http://localhost:4321/patchwork/
 make docs-build       # the static site in docs/dist, as in CI
 make docs-preview     # serve docs/dist
 make docs-clean       # remove generated pages and build output

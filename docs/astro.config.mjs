@@ -7,11 +7,11 @@ import starlightPydocs, { pydocsSidebarGroup } from 'starlight-pydocs';
 import rehypeKatex from 'rehype-katex';
 import remarkMath from 'remark-math';
 
-// The site is served at https://max-models.github.io/template-python/ by GitHub Pages.
-const base = '/template-python';
+// The site is served at https://max-models.github.io/patchwork/ by GitHub Pages.
+const base = '/patchwork';
 
 // The Python package documented under "API reference" (the directory name in src/).
-const pythonPackage = 'app';
+const pythonPackage = 'patchwork';
 
 export default defineConfig({
 	site: 'https://max-models.github.io',
@@ -22,16 +22,16 @@ export default defineConfig({
 	},
 	integrations: [
 		starlight({
-			title: 'template-python',
+			title: 'patchwork',
 			description: 'Template repository for Python projects.',
 			customCss: ['katex/dist/katex.min.css', './src/styles/custom.css'],
 			components: {
 				Header: './src/components/Header.astro',
 			},
 			social: [
-				{ icon: 'github', label: 'GitHub', href: 'https://github.com/max-models/template-python' },
+				{ icon: 'github', label: 'GitHub', href: 'https://github.com/max-models/patchwork' },
 			],
-			editLink: { baseUrl: 'https://github.com/max-models/template-python/edit/devel/docs/' },
+			editLink: { baseUrl: 'https://github.com/max-models/patchwork/edit/devel/docs/' },
 			lastUpdated: true,
 			plugins: [
 				starlightPydocs({
@@ -46,7 +46,7 @@ export default defineConfig({
 							},
 							sourceLink: {
 								host: 'github',
-								repo: 'max-models/template-python',
+								repo: 'max-models/patchwork',
 								ref: 'devel',
 								root: '..',
 							},

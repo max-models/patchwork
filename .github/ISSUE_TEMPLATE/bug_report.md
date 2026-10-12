@@ -22,7 +22,7 @@ assignees: ""
 
 **Environment**
 
-- template-python version:
+- patchwork version:
 - Python version:
 - OS:
 

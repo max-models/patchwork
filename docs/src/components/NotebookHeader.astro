@@ -12,7 +12,7 @@ export interface Props {
 	status?: 'executed' | 'not run';
 }
 const { download, source, status = 'executed' } = Astro.props;
-const github = `https://github.com/max-models/template-python/blob/devel/${source}`;
+const github = `https://github.com/max-models/patchwork/blob/devel/${source}`;
 const notes = {
 	executed: 'Run when the site was built.',
 	'not run': 'Not run for this build: the outputs are missing.',

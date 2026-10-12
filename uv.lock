@@ -2538,7 +2538,7 @@ wheels = [
 ]
 
 [[package]]
-name = "template-python"
+name = "patchwork"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
@@ -2588,7 +2588,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'test'" },
     { name = "pytest-cov", marker = "extra == 'test'" },
     { name = "ruff", marker = "extra == 'dev'" },
-    { name = "template-python", extras = ["test", "docs"], marker = "extra == 'dev'" },
+    { name = "patchwork", extras = ["test", "docs"], marker = "extra == 'dev'" },
 ]
 provides-extras = ["dev", "docs", "test"]
 
