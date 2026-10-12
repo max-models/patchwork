@@ -43,10 +43,14 @@ The composite Poisson example solves a smooth source across the coarse-fine inte
 ![Composite Poisson solution on a refined patch](/patchwork/figures/composite_poisson.png)
 For nested levels and a complete script, run `python examples/nested_patches.py`.
 
+For node-centered fields, faces with different conditions, periodic axes and
+embedded bodies, see [Node-centered Poisson](/patchwork/getting-started/node-centered/).
+
 ## MPI and serial use
 
 No MPI setup is required for a normal Python run. To distribute a patch array,
 launch the same script collectively, for example `mpiexec -n 2 python
 examples/two_level_mesh.py`. All ranks must construct the same hierarchy and
-allocate fields in the same order. Coarse-fine halo exchange and composite
-solvers are not part of this initial release.
+allocate fields in the same order. The Poisson solves gather the patch
+fields and solve on every rank; coarse-fine halo exchange for user kernels is
+not part of this release.

@@ -21,13 +21,13 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-  "mpiarray @ git+https://github.com/max-models/mpiarray@6160e7894a32ee0a61afe182cd6495ab65aec477",
+  "mpiarray @ git+https://github.com/max-models/mpiarray@devel",
   "numpy",
   "scipy",
 ]
 
 [project.optional-dependencies]
-mpi = [ "mpiarray[mpi] @ git+https://github.com/max-models/mpiarray@6160e7894a32ee0a61afe182cd6495ab65aec477" ]
+mpi = [ "mpiarray[mpi] @ git+https://github.com/max-models/mpiarray@devel" ]
 plot = [ "matplotlib" ]
 dev = [
   "jupyterlab",

@@ -12,7 +12,9 @@ mesh.allocate_field("rhs", halo=1)
 
 for patch in mesh:
     x, y = patch.local_cell_centers(mesh)
-    patch.field("rhs").local[...] = 2.0 * np.pi**2 * np.sin(np.pi * x) * np.sin(np.pi * y)
+    patch.field("rhs").local[...] = (
+        2.0 * np.pi**2 * np.sin(np.pi * x) * np.sin(np.pi * y)
+    )
 
 solve_poisson(mesh, "rhs", potential="phi", boundary_value=0.0)
 result = plot_patches(mesh, field="phi")

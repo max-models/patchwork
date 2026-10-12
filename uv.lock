@@ -868,18 +868,14 @@ toml = [
 
 [[package]]
 name = "cunumpy"
-version = "0.6.2"
-source = { registry = "https://pypi.org/simple" }
+version = "0.6.3"
+source = { git = "https://github.com/max-models/cunumpy.git?rev=devel#3114eb733c5721e4b2b95d72924e805de6dc9d5f" }
 dependencies = [
     { name = "array-api-compat" },
     { name = "maybempi" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/60/43/f9ac4e592bfe75e21c2198fca96e3ec48dd9c06610758f3e5a0fa91c37c5/cunumpy-0.6.2.tar.gz", hash = "sha256:53b948f3b139b54930eb148b4a4130a3e212c522c313b5b3021d7158016bc1b0", size = 155658, upload-time = "2026-10-08T10:52:48.347Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/56/10/837d9f4b6043462cfc1412fe56337e946d6ced94163cdcb5537334f02b86/cunumpy-0.6.2-py3-none-any.whl", hash = "sha256:b0ca5bd66d05ac4c245c1b80c3c585e2e8dd9c9ea52e8a9de03781169091baf3", size = 166508, upload-time = "2026-10-08T10:52:46.892Z" },
 ]
 
 [[package]]
@@ -2167,10 +2163,11 @@ wheels = [
 
 [[package]]
 name = "mpiarray"
-version = "0.1.0"
-source = { git = "https://github.com/max-models/mpiarray?rev=6160e7894a32ee0a61afe182cd6495ab65aec477#6160e7894a32ee0a61afe182cd6495ab65aec477" }
+version = "0.1.1"
+source = { git = "https://github.com/max-models/mpiarray?rev=devel#70949daee72048b5b52799a7eb95c6bb06630e6d" }
 dependencies = [
     { name = "cunumpy" },
+    { name = "maybempi" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -2582,8 +2579,8 @@ requires-dist = [
     { name = "ipykernel", marker = "extra == 'docs'" },
     { name = "jupyterlab", marker = "extra == 'dev'" },
     { name = "matplotlib", marker = "extra == 'plot'" },
-    { name = "mpiarray", git = "https://github.com/max-models/mpiarray?rev=6160e7894a32ee0a61afe182cd6495ab65aec477" },
-    { name = "mpiarray", extras = ["mpi"], marker = "extra == 'mpi'", git = "https://github.com/max-models/mpiarray?rev=6160e7894a32ee0a61afe182cd6495ab65aec477" },
+    { name = "mpiarray", git = "https://github.com/max-models/mpiarray?rev=devel" },
+    { name = "mpiarray", extras = ["mpi"], marker = "extra == 'mpi'", git = "https://github.com/max-models/mpiarray?rev=devel" },
     { name = "nbclient", marker = "extra == 'docs'", specifier = ">=0.10" },
     { name = "nbformat", marker = "extra == 'docs'", specifier = ">=5.10" },
     { name = "numpy" },

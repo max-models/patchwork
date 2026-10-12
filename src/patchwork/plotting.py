@@ -19,6 +19,9 @@ def plot_patches(
 ) -> tuple[Any, Any] | None:
     """Plot patch extents and cell grids, optionally colored by a field.
 
+    With ``show_grid=False`` and no ``field`` only the patch outlines are drawn,
+    e.g. over an image that is already on ``ax``.
+
     When ``field`` is provided, each patch field is gathered collectively and
     plotted on ``root`` only. Call this function on every rank in the patch
     communicator. Layout-only plots are also returned on ``root`` only.
@@ -30,7 +33,9 @@ def plot_patches(
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
     except ImportError as exc:
-        raise ImportError("plotting requires matplotlib; install patchwork[plot]") from exc
+        raise ImportError(
+            "plotting requires matplotlib; install patchwork[plot]"
+        ) from exc
 
     rank = hierarchy.comm.Get_rank()
     gathered: dict[int, Any] = {}
@@ -47,30 +52,45 @@ def plot_patches(
 
     palette = plt.get_cmap("tab10")
     mappable = None
+    limits = None
+    nodal = field is not None and hierarchy.centering(field) == "node"
+    if field is not None:
+        import numpy as np
+
+        # one colour scale for all patches
+        limits = (
+            min(float(np.nanmin(values)) for values in gathered.values()),
+            max(float(np.nanmax(values)) for values in gathered.values()),
+        )
     for patch in hierarchy:
         ((x0, x1), (y0, y1)) = patch.physical_bounds(hierarchy)
         color = palette(patch.level % 10)
         if field is not None:
-            import numpy as np
-
             values = gathered[id(patch)]
             dx, dy = hierarchy.spacing(patch.level)
             x_edges = x0 + np.arange(patch.shape[0] + 1) * dx
             y_edges = y0 + np.arange(patch.shape[1] + 1) * dy
+            # node values sit on the cell corners and are shaded between them
             mappable = ax.pcolormesh(
                 x_edges,
                 y_edges,
                 values.T,
-                shading="flat",
+                shading="gouraud" if nodal else "flat",
                 cmap=cmap,
+                vmin=limits[0],
+                vmax=limits[1],
                 zorder=2 * patch.level + 1,
             )
-        elif patch.level > 0:
+        elif patch.level > 0 and show_grid:
             # Mask the covered coarse cells so only the finest active grid is visible.
             ax.add_patch(
                 Rectangle(
-                    (x0, y0), x1 - x0, y1 - y0,
-                    facecolor="white", edgecolor="none", zorder=2 * patch.level
+                    (x0, y0),
+                    x1 - x0,
+                    y1 - y0,
+                    facecolor="white",
+                    edgecolor="none",
+                    zorder=2 * patch.level,
                 )
             )
         ax.add_patch(
@@ -120,5 +140,7 @@ def plot_patches(
     ax.legend(handles=handles, loc="upper right", framealpha=0.9)
     if mappable is not None:
         fig.colorbar(mappable, ax=ax, label=field)
-    ax.set_title("Patchwork AMR hierarchy" if field is None else f"Patchwork field: {field}")
+    ax.set_title(
+        "Patchwork AMR hierarchy" if field is None else f"Patchwork field: {field}"
+    )
     return fig, ax

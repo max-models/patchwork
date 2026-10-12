@@ -12,17 +12,25 @@ analysis](https://github.com/max-models/patchwork/actions/workflows/static_analy
 [![Python](https://img.shields.io/pypi/pyversions/patchwork.png)](https://pypi.org/project/patchwork/)
 
 Patchwork is a small 2D block-structured adaptive mesh library. It
-stores cell-centered fields on nested rectangular patches using
-[`mpiarray`](https://github.com/max-models/mpiarray). The same API works
-without MPI installed or launched; under `mpiexec`, patch arrays can be
-split across ranks after installing the optional `mpi` extra. Matplotlib
-plots make the level layout and each patch’s cell grid visible.
+stores cell-centered or node-centered fields on nested rectangular
+patches using [`mpiarray`](https://github.com/max-models/mpiarray). The
+same API works without MPI installed or launched; under `mpiexec`, patch
+arrays can be split across ranks after installing the optional `mpi`
+extra. Matplotlib plots make the level layout and each patch’s cell grid
+visible.
 
-The initial version provides hierarchy construction, patch validation,
-mpiarray-backed field storage, plotting, and a composite cell-centered
-finite-volume Poisson solve with constant Dirichlet boundaries. Particle
-deposition, coarse-fine halo exchange for user kernels, and dynamic
-regridding are planned next.
+It provides hierarchy construction, patch validation, mpiarray-backed
+field storage, plotting, and two composite Poisson solves:
+
+- `solve_poisson`: cell-centered finite volumes with one constant
+  Dirichlet value on the domain boundary;
+- `NodalPoisson`: node-centered, the five-point Laplacian wherever the
+  mesh is uniform, with Dirichlet and Neumann faces, periodic axes and
+  embedded bodies at fixed potentials. It is factorized once and solved
+  many times, which is what a particle-in-cell code needs.
+
+Particle deposition, coarse-fine halo exchange for user kernels, and
+dynamic regridding are planned next.
 
 ## Quick example
 
@@ -40,12 +48,42 @@ fig.savefig("mesh.png", dpi=180)
 ![Two-level mesh showing the coarse grid, fine patch, and a sample
 density field](docs/public/figures/two_level_mesh.png)
 
+## Node-centered Poisson solve
+
+``` python
+import numpy as np
+from patchwork import AMRHierarchy, Dirichlet, EmbeddedDirichlet, Neumann, NodalPoisson
+
+mesh = AMRHierarchy(base_shape=(32, 32), periodic=(False, True))
+mesh.add_patch(level=1, box=((24, 40), (24, 40)))
+solver = NodalPoisson(
+    mesh,
+    faces={"x_lower": Neumann(0.0), "x_upper": Dirichlet(100.0)},
+    embedded=[
+        EmbeddedDirichlet(
+            inside=lambda p: np.hypot(p[0] - 0.5, p[1] - 0.5) < 0.05, value=-20.0
+        )
+    ],
+)
+x, y = solver.nodes.coordinates.T
+potential = solver.solve(np.exp(-((x - 0.3) ** 2 + (y - 0.5) ** 2) / 0.01))
+```
+
+`solver.solve` can be called again with another source at the cost of
+two triangular solves. Nodes of a fine patch in the middle of a coarser
+cell’s edge take the interpolated value of the edge’s ends, so the
+potential is continuous across patch boundaries.
+
+![Potential around a small electrode, resolved by two nested
+patches](docs/public/figures/nodal_electrode.png)
+
 Patch boxes use half-open integer cell bounds on their own refinement
 level. The default refinement ratio is two. For runnable layouts and a
 manufactured composite solve, see
 [`examples/two_level_mesh.py`](examples/two_level_mesh.py),
-[`examples/nested_patches.py`](examples/nested_patches.py), and
-[`examples/composite_poisson.py`](examples/composite_poisson.py).
+[`examples/nested_patches.py`](examples/nested_patches.py),
+[`examples/composite_poisson.py`](examples/composite_poisson.py), and
+[`examples/nodal_electrode.py`](examples/nodal_electrode.py).
 
 ## Install
 

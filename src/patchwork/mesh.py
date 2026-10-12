@@ -22,7 +22,9 @@ def _box(value: Sequence[Sequence[int]]) -> IndexBox:
         raise ValueError("a patch box must be ((i_lower, i_upper), (j_lower, j_upper))")
     result = tuple((int(axis[0]), int(axis[1])) for axis in value)
     if any(lo < 0 or hi <= lo for lo, hi in result):
-        raise ValueError(f"patch bounds must be non-empty and non-negative, got {result}")
+        raise ValueError(
+            f"patch bounds must be non-empty and non-negative, got {result}"
+        )
     if any(int(axis[0]) != axis[0] or int(axis[1]) != axis[1] for axis in value):
         raise ValueError("patch bounds must be integers")
     return result  # type: ignore[return-value]
@@ -30,7 +32,9 @@ def _box(value: Sequence[Sequence[int]]) -> IndexBox:
 
 def _overlap(a: IndexBox, b: IndexBox) -> bool:
     """Return whether two half-open boxes overlap in their interiors."""
-    return all(max(x0, y0) < min(x1, y1) for (x0, x1), (y0, y1) in zip(a, b, strict=True))
+    return all(
+        max(x0, y0) < min(x1, y1) for (x0, x1), (y0, y1) in zip(a, b, strict=True)
+    )
 
 
 @dataclass
@@ -47,6 +51,11 @@ class Patch:
         return tuple(hi - lo for lo, hi in self.box)  # type: ignore[return-value]
 
     @property
+    def node_shape(self) -> tuple[int, int]:
+        """Number of nodes (cell corners) along each axis: one more than cells."""
+        return tuple(hi - lo + 1 for lo, hi in self.box)  # type: ignore[return-value]
+
+    @property
     def field_names(self) -> tuple[str, ...]:
         """Names of allocated fields on this patch."""
         return tuple(self._fields)
@@ -56,7 +65,9 @@ class Patch:
         try:
             return self._fields[name]
         except KeyError as exc:
-            raise KeyError(f"patch at level {self.level} has no field {name!r}") from exc
+            raise KeyError(
+                f"patch at level {self.level} has no field {name!r}"
+            ) from exc
 
     def local_cell_centers(self, hierarchy: AMRHierarchy) -> tuple[Any, Any]:
         """Coordinates of this rank's cell centers for the first allocated field."""
@@ -73,6 +84,15 @@ class Patch:
         y = y0 + (j0 + np.arange(lj0, lj1) + 0.5) * dy
         return np.meshgrid(x, y, indexing="ij")
 
+    def node_coordinates(self, hierarchy: AMRHierarchy) -> tuple[Any, Any]:
+        """Coordinates of the nodes of the whole patch along each axis (1D arrays)."""
+        import numpy as np
+
+        dx, dy = hierarchy.spacing(self.level)
+        x0, y0 = hierarchy.lower_bound
+        (i0, i1), (j0, j1) = self.box
+        return x0 + np.arange(i0, i1 + 1) * dx, y0 + np.arange(j0, j1 + 1) * dy
+
     def physical_bounds(self, hierarchy: AMRHierarchy) -> PhysicalBounds:
         """Physical rectangle occupied by this patch."""
         dx, dy = hierarchy.spacing(self.level)
@@ -82,13 +102,17 @@ class Patch:
 
 
 class AMRHierarchy:
-    """A 2D nested patch hierarchy with mpiarray-backed cell-centered fields.
+    """A 2D nested patch hierarchy with mpiarray-backed fields.
 
     Patch coordinates are integer cell bounds on their own refinement level.
     A child patch's bounds must align with the parent level and be contained
-    within one parent patch. Refinement is cell-centered with ratio two by
-    default. Without an MPI launcher, mpiarray supplies a serial communicator
-    and the same interface works with a single process.
+    within one parent patch. The refinement ratio is two by default. Fields
+    are cell-centered, or node-centered (one value per cell corner, see
+    :meth:`allocate_field`). ``periodic`` flags the axes on which the last
+    cell neighbours the first; the node-centered solver
+    (:class:`~patchwork.nodal.NodalPoisson`) uses it. Without an MPI launcher,
+    mpiarray supplies a serial communicator and the same interface works with a
+    single process.
     """
 
     def __init__(
@@ -97,8 +121,10 @@ class AMRHierarchy:
         bounds: PhysicalBounds = ((0.0, 1.0), (0.0, 1.0)),
         *,
         refinement_ratio: int = 2,
+        periodic: tuple[bool, bool] = (False, False),
         comm: Any = None,
     ) -> None:
+        """Create the base level: ``base_shape`` cells over the physical ``bounds``."""
         if len(base_shape) != 2 or any(int(n) != n or n <= 0 for n in base_shape):
             raise ValueError("base_shape must contain two positive integer cell counts")
         if int(refinement_ratio) != refinement_ratio or refinement_ratio < 2:
@@ -110,6 +136,9 @@ class AMRHierarchy:
         self.base_shape = tuple(int(n) for n in base_shape)
         self.bounds = tuple(tuple(float(x) for x in axis) for axis in bounds)
         self.refinement_ratio = int(refinement_ratio)
+        if len(periodic) != 2:
+            raise ValueError("periodic must have one flag per axis")
+        self.periodic = (bool(periodic[0]), bool(periodic[1]))
         self.comm = mpa.default_comm() if comm is None else comm
         self._field_specs: dict[str, dict[str, Any]] = {}
         self._patches: list[Patch] = [
@@ -171,12 +200,18 @@ class AMRHierarchy:
         normalized = _box(box)
         shape = self.level_shape(level)
         if any(hi > n for (_, hi), n in zip(normalized, shape, strict=True)):
-            raise ValueError(f"patch {normalized} exceeds level-{level} domain shape {shape}")
+            raise ValueError(
+                f"patch {normalized} exceeds level-{level} domain shape {shape}"
+            )
         ratio = self.refinement_ratio
         if any(lo % ratio or hi % ratio for lo, hi in normalized):
-            raise ValueError(f"level-{level} patch bounds must align to level-{level - 1} cells")
+            raise ValueError(
+                f"level-{level} patch bounds must align to level-{level - 1} cells"
+            )
         if any(p.level == level and _overlap(normalized, p.box) for p in self._patches):
-            raise ValueError(f"patch {normalized} overlaps an existing level-{level} patch")
+            raise ValueError(
+                f"patch {normalized} overlaps an existing level-{level} patch"
+            )
         parents = self.patches_at_level(level - 1)
         if not any(
             all(
@@ -187,18 +222,32 @@ class AMRHierarchy:
             )
             for parent in parents
         ):
-            raise ValueError(f"patch {normalized} is not contained in a level-{level - 1} parent")
+            raise ValueError(
+                f"patch {normalized} is not contained in a level-{level - 1} parent"
+            )
         patch = Patch(level=level, box=normalized)
         for name, spec in self._field_specs.items():
-            patch._fields[name] = mpa.zeros(
-                patch.shape,
-                dtype=spec["dtype"],
-                split=spec["split"],
-                halo=spec["halo"],
-                comm=self.comm,
-            )
+            patch._fields[name] = self._zeros(patch, spec)
         self._patches.append(patch)
         return patch
+
+    def _zeros(self, patch: Patch, spec: dict[str, Any]) -> DistributedArray:
+        """A zero array for one patch of a field with allocation ``spec``."""
+        shape = patch.node_shape if spec["centering"] == "node" else patch.shape
+        return mpa.zeros(
+            shape,
+            dtype=spec["dtype"],
+            split=spec["split"],
+            halo=spec["halo"],
+            comm=self.comm,
+        )
+
+    def centering(self, name: str) -> str:
+        """``"cell"`` or ``"node"``: where the values of field ``name`` sit."""
+        try:
+            return self._field_specs[name]["centering"]
+        except KeyError as exc:
+            raise KeyError(f"hierarchy has no field {name!r}") from exc
 
     def allocate_field(
         self,
@@ -207,21 +256,22 @@ class AMRHierarchy:
         dtype: Any = float,
         halo: int = 1,
         split: Any = 0,
+        centering: str = "cell",
     ) -> None:
         """Allocate a named zero-filled field on every existing patch.
 
         The default splits patch arrays over the first axis of ``comm``. Use
-        ``split=None`` to replicate each patch on every rank.
+        ``split=None`` to replicate each patch on every rank. With
+        ``centering="node"`` the values sit on the cell corners: a patch of
+        ``(nx, ny)`` cells holds ``(nx + 1, ny + 1)`` of them, and patches that
+        touch or nest share the nodes they have in common.
         """
         if not name or name in self._field_specs:
             raise ValueError(f"field name must be non-empty and unique, got {name!r}")
-        spec = {"dtype": dtype, "halo": halo, "split": split}
-        arrays = {
-            id(p): mpa.zeros(
-                p.shape, dtype=dtype, split=split, halo=halo, comm=self.comm
-            )
-            for p in self._patches
-        }
+        if centering not in ("cell", "node"):
+            raise ValueError(f"centering must be 'cell' or 'node', got {centering!r}")
+        spec = {"dtype": dtype, "halo": halo, "split": split, "centering": centering}
+        arrays = {id(p): self._zeros(p, spec) for p in self._patches}
         self._field_specs[name] = spec
         for patch in self._patches:
             patch._fields[name] = arrays[id(patch)]

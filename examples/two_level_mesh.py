@@ -6,7 +6,6 @@ import numpy as np
 
 from patchwork import AMRHierarchy, plot_patches
 
-
 mesh = AMRHierarchy(base_shape=(32, 24), bounds=((0.0, 2.0), (-0.5, 1.0)))
 mesh.add_patch(level=1, box=((16, 48), (12, 36)))
 mesh.allocate_field("density", halo=1)
