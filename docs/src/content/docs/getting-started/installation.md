@@ -34,3 +34,22 @@ patchwork
 ```bash
 pip install -e ".[dev]"
 ```
+
+## Optional plotting tools
+
+Install Matplotlib with Patchwork when you want to use `plot_patches` or run the
+examples that save figures. SciPy, used by the composite Poisson solver, is installed
+as a core dependency:
+
+```bash
+pip install -e ".[plot]"
+```
+
+For multi-rank runs, install the optional MPI bindings too:
+
+```bash
+pip install -e ".[mpi,plot]"
+```
+
+`mpiarray` uses its serial communicator when MPI is not installed or no MPI
+launcher is active. The AMR examples therefore run as ordinary Python scripts.

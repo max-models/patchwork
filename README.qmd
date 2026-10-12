@@ -15,24 +15,39 @@ format:
 [![PyPI](https://img.shields.io/pypi/v/patchwork)](https://pypi.org/project/patchwork/)
 [![Python](https://img.shields.io/pypi/pyversions/patchwork)](https://pypi.org/project/patchwork/)
 
-Template repository for Python projects: a `src/` package with a console entry point,
-`pytest` tests, GitHub Actions for tests, static analysis, tutorials, documentation and
-PyPI publishing, and an [Astro](https://astro.build/) + [Starlight](https://starlight.astro.build/)
-documentation site.
+Patchwork is a small 2D block-structured adaptive mesh library. It stores
+cell-centered fields on nested rectangular patches using
+[`mpiarray`](https://github.com/max-models/mpiarray). The same API works
+without MPI installed or launched; under `mpiexec`, patch arrays can be split
+across ranks after installing the optional `mpi` extra. Matplotlib plots make the level layout and each patch's cell grid
+visible.
 
-Documentation: <https://max-models.github.io/patchwork/>
+The initial version provides hierarchy construction, patch validation,
+mpiarray-backed field storage, plotting, and a composite cell-centered
+finite-volume Poisson solve with constant Dirichlet boundaries. Particle
+deposition, coarse-fine halo exchange for user kernels, and dynamic regridding
+are planned next.
 
-## Use the template
+## Quick example
 
-Create a repository from this template, then rename the package:
+```python
+from patchwork import AMRHierarchy, plot_patches
 
-```bash
-bash setup_project.sh my-app
-rm setup_project.sh
+mesh = AMRHierarchy(base_shape=(32, 24))
+fine = mesh.add_patch(level=1, box=((16, 48), (12, 36)))
+mesh.allocate_field("density")
+fine.field("density").local[:] = 1.0
+fig, ax = plot_patches(mesh, field="density")
+fig.savefig("mesh.png", dpi=180)
 ```
 
-This replaces `patchwork` with `my-app` everywhere, moves `src/app` to `src/my_app`,
-and points the entry point, tests and docs at it.
+![Two-level mesh showing the coarse grid, fine patch, and a sample density field](docs/public/figures/two_level_mesh.png)
+
+Patch boxes use half-open integer cell bounds on their own refinement level.
+The default refinement ratio is two. For runnable layouts and a manufactured composite solve, see
+[`examples/two_level_mesh.py`](examples/two_level_mesh.py),
+[`examples/nested_patches.py`](examples/nested_patches.py), and
+[`examples/composite_poisson.py`](examples/composite_poisson.py).
 
 ## Install
 
@@ -40,7 +55,7 @@ With [uv](https://docs.astral.sh/uv/):
 
 ```bash
 make install    # uv sync --extra dev, plus the pre-commit hooks
-uv run patchwork
+uv run python examples/two_level_mesh.py
 ```
 
 Or create and activate a Python environment (3.10 or newer):
@@ -54,17 +69,17 @@ pip install --upgrade pip
 Install the code and requirements with pip:
 
 ```bash
-pip install -e .
+pip install -e ".[plot]"  # add ,mpi for MPI-enabled runs
 ```
 
 Run the code with:
 
 ```bash
-patchwork
+python examples/two_level_mesh.py
 ```
 
-The `test`, `docs` and `dev` extras install the test runner, the documentation tooling and
-the linters:
+The `plot` extra installs Matplotlib. The `test`, `docs` and `dev` extras install the test
+runner, documentation tooling and linters:
 
 ```bash
 pip install -e ".[dev]"

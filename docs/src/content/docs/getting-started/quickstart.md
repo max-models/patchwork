@@ -1,26 +1,52 @@
 ---
 title: Quickstart
-description: Run the command line entry point of patchwork.
+description: Create, refine, and plot a 2D patch hierarchy.
 ---
 
-First, ensure that `patchwork` is [installed](/patchwork/getting-started/installation/).
+Patchwork uses `mpiarray` for patch fields. It runs in serial without an MPI
+launcher (or MPI installed), and supports distributed patch arrays when run
+under `mpiexec` after installing the `mpi` extra.
 
-## Basic usage
-
-After installation, you can run the application with:
-
-```bash
-patchwork
-```
-
-which calls `patchwork.main.main` and prints a greeting.
-
-## Use the package from Python
+## Create a hierarchy
 
 ```python
-from patchwork.main import main
+from patchwork import AMRHierarchy, solve_poisson
 
-main()
+mesh = AMRHierarchy(base_shape=(32, 24), bounds=((0, 2), (-0.5, 1)))
+fine = mesh.add_patch(level=1, box=((16, 48), (12, 36)))
+mesh.allocate_field("density", halo=1)
+fine.field("density").local[:] = 1.0
+solve_poisson(mesh, "density", potential="phi")
 ```
 
-See the [API reference](/patchwork/api/patchwork/) for every module and function.
+Patch bounds are half-open cell-index intervals at that patch's level. Fine
+patch bounds align to their parent grid and must be contained in a parent patch.
+The root level is the full domain and is created automatically.
+
+## Plot the patch layout and cells
+
+Install the plotting extra, then:
+
+```python
+from patchwork import plot_patches
+
+fig, ax = plot_patches(mesh, field="density")
+fig.savefig("patches.png", dpi=180)
+```
+
+The plot overlays the active level grids and colors each patch by its field. `solve_poisson` assembles a conservative finite-volume operator across coarse-fine faces and applies a constant Dirichlet value on the domain boundary. See `examples/composite_poisson.py` for a manufactured solution.
+
+![Example density field on a coarse grid with a fine patch](/patchwork/figures/two_level_mesh.png)
+
+The composite Poisson example solves a smooth source across the coarse-fine interface:
+
+![Composite Poisson solution on a refined patch](/patchwork/figures/composite_poisson.png)
+For nested levels and a complete script, run `python examples/nested_patches.py`.
+
+## MPI and serial use
+
+No MPI setup is required for a normal Python run. To distribute a patch array,
+launch the same script collectively, for example `mpiexec -n 2 python
+examples/two_level_mesh.py`. All ranks must construct the same hierarchy and
+allocate fields in the same order. Coarse-fine halo exchange and composite
+solvers are not part of this initial release.

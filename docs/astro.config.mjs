@@ -22,8 +22,8 @@ export default defineConfig({
 	},
 	integrations: [
 		starlight({
-			title: 'patchwork',
-			description: 'Template repository for Python projects.',
+			title: 'Patchwork',
+			description: 'Block-structured adaptive meshes backed by mpiarray.',
 			customCss: ['katex/dist/katex.min.css', './src/styles/custom.css'],
 			components: {
 				Header: './src/components/Header.astro',

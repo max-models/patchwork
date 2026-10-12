@@ -6,7 +6,7 @@ requires = [ "setuptools", "wheel" ]
 [project]
 name = "patchwork"
 version = "0.1.0"
-description = "Template python repository."
+description = "Block-structured adaptive meshes backed by mpiarray."
 readme = "README.md"
 keywords = [ "python" ]
 license = { file = "LICENSE.txt" }
@@ -21,26 +21,35 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
+  "mpiarray @ git+https://github.com/max-models/mpiarray@6160e7894a32ee0a61afe182cd6495ab65aec477",
   "numpy",
+  "scipy",
 ]
 
-optional-dependencies.dev = [
+[project.optional-dependencies]
+mpi = [ "mpiarray[mpi] @ git+https://github.com/max-models/mpiarray@6160e7894a32ee0a61afe182cd6495ab65aec477" ]
+plot = [ "matplotlib" ]
+dev = [
   "jupyterlab",
   "pre-commit",
   "pyproject-fmt",
   "pyright",
   "ruff",
-  "patchwork[test,docs]",
+  "patchwork[test,docs,plot]",
 ]
-optional-dependencies.docs = [
+docs = [
   "griffe",
   "ipykernel",
   "nbclient>=0.10",
   "nbformat>=5.10",
 ]
-optional-dependencies.test = [ "pytest", "pytest-cov" ]
-urls."Source" = "https://github.com/max-models/patchwork"
-scripts.patchwork = "patchwork.main:main"
+test = [ "pytest", "pytest-cov" ]
+
+[project.urls]
+Source = "https://github.com/max-models/patchwork"
+
+[project.scripts]
+patchwork = "patchwork.main:main"
 
 [tool.setuptools.packages.find]
 where = [ "src" ]
