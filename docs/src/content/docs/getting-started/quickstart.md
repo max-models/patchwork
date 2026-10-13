@@ -57,14 +57,14 @@ Each patch lives on some of the ranks and has a communicator of its own for
 them, over which mpiarray splits its fields:
 
 ```python
-mesh = AMRHierarchy(base_shape=(64, 64))                       # the base: on every rank
-small = mesh.add_patch(level=1, box=((32, 64), (32, 64)), ranks=3)        # one rank
-large = mesh.add_patch(level=1, box=((64, 128), (0, 64)), ranks=(0, 1))   # two ranks
+mesh = AMRHierarchy(base_shape=(64, 64))  # the base: on every rank
+small = mesh.add_patch(level=1, box=((32, 64), (32, 64)), ranks=3)  # one rank
+large = mesh.add_patch(level=1, box=((64, 128), (0, 64)), ranks=(0, 1))  # two ranks
 mesh.allocate_field("density")
 
-for patch in mesh.local_patches:            # the patches this rank holds a part of
+for patch in mesh.local_patches:  # the patches this rank holds a part of
     patch.field("density").local[...] = 1.0
-whole = mesh.gather(small, "density")       # the whole patch, on every rank
+whole = mesh.gather(small, "density")  # the whole patch, on every rank
 ```
 
 - `ranks` is one rank or several. Without it the hierarchy's `placement`
