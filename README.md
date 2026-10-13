@@ -17,8 +17,9 @@ patches using [`mpiarray`](https://github.com/max-models/mpiarray). The
 same API works without MPI installed or launched; under `mpiexec`, after
 installing the optional `mpi` extra, each patch lives on the ranks you
 give it (one for a small patch, several for a large one) with a
-communicator of its own. Matplotlib plots make the level layout and each
-patch’s cell grid visible.
+communicator of its own, and `exchange_halos` fills every patch’s halo
+from its neighbours and the level below, wherever they are. Matplotlib
+plots make the level layout and each patch’s cell grid visible.
 
 It provides hierarchy construction, patch validation, mpiarray-backed
 field storage, plotting, and two composite Poisson solves:

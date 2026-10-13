@@ -80,5 +80,33 @@ whole = mesh.gather(small, "density")  # the whole patch, on every rank
   first axis.
 
 The Poisson solves and `plot_patches` gather the patch fields and work
-wherever the patches are; the solve itself runs on every rank. Halo exchange
-between patches for user kernels is not part of this release.
+wherever the patches are; the solve itself runs on every rank.
+
+## Halos of patches
+
+A field allocated with `halo=h` has `h` cells (or nodes) around every patch.
+`exchange_halos` fills them from the rest of the hierarchy, so that a stencil
+can be applied to each patch on its own:
+
+```python
+mesh.allocate_field("u", halo=2, centering="node")
+# ... the patches' own points of "u" are set ...
+mesh.restrict("u")  # coarse points under finer patches take the fine values
+mesh.exchange_halos("u")  # every patch's halo, on every rank that holds it
+for patch in mesh.local_patches:
+    u = patch.field("u").local_with_halos  # own points and halo
+```
+
+- A halo point inside another patch of the same level gets its value, across a
+  periodic face too.
+- Elsewhere it is the bilinear interpolation of the level below (renormalised
+  where some of the four coarse points are not on any patch).
+- Between the ranks of one patch, mpiarray's `update_halos` fills the halo.
+- Halo points outside the domain are left as they are: set them for your
+  boundary condition.
+
+`restrict` gives coarse cells the mean of the fine cells over them, and coarse
+nodes the fine node at the same place, finest level first. Both are collective;
+their schedules are built at the first call for a field and kept until a patch
+is added. Each call sends its data in one `Alltoallv` over the hierarchy's
+communicator (`mpiarray.CopyPlan`), whichever ranks the patches are on.

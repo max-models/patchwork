@@ -33,6 +33,13 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Patch.comm`, `Patch.is_local`, `AMRHierarchy.local_patches`, `cells_on_rank` and the
   collective `gather(patch, name, root=None)`. Both Poisson solvers and `plot_patches` work
   wherever the patches are. `Patch.local_node_coordinates` for filling node-centered fields.
+- Halo exchange between patches: `AMRHierarchy.exchange_halos(name)` fills the halo of every
+  patch from the patches of the same level (across periodic faces too), else by bilinear
+  interpolation of the level below, and between the ranks of each patch; halo points outside
+  the domain are left for the boundary conditions. `AMRHierarchy.restrict(name)` gives coarse
+  points under finer patches the fine values (cell means, coinciding nodes), finest level first.
+  Both are schedules (`patchwork.halos.HaloExchange`, `Restriction`) built once per field and
+  sent with `mpiarray.CopyPlan`, which needs mpiarray's `devel` branch from 2026-10-13 on.
 
 ### Changed
 

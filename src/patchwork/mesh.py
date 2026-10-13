@@ -219,6 +219,8 @@ class AMRHierarchy:
         # one communicator per group of ranks, shared by the patches on it
         self._communicators: dict[tuple[int, ...], Any] = {}
         self._cells_on_rank = [0.0] * self.comm.Get_size()
+        # halo exchanges and restrictions, by kind and field; rebuilt after add_patch
+        self._schedules: dict[tuple[str, str], Any] = {}
         self._field_specs: dict[str, dict[str, Any]] = {}
         whole = ((0, self.base_shape[0]), (0, self.base_shape[1]))
         boxes = [whole] if base_boxes is None else [_box(box) for box in base_boxes]
@@ -405,6 +407,7 @@ class AMRHierarchy:
                 f"patch {normalized} is not contained in the level-{level - 1} patches"
             )
         patch = self._new_patch(level, normalized, ranks)
+        self._schedules.clear()
         if patch.is_local:
             for name, spec in self._field_specs.items():
                 patch._fields[name] = self._zeros(patch, spec)
@@ -457,6 +460,40 @@ class AMRHierarchy:
         for patch in self._patches:
             if patch.is_local:
                 patch._fields[name] = arrays[id(patch)]
+
+    def exchange_halos(self, name: str) -> None:
+        """Fill the halo of every patch of field ``name`` from the rest of the hierarchy.
+
+        From the patches of the same level the halo overlaps (across periodic
+        faces too), else by bilinear interpolation of the level below, and
+        between the ranks of each patch. Halo points outside the domain are
+        left for the boundary conditions. Collective over ``comm``; the
+        schedule is built at the first call and kept until a patch is added.
+        See :class:`~patchwork.halos.HaloExchange`.
+        """
+        from patchwork.halos import HaloExchange
+
+        self._schedule("halo", name, HaloExchange).execute()
+
+    def restrict(self, name: str) -> None:
+        """Give the points of field ``name`` under finer patches the fine values.
+
+        The mean of the fine cells (cell-centered) or the coinciding fine node
+        (node-centered), finest level first. Collective over ``comm``; call
+        :meth:`exchange_halos` after it for the halos. See
+        :class:`~patchwork.halos.Restriction`.
+        """
+        from patchwork.halos import Restriction
+
+        self._schedule("restrict", name, Restriction).execute()
+
+    def _schedule(self, kind: str, name: str, build: Any) -> Any:
+        if name not in self._field_specs:
+            raise KeyError(f"hierarchy has no field {name!r}")
+        key = (kind, name)
+        if key not in self._schedules:
+            self._schedules[key] = build(self, name)
+        return self._schedules[key]
 
     def __iter__(self) -> Iterator[Patch]:
         """Iterate through patches in level order."""
