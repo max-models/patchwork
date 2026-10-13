@@ -9,7 +9,7 @@ import mpiarray as mpa
 from maybempi import MPI
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Iterator, Mapping, Sequence
 
     from mpiarray import DistributedArray
 
@@ -113,16 +113,34 @@ class Patch:
         x, y = self.node_coordinates(hierarchy)
         return np.meshgrid(x[i0:i1], y[j0:j1], indexing="ij")
 
-    def local_cell_centers(self, hierarchy: AMRHierarchy) -> tuple[Any, Any]:
-        """Coordinates of this rank's cell centers for the first allocated field."""
+    def local_cell_centers(
+        self, hierarchy: AMRHierarchy, name: str | None = None
+    ) -> tuple[Any, Any]:
+        """Coordinates of this rank's cells of the cell-centered field ``name``.
+
+        Two arrays of the shape of ``field(name).local``, for filling it.
+        Without ``name``, of the first cell-centered field allocated.
+        """
         if not self.is_local:
             raise RuntimeError(
                 f"this rank holds no part of the level-{self.level} patch {self.box}: "
                 f"it is on ranks {self.ranks} (see AMRHierarchy.local_patches)"
             )
-        if not self._fields:
-            raise RuntimeError("allocate a field before requesting local cell centers")
-        layout = next(iter(self._fields.values())).layout
+        if name is None:
+            cell_fields = [
+                array
+                for array in self._fields.values()
+                if tuple(array.shape) == self.shape
+            ]
+            if not cell_fields:
+                raise RuntimeError(
+                    "allocate a cell-centered field before requesting local cell centers"
+                )
+            layout = cell_fields[0].layout
+        else:
+            layout = self.field(name).layout
+            if tuple(layout.shape) != self.shape:
+                raise ValueError(f"field {name!r} is not cell-centered")
         (i0, _), (j0, _) = self.box
         (li0, li1), (lj0, lj1) = layout.index_bounds
         dx, dy = hierarchy.spacing(self.level)
@@ -216,8 +234,10 @@ class AMRHierarchy:
                 f"placement must be 'all' or 'balanced', got {placement!r}"
             )
         self.placement = placement
-        # one communicator per group of ranks, shared by the patches on it
-        self._communicators: dict[tuple[int, ...], Any] = {}
+        # one communicator per group of ranks, shared by the patches on it (and
+        # by the hierarchies regrid makes from this one, which set it beforehand)
+        if not hasattr(self, "_communicators"):
+            self._communicators: dict[tuple[int, ...], Any] = {}
         self._cells_on_rank = [0.0] * self.comm.Get_size()
         # halo exchanges and restrictions, by kind and field; rebuilt after add_patch
         self._schedules: dict[tuple[str, str], Any] = {}
@@ -487,6 +507,73 @@ class AMRHierarchy:
         from patchwork.halos import Restriction
 
         self._schedule("restrict", name, Restriction).execute()
+
+    def regrid(
+        self,
+        tags: Mapping[int, Any],
+        *,
+        efficiency: float = 0.7,
+        buffer: int = 1,
+        nesting: int = 1,
+        max_patch_size: int | None = None,
+        placement: str | None = None,
+    ) -> AMRHierarchy:
+        """A new hierarchy with patches over the tagged cells, and the fields moved to it.
+
+        ``tags`` maps a level to booleans of that level's shape
+        (:meth:`level_shape`): the cells that need the next finer level. Make
+        them with :func:`~patchwork.regrid.gradient_tags`,
+        :func:`~patchwork.regrid.function_tags` or by hand; each rank may tag
+        from the data it holds, and the tags are combined over the ranks.
+
+        Level by level from the coarsest, the tagged cells, grown by
+        ``buffer`` cells, are covered with boxes by
+        :func:`~patchwork.regrid.cluster` (at least ``efficiency`` of their
+        cells tagged, at most ``max_patch_size`` cells of the new level long).
+        A level also covers, with a margin, what the finer levels need, and
+        each patch keeps ``nesting`` cells of the level below between itself
+        and that level's edge (the edge of the domain excepted). The base level
+        stays as it is. The levels above the last tagged one are dropped.
+
+        Every field is moved: a point takes the value of an old patch of the
+        same level that has it, else the bilinear interpolation of the new
+        level below. Halos are not filled; call :meth:`exchange_halos`.
+
+        New patches are placed by ``placement`` (default: this hierarchy's),
+        the largest first. Collective over ``comm``; this hierarchy is left as
+        it is.
+        """
+        from patchwork.regrid import combine_tags, new_boxes, transfer
+
+        combined = combine_tags(self, tags)
+        boxes = new_boxes(
+            self,
+            combined,
+            efficiency=efficiency,
+            buffer=buffer,
+            nesting=nesting,
+            max_patch_size=max_patch_size,
+        )
+        base = self.patches_at_level(0)
+        new = AMRHierarchy.__new__(AMRHierarchy)
+        new._communicators = self._communicators
+        new.__init__(  # type: ignore[misc]
+            self.base_shape,  # type: ignore[arg-type]
+            self.bounds,  # type: ignore[arg-type]
+            refinement_ratio=self.refinement_ratio,
+            periodic=self.periodic,
+            base_boxes=[patch.box for patch in base],
+            base_ranks=[patch.ranks for patch in base],
+            placement=self.placement if placement is None else placement,
+            comm=self.comm,
+        )
+        for level in sorted(boxes):
+            for box in sorted(boxes[level], key=lambda b: -_shared_cells(b, b)):
+                new.add_patch(level, box)
+        for name, spec in self._field_specs.items():
+            new.allocate_field(name, **spec)
+            transfer(self, new, name)
+        return new
 
     def _schedule(self, kind: str, name: str, build: Any) -> Any:
         if name not in self._field_specs:

@@ -43,9 +43,20 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   points under finer patches the fine values (cell means, coinciding nodes), finest level first.
   Both are schedules (`patchwork.halos.HaloExchange`, `Restriction`) built once per field and
   sent with `mpiarray.CopyPlan`, which needs mpiarray's `devel` branch from 2026-10-13 on.
+- Regridding: `AMRHierarchy.regrid(tags, efficiency=, buffer=, nesting=, max_patch_size=,
+  placement=)` returns a hierarchy with patches over the tagged cells of each level, properly
+  nested, with the fields moved over (copied from old patches of the same level, else
+  interpolated from the new level below). `gradient_tags` (a field's change across a cell),
+  `function_tags` (a function of the position) and `cluster` (Berger-Rigoutsos clustering)
+  in `patchwork.regrid`, also exported at the top level. Tutorial "Regridding".
+- `Patch.local_cell_centers(hierarchy, name)` takes the field whose cells are wanted; without
+  one, the first cell-centered field (it used the first field of any centering).
 
 ### Changed
 
+- Interpolation from the level below (halos, regridding) extrapolates linearly next to a wall of
+  a non-periodic axis instead of dropping the coarse point beyond it, so it is exact for linear
+  fields there too.
 - A patch must lie within the patches of the level below, but no longer within one of them: it
   may lie over several that touch.
 - A `Neumann` gradient is evaluated at the middle of every boundary cell edge instead of at the

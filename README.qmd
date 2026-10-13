@@ -35,8 +35,13 @@ storage, plotting, and two composite Poisson solves:
   at fixed potentials. It is factorized once and solved many times, which is
   what a particle-in-cell code needs.
 
-Particle deposition, coarse-fine halo exchange for user kernels, and dynamic
-regridding are planned next.
+`regrid` places the patches itself: tag the cells that need finer cells (by a
+field's change across a cell, a function of the position, or by hand), and it
+covers them with properly nested patches (Berger-Rigoutsos clustering) and moves
+the fields over.
+
+Particle deposition on patches and a distributed composite solve are planned
+next.
 
 ## Quick example
 

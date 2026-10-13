@@ -114,17 +114,112 @@ class _Points:
             inside |= valid & cells[index[0], index[1]]
         return inside
 
-    def stencil(self, fine: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    def stencil(
+        self, fine: np.ndarray, axis: int, level: int
+    ) -> tuple[np.ndarray, np.ndarray]:
         """The two coarse points around fine points along one axis, and their weights.
 
-        Returns the lower coarse index and the weight of the upper one.
+        ``level`` is the coarse level. Returns the lower coarse index and the
+        weight of the upper one. Next to a wall of a non-periodic axis, where
+        one of the two would lie beyond it, the two points inside are taken and
+        the value is extrapolated linearly (a weight outside [0, 1]).
         """
         if self.nodal:
             position = fine / self.ratio
         else:
             position = (fine + 0.5) / self.ratio - 0.5
         lower = np.floor(position).astype(np.int64)
+        count = self.hierarchy.level_shape(level)[axis] + (1 if self.nodal else 0)
+        if not self.periodic[axis] and count >= 2:
+            lower = np.clip(lower, 0, count - 2)
         return lower, position - lower
+
+
+def interpolate_from_below(
+    hierarchy: AMRHierarchy,
+    points: _Points,
+    patch: Patch,
+    field_of: Any,
+    array: Any,
+    i: np.ndarray,
+    j: np.ndarray,
+    dtype: Any,
+    copies: list,
+) -> tuple | None:
+    """Bilinear interpolation of the level below ``patch`` at its points ``(i, j)``.
+
+    ``(i, j)`` are level indices of points of ``patch`` (own or halo),
+    ``field_of(coarse)`` the array of a patch of the level below (``None``
+    where this rank does not hold it) and ``array`` the patch's own array
+    (``None`` likewise). Appends to ``copies`` the copies that bring the coarse
+    values into a buffer on the patch's ranks; the weights leave out coarse
+    points on no patch and are renormalised. Returns what to compute after the
+    copies, ``(array, storage index, buffer, flat indices, weights)``, on the
+    ranks that hold some of the points, else ``None``.
+    """
+    if not i.size:
+        return None
+    below = patch.level - 1
+    (ci, wi), (cj, wj) = points.stencil(i, 0, below), points.stencil(j, 1, below)
+    buffer_box = (
+        (int(ci.min()), int(ci.max()) + 2),
+        (int(cj.min()), int(cj.max()) + 2),
+    )
+    shape = tuple(hi - lo for lo, hi in buffer_box)
+    available = np.zeros(shape, dtype=bool)
+    buffer = (
+        mpa.zeros(shape, dtype=dtype, split=None, comm=patch.comm)
+        if patch.is_local
+        else None
+    )
+    for coarse in hierarchy.patches_at_level(patch.level - 1):
+        coarse_origin = tuple(lo for lo, _ in points.own(coarse))
+        for shift in points.shifts(patch.level - 1):
+            part = _overlap(buffer_box, _shift(points.own(coarse), shift))
+            if part is None:
+                continue
+            source = _shift(
+                part,
+                tuple(-d - o for d, o in zip(shift, coarse_origin, strict=True)),
+            )
+            target = _shift(part, tuple(-lo for lo, _ in buffer_box))
+            copies.append((field_of(coarse), source, buffer, target))
+            available[tuple(slice(s, e) for s, e in target)] = True
+    # the four coarse points of every point, without the unavailable ones
+    corners = []
+    for a, b in itertools.product((0, 1), repeat=2):
+        weight = (wi if a else 1.0 - wi) * (wj if b else 1.0 - wj)
+        bi = ci + a - buffer_box[0][0]
+        bj = cj + b - buffer_box[1][0]
+        weight = np.where(available[bi, bj], weight, 0.0)
+        corners.append((bi * shape[1] + bj, weight))
+    total = np.sum([weight for _, weight in corners], axis=0)
+    keep = total > 0.0
+    if not keep.any() or array is None:
+        return None
+    flat = np.stack([index[keep] for index, _ in corners], axis=1)
+    weights = np.stack([weight[keep] / total[keep] for _, weight in corners], axis=1)
+    origin = tuple(lo for lo, _ in patch.box)
+    layout = array.layout
+    mine = np.ones(int(keep.sum()), dtype=bool)
+    local = []
+    for values, o, (b0, b1), h in zip(
+        (i[keep], j[keep]), origin, layout.index_bounds, layout.halo, strict=True
+    ):
+        values = values - o
+        mine &= (values >= b0 - h) & (values < b1 + h)
+        local.append(values - b0 + h)
+    if not mine.any():
+        return None
+    index = (local[0][mine], local[1][mine])
+    return (array, index, buffer, flat[mine], weights[mine])
+
+
+def apply_interpolations(interpolations: list[tuple]) -> None:
+    """Compute the interpolated points from their filled buffers."""
+    for array, index, buffer, flat, weights in interpolations:
+        values = np.asarray(buffer.local_with_halos).reshape(-1)[flat]
+        array.local_with_halos[index] = (values * weights).sum(axis=1)
 
 
 class HaloExchange:
@@ -196,78 +291,28 @@ class HaloExchange:
         """Interpolation of the level below into the halo points no patch covers."""
         own = points.own(patch)
         width = self._width
-        extended = tuple((lo - width, hi + width) for lo, hi in own)
         i, j = np.nonzero(~covered)
-        i = i + extended[0][0]
-        j = j + extended[1][0]
+        i = i + own[0][0] - width
+        j = j + own[1][0] - width
         keep = points.in_domain(patch.level, i, j)
-        i, j = i[keep], j[keep]
-        if not i.size:
-            return
-        (ci, wi), (cj, wj) = points.stencil(i), points.stencil(j)
-        buffer_box = (
-            (int(ci.min()), int(ci.max()) + 2),
-            (int(cj.min()), int(cj.max()) + 2),
+        interpolation = interpolate_from_below(
+            self._hierarchy,
+            points,
+            patch,
+            self._field,
+            self._field(patch),
+            i[keep],
+            j[keep],
+            dtype,
+            copies,
         )
-        shape = tuple(hi - lo for lo, hi in buffer_box)
-        available = np.zeros(shape, dtype=bool)
-        buffer = (
-            mpa.zeros(shape, dtype=dtype, split=None, comm=patch.comm)
-            if patch.is_local
-            else None
-        )
-        for coarse in self._hierarchy.patches_at_level(patch.level - 1):
-            coarse_origin = tuple(lo for lo, _ in points.own(coarse))
-            for shift in points.shifts(patch.level - 1):
-                part = _overlap(buffer_box, _shift(points.own(coarse), shift))
-                if part is None:
-                    continue
-                source = _shift(
-                    part,
-                    tuple(-d - o for d, o in zip(shift, coarse_origin, strict=True)),
-                )
-                target = _shift(part, tuple(-lo for lo, _ in buffer_box))
-                copies.append((self._field(coarse), source, buffer, target))
-                available[tuple(slice(s, e) for s, e in target)] = True
-        # the four coarse points of every halo point, without the unavailable ones
-        corners = []
-        for a, b in itertools.product((0, 1), repeat=2):
-            weight = (wi if a else 1.0 - wi) * (wj if b else 1.0 - wj)
-            bi = ci + a - buffer_box[0][0]
-            bj = cj + b - buffer_box[1][0]
-            weight = np.where(available[bi, bj], weight, 0.0)
-            corners.append((bi * shape[1] + bj, weight))
-        total = np.sum([weight for _, weight in corners], axis=0)
-        keep = total > 0.0
-        if not keep.any() or not patch.is_local:
-            return
-        flat = np.stack([index[keep] for index, _ in corners], axis=1)
-        weights = np.stack(
-            [weight[keep] / total[keep] for _, weight in corners], axis=1
-        )
-        array = patch.field(self._name)
-        i = i[keep] - own[0][0]
-        j = j[keep] - own[1][0]
-        layout = array.layout
-        mine = np.ones(i.shape, dtype=bool)
-        local = []
-        for values, (b0, b1), h in zip(
-            (i, j), layout.index_bounds, layout.halo, strict=True
-        ):
-            mine &= (values >= b0 - h) & (values < b1 + h)
-            local.append(values - b0 + h)
-        if mine.any():
-            index = (local[0][mine], local[1][mine])
-            self._interpolations.append(
-                (array, index, buffer, flat[mine], weights[mine])
-            )
+        if interpolation is not None:
+            self._interpolations.append(interpolation)
 
     def execute(self) -> None:
         """Fill the halos. Collective over the hierarchy's communicator."""
         self._plan.execute()
-        for array, index, buffer, flat, weights in self._interpolations:
-            values = np.asarray(buffer.local_with_halos).reshape(-1)[flat]
-            array.local_with_halos[index] = (values * weights).sum(axis=1)
+        apply_interpolations(self._interpolations)
         if self._width:
             for patch in self._hierarchy.local_patches:
                 patch.field(self._name).update_halos()
