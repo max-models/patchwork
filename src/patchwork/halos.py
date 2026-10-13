@@ -72,7 +72,7 @@ class _Points:
         extra = 1 if self.nodal else 0
         return tuple((lo, hi + extra) for lo, hi in patch.box)
 
-    def shifts(self, level: int) -> list[tuple[int, int]]:
+    def shifts(self, level: int) -> list[tuple[int, ...]]:
         """The periodic images to look in: shifts by a period on periodic axes."""
         cells = self.hierarchy.level_shape(level)
         options = [
@@ -237,7 +237,7 @@ class HaloExchange:
             bj = cj + b - buffer_box[1][0]
             weight = np.where(available[bi, bj], weight, 0.0)
             corners.append((bi * shape[1] + bj, weight))
-        total = sum(weight for _, weight in corners)
+        total = np.sum([weight for _, weight in corners], axis=0)
         keep = total > 0.0
         if not keep.any() or not patch.is_local:
             return

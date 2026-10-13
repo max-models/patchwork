@@ -29,8 +29,11 @@ def plot_patches(
 
     Returns ``(figure, axes)`` on the plotting rank and ``None`` elsewhere.
     """
+    import numpy as np
+
     try:
         import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
         from matplotlib.patches import Rectangle
     except ImportError as exc:
         raise ImportError(
@@ -52,11 +55,10 @@ def plot_patches(
 
     palette = plt.get_cmap("tab10")
     mappable = None
-    limits = None
+    # the colour scale shared by all patches; set when a field is drawn
+    limits = (0.0, 1.0)
     nodal = field is not None and hierarchy.centering(field) == "node"
     if field is not None:
-        import numpy as np
-
         # one colour scale for all patches
         limits = (
             min(float(np.nanmin(values)) for values in gathered.values()),
@@ -107,8 +109,6 @@ def plot_patches(
         )
         if show_grid:
             dx, dy = hierarchy.spacing(patch.level)
-            import numpy as np
-
             ax.vlines(
                 x0 + np.arange(patch.shape[0] + 1) * dx,
                 y0,
@@ -133,7 +133,7 @@ def plot_patches(
     ax.set_aspect("equal", adjustable="box")
     levels = range(hierarchy.max_level + 1)
     handles = [
-        plt.Line2D([0], [0], color=palette(level % 10), lw=2, label=f"level {level}")
+        Line2D([0], [0], color=palette(level % 10), lw=2, label=f"level {level}")
         for level in levels
         if hierarchy.patches_at_level(level)
     ]

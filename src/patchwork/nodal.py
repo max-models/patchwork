@@ -204,7 +204,7 @@ class CompositeNodes:
                     weights.append(np.full(int(found.sum()), k / span))
                     spans.append(np.full(int(found.sum()), span))
         self.hanging = np.zeros(self.num_nodes, dtype=bool)
-        identity = sparse.identity(self.num_nodes, format="csr")
+        identity = sparse.csr_matrix(sparse.identity(self.num_nodes))
         if not slaves or not sum(part.size for part in slaves):
             self.reduction = identity
             return
@@ -219,21 +219,23 @@ class CompositeNodes:
         slave, master, weight = slave[first], master[first], weight[first]
         self.hanging[slave] = True
         free = np.nonzero(~self.hanging)[0]
-        reduction = sparse.coo_matrix(
-            (
-                np.concatenate((np.ones(free.size), 1.0 - weight, weight)),
+        reduction = sparse.csr_matrix(
+            sparse.coo_matrix(
                 (
-                    np.concatenate((free, slave, slave)),
-                    np.concatenate((free, master[:, 0], master[:, 1])),
+                    np.concatenate((np.ones(free.size), 1.0 - weight, weight)),
+                    (
+                        np.concatenate((free, slave, slave)),
+                        np.concatenate((free, master[:, 0], master[:, 1])),
+                    ),
                 ),
-            ),
-            shape=(self.num_nodes, self.num_nodes),
-        ).tocsr()
+                shape=(self.num_nodes, self.num_nodes),
+            )
+        )
         # an end of the edge may itself hang on a still coarser cell
         for _ in range(self._finest + 1):
             if not reduction[:, slave].nnz:
                 break
-            reduction = (reduction @ reduction).tocsr()
+            reduction = sparse.csr_matrix(reduction @ reduction)
             reduction.eliminate_zeros()
         else:
             raise RuntimeError("the hanging-node constraints do not close")
@@ -290,10 +292,10 @@ class CompositeNodes:
             if self._periodic[axis]:
                 beyond = beyond % self._cells[axis]
                 at_rectangle[:] = False
-            index = [None, None]
-            index[axis] = np.clip(beyond, 0, self._cells[axis] - 1)
-            index[other] = self.cell_lower[:, other]
-            outside = at_rectangle | (leaf[index[0], index[1]] < 0)
+            clipped = np.clip(beyond, 0, self._cells[axis] - 1)
+            along = self.cell_lower[:, other]
+            rows, columns = (clipped, along) if axis == 0 else (along, clipped)
+            outside = at_rectangle | (leaf[rows, columns] < 0)
             midpoint = centre.copy()
             midpoint[:, axis] += (0.5 if side else -0.5) * self.cell_span
             first, second = corners[axis, side]
@@ -392,10 +394,12 @@ class CompositeNodes:
         columns, weights = self._bilinear(lower, fraction, level)
         rows = np.repeat(np.arange(self.num_nodes), 4)
         shape = self.level_shape(level)
-        matrix = sparse.coo_matrix(
-            (weights.reshape(-1), (rows, columns.reshape(-1))),
-            shape=(self.num_nodes, shape[0] * shape[1]),
-        ).tocsr()
+        matrix = sparse.csr_matrix(
+            sparse.coo_matrix(
+                (weights.reshape(-1), (rows, columns.reshape(-1))),
+                shape=(self.num_nodes, shape[0] * shape[1]),
+            )
+        )
         matrix.eliminate_zeros()
         return matrix
 
@@ -464,10 +468,12 @@ class CompositeNodes:
         )
         weights[~inside] = 0.0  # outside the domain: no value
         rows = np.repeat(np.arange(points.shape[1]), 4)
-        matrix = sparse.coo_matrix(
-            (weights.reshape(-1), (rows, self.cell_corners[leaf].reshape(-1))),
-            shape=(points.shape[1], self.num_nodes),
-        ).tocsr()
+        matrix = sparse.csr_matrix(
+            sparse.coo_matrix(
+                (weights.reshape(-1), (rows, self.cell_corners[leaf].reshape(-1))),
+                shape=(points.shape[1], self.num_nodes),
+            )
+        )
         matrix.eliminate_zeros()
         return matrix
 
@@ -609,7 +615,7 @@ class CompositeNodes:
         shape = list(array.shape)
         shape[axis] = count * ratio if periodic else (count - 1) * ratio + 1
         fine = np.empty(shape, dtype=array.dtype)
-        index = [slice(None)] * array.ndim
+        index: list[slice | int] = [slice(None)] * array.ndim
 
         def along(part: slice | int) -> tuple:
             index[axis] = part
@@ -763,9 +769,8 @@ class NodalPoisson:
         length = np.concatenate((hx, hx, hy, hy))
         # A periodic axis one cell wide joins a node to itself: no coupling.
         keep = first != second
-        first, second, conductance, length = (
-            array[keep] for array in (first, second, conductance, length)
-        )
+        first, second = first[keep], second[keep]
+        conductance, length = conductance[keep], length[keep]
 
         # An edge that enters a body: the node outside sees the surface, at the
         # body's potential, instead of the node inside.
@@ -792,20 +797,24 @@ class NodalPoisson:
         )
         num_bodies = len(self._embedded)
         # the surface values' share of the right-hand side, per body
-        wall = sparse.coo_matrix(
-            (cut_conductance / fraction, (outside, self._owner[inside])),
-            shape=(n, max(num_bodies, 1)),
-        ).tocsr()
-        operator = sparse.coo_matrix((entries, (rows, columns)), shape=(n, n)).tocsr()
+        wall = sparse.csr_matrix(
+            sparse.coo_matrix(
+                (cut_conductance / fraction, (outside, self._owner[inside])),
+                shape=(n, max(num_bodies, 1)),
+            )
+        )
+        operator = sparse.csr_matrix(
+            sparse.coo_matrix((entries, (rows, columns)), shape=(n, n))
+        )
 
         operator, wall = self._shortley_weller(
             operator, wall, outside, inside, fraction * cut_length
         )
 
         reduction = nodes.reduction
-        reduced = (reduction.T @ operator @ reduction).tocsr()
-        self._wall = (reduction.T @ wall).tocsr()
-        self._load = (reduction.T @ sparse.diags(nodes.volumes)).tocsr()
+        reduced = sparse.csr_matrix(reduction.T @ operator @ reduction)
+        self._wall = sparse.csr_matrix(reduction.T @ wall)
+        self._load = sparse.csr_matrix(reduction.T @ sparse.diags(nodes.volumes))
 
         self.fixed = np.zeros(n, dtype=bool)
         for face, condition in self._faces.items():
@@ -920,7 +929,7 @@ class NodalPoisson:
             ),
             shape=wall.shape,
         )
-        return operator.tocsr(), wall.tocsr()
+        return sparse.csr_matrix(operator), sparse.csr_matrix(wall)
 
     # Boundary values ---------------------------------------------------------------#
     def _update_values(self) -> None:

@@ -397,7 +397,8 @@ class AMRHierarchy:
                 f"patch {normalized} overlaps an existing level-{level} patch"
             )
         # every cell of the level below that the patch refines is in a patch there
-        coarse = tuple((lo // ratio, hi // ratio) for lo, hi in normalized)
+        (i0, i1), (j0, j1) = normalized
+        coarse: IndexBox = ((i0 // ratio, i1 // ratio), (j0 // ratio, j1 // ratio))
         covered = sum(
             _shared_cells(coarse, parent.box)
             for parent in self.patches_at_level(level - 1)
