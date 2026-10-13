@@ -2164,7 +2164,7 @@ wheels = [
 [[package]]
 name = "mpiarray"
 version = "0.1.1"
-source = { git = "https://github.com/max-models/mpiarray?rev=devel#70949daee72048b5b52799a7eb95c6bb06630e6d" }
+source = { git = "https://github.com/max-models/mpiarray?rev=devel#7dd658b74fde6260ef0a1837c0dcf825d44e70cf" }
 dependencies = [
     { name = "cunumpy" },
     { name = "maybempi" },
@@ -2559,6 +2559,8 @@ docs = [
     { name = "griffe" },
     { name = "ipykernel", version = "7.3.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "ipykernel", version = "7.4.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "matplotlib", version = "3.11.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "nbclient" },
     { name = "nbformat" },
 ]
@@ -2586,6 +2588,7 @@ requires-dist = [
     { name = "nbclient", marker = "extra == 'docs'", specifier = ">=0.11.0" },
     { name = "nbformat", marker = "extra == 'docs'", specifier = ">=5.11.1" },
     { name = "numpy" },
+    { name = "patchwork", extras = ["plot"], marker = "extra == 'docs'" },
     { name = "patchwork", extras = ["test", "docs", "plot"], marker = "extra == 'dev'" },
     { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "pyproject-fmt", marker = "extra == 'dev'" },
