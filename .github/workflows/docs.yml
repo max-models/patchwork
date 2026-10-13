@@ -1,7 +1,8 @@
 name: Docs
 
-# The Astro + Starlight site in docs/: hand-written pages, the executed tutorials and the API
-# reference. Built on every push and pull request; deployed to GitHub Pages from devel.
+# The Astro + Starlight site in docs/: hand-written pages, the executed notebooks and the API
+# reference. Built on every push and pull request with the shared workflow of
+# max-models/starlight-theme; deployed to GitHub Pages from devel.
 
 on:
   push:
@@ -20,62 +21,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: astral-sh/setup-uv@v7
-        with:
-          python-version: "3.12"
-          enable-cache: true
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: docs/package-lock.json
-
-      - name: Install the package with the docs extra
-        run: |
-          uv sync --extra docs
-          uv run python -m ipykernel install --user --name python3
-
-      - name: Execute and convert the tutorials
-        run: |
-          uv run python docs/tools/notebooks.py execute
-          uv run python docs/tools/notebooks.py convert --strict
-
-      - name: Build the site
-        working-directory: docs
-        run: |
-          npm ci
-          npm run check:mdx
-          DOCS_PYTHON="$(pwd)/../.venv/bin/python" npm run build
-
-      - name: Smoke test the built site
-        working-directory: docs
-        run: |
-          for page in /index.html /getting-started/installation/index.html /tutorials/01-first-hierarchy/index.html /api/patchwork/index.html /api/patchwork/main/index.html; do
-            test -f "dist$page" || { echo "missing dist$page"; exit 1; }
-          done
-          grep -q 'href="/patchwork/' dist/index.html || { echo "links do not use the base path"; exit 1; }
-          echo "all pages built with the /patchwork base path"
-
-      - uses: actions/upload-pages-artifact@v5
-        with:
-          path: docs/dist
-
-  deploy:
-    needs: build
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/devel'
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v5
+  docs:
+    uses: max-models/starlight-theme/.github/workflows/docs.yml@v0.1.0
+    with:
+      smoke-paths: |
+        getting-started/installation/index.html
+        tutorials/01-first-hierarchy/index.html
+        api/patchwork/index.html
+        api/patchwork/main/index.html

@@ -28,10 +28,19 @@ jobs:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
 
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+
       - name: Install project
         run: |
           uv sync --extra docs
           uv run python -m ipykernel install --user --name python3
+          cd docs && npm ci
 
       - name: Execute tutorials
-        run: uv run python docs/tools/notebooks.py execute --force
+        working-directory: docs
+        run: DOCS_PYTHON="$(pwd)/../.venv/bin/python" npx starlight-notebooks execute --force

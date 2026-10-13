@@ -71,7 +71,6 @@ ignore = [ "E501" ] # line length is handled by the formatter
 pydocstyle.convention = "google"
 per-file-ignores."**/tests/**" = [ "D" ]
 per-file-ignores."*.ipynb" = [ "D" ]
-per-file-ignores."docs/tools/*" = [ "D" ]
 
 [tool.pyright]
 include = [ "src" ]

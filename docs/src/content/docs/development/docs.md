@@ -7,10 +7,16 @@ The site in `docs/` is built with [Astro](https://astro.build/) and
 [Starlight](https://starlight.astro.build/). It has three kinds of pages:
 
 - **Hand-written pages** in `docs/src/content/docs/`, as Markdown or MDX.
-- **Tutorials**, converted from the Jupyter notebooks in `tutorials/` by `docs/tools/notebooks.py`.
+- **Tutorials**, converted from the Jupyter notebooks in `tutorials/` by `starlight-notebooks`.
   Each notebook is executed and its outputs (text, images, tables) are written into an MDX page.
 - **API reference**, generated from the docstrings by
   [starlight-pydocs](https://ewels.github.io/starlight-pydocs/), one page per module.
+
+The configuration (`defineDocs` in `docs/astro.config.mjs`), the look, the header, the notebook
+tool and the build workflow come from the shared
+[starlight-theme](https://github.com/max-models/starlight-theme) of the max-models projects;
+change them there, and update the version in `docs/package.json` and
+`.github/workflows/docs.yml` to pick up a new release.
 
 ## Requirements
 
@@ -40,6 +46,7 @@ paragraph its description. Cell tags control the output:
 | ------------------ | ---------------------------------------- |
 | `remove-cell`      | the cell is left out of the page         |
 | `hide-input`       | the code is hidden, the outputs are kept |
+| `fold-input`       | the code is in a closed "Show code" box  |
 | `remove-output`    | the outputs are left out                 |
 | `raises-exception` | an error output is shown, not a failure  |
 

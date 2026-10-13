@@ -60,7 +60,7 @@ replace "${PACKAGE}\\.main\\.main" "${APPNAME_UNDERSCORE}.main.main"
 replace "/api/${PACKAGE}/" "/api/${APPNAME_UNDERSCORE}/"
 replace "src/${PACKAGE}/" "src/${APPNAME_UNDERSCORE}/"
 replace "source = \[ \"${PACKAGE}\" \]" "source = [ \"${APPNAME_UNDERSCORE}\" ]"
-replace "^const pythonPackage = '${PACKAGE}';" "const pythonPackage = '${APPNAME_UNDERSCORE}';"
+replace "pythonPackage: '${PACKAGE}'," "pythonPackage: '${APPNAME_UNDERSCORE}',"
 
 # 4. Remove the workflow that tests this script
 rm -f ".github/workflows/test_setup_script.yml"
@@ -72,5 +72,5 @@ echo "  Moved src/${PACKAGE} → src/${APPNAME_UNDERSCORE}"
 echo "  Updated the imports, entry point, docs and API reference"
 echo "  Removed .github/workflows/test_setup_script.yml"
 echo
-echo "Next: update the GitHub links in pyproject.toml, docs/astro.config.mjs and"
-echo "docs/src/components/NotebookHeader.astro, then remove this script with: rm setup_project.sh"
+echo "Next: update the GitHub links in pyproject.toml and docs/astro.config.mjs (repo:),"
+echo "then remove this script with: rm setup_project.sh"
