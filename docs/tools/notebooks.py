@@ -275,9 +275,10 @@ def convert_output(output: dict, page: Page, tags: list[str], index: int) -> str
             )
         return _fence(_ANSI.sub("", "\n".join(output.get("traceback", []))))
     data = output.get("data", {})
-    if "image/png" in data or "image/jpeg" in data:
-        mime = "image/png" if "image/png" in data else "image/jpeg"
-        path, url = page.asset(".png" if mime == "image/png" else ".jpg")
+    images = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif"}
+    mime = next((mime for mime in images if mime in data), None)
+    if mime is not None:  # a GIF is an animation, e.g. from IPython.display.Image
+        path, url = page.asset(images[mime])
         path.write_bytes(base64.b64decode(_text(data[mime])))
         page.components.add("NotebookImage")
         return f'<NotebookImage src="{url}" />'

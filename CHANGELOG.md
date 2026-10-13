@@ -49,6 +49,8 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   interpolated from the new level below). `gradient_tags` (a field's change across a cell),
   `function_tags` (a function of the position) and `cluster` (Berger-Rigoutsos clustering)
   in `patchwork.regrid`, also exported at the top level. Tutorial "Regridding".
+- `plot_patches(grid_linewidth=, grid_alpha=)`: stronger cell lines for small figures, such as
+  the frames of an animation. The tutorial publisher turns GIF outputs into animated images.
 - `Patch.local_cell_centers(hierarchy, name)` takes the field whose cells are wanted; without
   one, the first cell-centered field (it used the first field of any centering).
 
