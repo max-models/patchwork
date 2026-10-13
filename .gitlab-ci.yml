@@ -43,9 +43,11 @@ pages:
   script:
     - apt-get update && apt-get install -y python3 python3-pip python3-venv
     - pip install uv && uv sync --extra docs
-    - uv run python docs/tools/notebooks.py execute
-    - uv run python docs/tools/notebooks.py convert
-    - cd docs && npm ci && DOCS_PYTHON="$(pwd)/../.venv/bin/python" npm run build
+    - export DOCS_PYTHON="$CI_PROJECT_DIR/.venv/bin/python"
+    - cd docs && npm ci
+    - npx starlight-notebooks execute
+    - npx starlight-notebooks convert
+    - npx astro build
     - mv dist ../public
   artifacts:
     paths:
