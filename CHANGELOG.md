@@ -20,6 +20,9 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   patches, interpolation from and to a level's uniform lattice (`from_level`, `to_level`,
   `evaluation`) and `sample_patches` for patch-wise fields such as a gradient.
 - `examples/nodal_electrode.py`.
+- Tutorials (executed notebooks in `tutorials/`, published in the docs): a first hierarchy, the
+  cell-centered and node-centered Poisson solves, non-rectangular domains, and halos. They replace
+  the placeholder tutorial and the hand-written "Node-centered Poisson" page.
 - Domains that are not rectangles: `AMRHierarchy(base_boxes=...)` makes the base level a union
   of boxes (an L, a T, a notch). The edges inside the bounding rectangle are the boundary
   `"inner"`, which `NodalPoisson` takes a `Dirichlet` or `Neumann` condition for;

@@ -4,9 +4,9 @@
 import { withBase } from '../utils/base';
 
 export interface Props {
-	/** Site-root path of the downloadable notebook under public/, e.g. "/tutorials/example-tutorial/example_tutorial.ipynb". */
+	/** Site-root path of the downloadable notebook under public/, e.g. "/tutorials/01-first-hierarchy/01_first_hierarchy.ipynb". */
 	download: string;
-	/** Repository path of the notebook, e.g. "tutorials/example_tutorial.ipynb". */
+	/** Repository path of the notebook, e.g. "tutorials/01_first_hierarchy.ipynb". */
 	source: string;
 	/** "executed" (outputs from a run at build time) or "not run". */
 	status?: 'executed' | 'not run';

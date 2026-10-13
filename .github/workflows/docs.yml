@@ -59,7 +59,7 @@ jobs:
       - name: Smoke test the built site
         working-directory: docs
         run: |
-          for page in /index.html /getting-started/installation/index.html /tutorials/example-tutorial/index.html /api/patchwork/index.html /api/patchwork/main/index.html; do
+          for page in /index.html /getting-started/installation/index.html /tutorials/01-first-hierarchy/index.html /api/patchwork/index.html /api/patchwork/main/index.html; do
             test -f "dist$page" || { echo "missing dist$page"; exit 1; }
           done
           grep -q 'href="/patchwork/' dist/index.html || { echo "links do not use the base path"; exit 1; }
