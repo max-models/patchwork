@@ -49,6 +49,12 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   interpolated from the new level below). `gradient_tags` (a field's change across a cell),
   `function_tags` (a function of the position) and `cluster` (Berger-Rigoutsos clustering)
   in `patchwork.regrid`, also exported at the top level. Tutorial "Regridding".
+- Conservative fields: `allocate_field(..., conservative=True)` (cell-centered) keeps its integral
+  through `regrid`, which restricts it first and fills new cells from the level below with
+  limited (MC) slopes: the fine cells of a coarse cell keep its mean, and no new extrema appear.
+  `AMRHierarchy.integral(name)` integrates a cell- or node-centered field over the finest cells.
+- `examples/regrid_moving_charge.py`: regridding, rebuilding `NodalPoisson` and solving at every
+  step of a moving charge, timed against a uniform mesh as fine as the finest patches.
 - `plot_patches(grid_linewidth=, grid_alpha=)`: stronger cell lines for small figures, such as
   the frames of an animation. The tutorial publisher turns GIF outputs into animated images.
 - `Patch.local_cell_centers(hierarchy, name)` takes the field whose cells are wanted; without

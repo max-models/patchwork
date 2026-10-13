@@ -112,17 +112,20 @@ def fill(mesh, function):
     for patch in mesh.local_patches:
         x, y = patch.local_node_coordinates(mesh, "u")
         patch.field("u").local[...] = function(x, y)
-        x, y = patch.local_cell_centers(mesh, "c")
-        patch.field("c").local[...] = function(x, y)
+        for name in ("c", "rho"):
+            x, y = patch.local_cell_centers(mesh, name)
+            patch.field(name).local[...] = function(x, y)
 
 
-def largest_error(mesh, function):
+def largest_error(mesh, function, cells=("c", "rho")):
     error = 0.0
     for patch in mesh.local_patches:
         x, y = patch.local_node_coordinates(mesh, "u")
         error = max(error, float(np.abs(patch.field("u").local - function(x, y)).max()))
-        x, y = patch.local_cell_centers(mesh, "c")
-        error = max(error, float(np.abs(patch.field("c").local - function(x, y)).max()))
+        for name in cells:
+            x, y = patch.local_cell_centers(mesh, name)
+            values = patch.field(name).local
+            error = max(error, float(np.abs(values - function(x, y)).max()))
     return WORLD.allreduce(error, op=MPI.MAX)
 
 
@@ -130,6 +133,7 @@ def hierarchy(**options) -> AMRHierarchy:
     mesh = AMRHierarchy(base_shape=(32, 24), comm=WORLD, **options)
     mesh.allocate_field("u", centering="node", halo=1)
     mesh.allocate_field("c", halo=1)
+    mesh.allocate_field("rho", halo=1, conservative=True)
     return mesh
 
 
@@ -266,7 +270,9 @@ def test_a_periodic_axis_is_refined_across_its_seam() -> None:
     boxes = [p.box for p in mesh.patches_at_level(1)]
     assert any(j0 == 0 for _, (j0, _) in boxes)
     assert any(j1 == 48 for _, (_, j1) in boxes)
-    assert largest_error(mesh, lambda x, y: 1.0 + 2.0 * x + 0.0 * y) < 1e-12
+    # the patches reach the x walls: the conservative "rho" is flat in the
+    # coarse cells there, not linear
+    assert largest_error(mesh, lambda x, y: 1.0 + 2.0 * x + 0.0 * y, ("c",)) < 1e-12
 
 
 def test_levels_without_tags_are_dropped_and_communicators_are_shared() -> None:
@@ -311,3 +317,105 @@ def test_random_tags_on_three_levels_give_properly_nested_patches(seed) -> None:
     new = mesh.regrid(tags, efficiency=float(rng.choice([0.3, 0.5, 0.8])))
 
     assert_properly_nested(new, nesting=1)
+
+
+@pytest.mark.parametrize("periodic", [(False, False), (False, True)])
+def test_a_conservative_field_keeps_its_integral_through_regrids(periodic) -> None:
+    mesh = hierarchy(periodic=periodic, placement="balanced")
+
+    previous = None
+    for centre in (0.3, 0.45, 0.6, 0.6):  # the last regrid keeps the patches
+        # each level evolved on its own, as in a simulation: the coarse cells
+        # under a patch no longer hold the means of its cells
+        # a narrow pulse on a wide one, curved at the patches' edges too
+        fill(
+            mesh,
+            lambda x, y, c=centre: (
+                blob(x - c + 0.35, y)
+                + 0.5 * np.exp(-((x - 0.5) ** 2 + (y - 0.5) ** 2) / 0.05)
+            ),
+        )
+        total = mesh.integral("rho")
+        tags = function_tags(
+            mesh, lambda x, y, c=centre: np.hypot(x - c, y - 0.6) < 0.15, levels=3
+        )
+
+        mesh = mesh.regrid(tags, max_patch_size=16)
+
+        assert mesh.integral("rho") == pytest.approx(total, rel=1e-13, abs=0)
+        if centre != previous:
+            # the bilinear field "c" held the same values, but its new cells
+            # do not keep the integral
+            assert abs(mesh.integral("c") - total) > 1e-6
+        previous = centre
+    total = mesh.integral("rho")
+    mesh = mesh.regrid({0: np.zeros((32, 24), dtype=bool)})  # every patch dropped
+    assert mesh.integral("rho") == pytest.approx(total, rel=1e-13, abs=0)
+
+
+def test_conservative_filling_makes_no_new_extremes() -> None:
+    mesh = hierarchy()
+
+    def step(x, y):
+        return np.where(x + 0.5 * y < 0.6, 1.0, 3.0)
+
+    fill(mesh, step)
+    mesh = mesh.regrid(function_tags(mesh, lambda x, y: np.abs(x - 0.45) < 0.2, 2))
+
+    for patch in mesh.local_patches:
+        values = np.asarray(patch.field("rho").local)
+        assert values.min() >= 1.0 - 1e-12
+        assert values.max() <= 3.0 + 1e-12
+
+
+def test_the_integral_of_cell_and_node_fields() -> None:
+    mesh = AMRHierarchy(
+        base_shape=(16, 16),
+        base_boxes=[((0, 8), (0, 16)), ((8, 16), (8, 16))],  # an L of area 3/4
+        comm=WORLD,
+        placement="balanced",
+    )
+    mesh.add_patch(level=1, box=((4, 20), (16, 28)))  # over both base boxes
+    mesh.add_patch(level=2, box=((12, 28), (36, 52)))
+    mesh.allocate_field("u", centering="node")
+    mesh.allocate_field("c")
+    for patch in mesh.local_patches:
+        x, y = patch.local_node_coordinates(mesh, "u")
+        patch.field("u").local[...] = linear(x, y)
+        patch.field("c").local[...] = 2.0
+
+    assert mesh.integral("c") == pytest.approx(2.0 * 0.75, rel=1e-14)
+    # the trapezoidal rule is exact for a linear field: 1 + 2x - 3y over the
+    # unit square without the quadrant [0.5, 1] x [0, 0.5]
+    square = 1.0 + 1.0 - 1.5
+    quadrant = 0.25 * (1.0 + 2.0 * 0.75 - 3.0 * 0.25)
+    assert mesh.integral("u") == pytest.approx(square - quadrant, rel=1e-13)
+
+    # values under a finer patch do not count
+    for patch in mesh.local_patches:
+        if patch.level < 2:
+            under = patch.field("c")
+            (b0, _), (c0, _) = under.layout.index_bounds
+            (i0, _), (j0, _) = patch.box
+            i, j = np.meshgrid(
+                i0 + b0 + np.arange(under.local.shape[0]),
+                j0 + c0 + np.arange(under.local.shape[1]),
+                indexing="ij",
+            )
+            finer = covered_cells(
+                mesh.level_shape(patch.level + 1),
+                [p.box for p in mesh.patches_at_level(patch.level + 1)],
+            )
+            n, m = finer.shape
+            ratio = mesh.refinement_ratio
+            refined = finer.reshape(n // ratio, ratio, m // ratio, ratio).any(
+                axis=(1, 3)
+            )
+            np.asarray(under.local)[refined[i, j].astype(bool)] = 100.0
+    assert mesh.integral("c") == pytest.approx(2.0 * 0.75, rel=1e-14)
+
+
+def test_only_cell_centered_fields_can_be_conservative() -> None:
+    mesh = AMRHierarchy(base_shape=(8, 8), comm=WORLD)
+    with pytest.raises(ValueError, match="cell-centered"):
+        mesh.allocate_field("u", centering="node", conservative=True)

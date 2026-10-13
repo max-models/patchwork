@@ -33,6 +33,7 @@ from patchwork.halos import (
     _Points,
     _shift,
     apply_interpolations,
+    conservative_from_below,
     interpolate_from_below,
 )
 
@@ -80,16 +81,16 @@ def gradient_tags(
     cell of each level, so a finer level, with smaller cells, sees a smaller
     change: tagging stops once the cells resolve the field.
 
-    Every existing level is tagged, from the data each rank holds; the halos of
-    the field are filled first (collective). The tags are combined over the
-    ranks by :meth:`~patchwork.mesh.AMRHierarchy.regrid`.
+    Every existing level is tagged, from the data each rank holds, comparing
+    only points of the same patch: where a patch is split over ranks, the halos
+    between its blocks are filled first (``update_halos``, collective over the
+    patch's ranks). The tags are combined over the ranks by
+    :meth:`~patchwork.mesh.AMRHierarchy.regrid`.
     """
     spec = hierarchy._field_specs.get(name)
     if spec is None:
         raise KeyError(f"hierarchy has no field {name!r}")
     nodal = spec["centering"] == "node"
-    if spec["halo"]:
-        hierarchy.exchange_halos(name)
     points = _Points(hierarchy, nodal)
     tags = {
         level: np.zeros(hierarchy.level_shape(level), dtype=bool)
@@ -98,6 +99,8 @@ def gradient_tags(
     for patch in hierarchy.local_patches:
         array = patch.field(name)
         layout = array.layout
+        if layout.distributed and any(layout.halo):
+            array.update_halos()  # the seams between this patch's ranks
         storage = np.asarray(array.local_with_halos)
         # level indices of the storage's points
         axes = [
@@ -107,7 +110,9 @@ def gradient_tags(
             )
         ]
         i, j = np.meshgrid(*axes, indexing="ij")
-        valid = points.in_domain(patch.level, i, j)
+        # the patch's own points only (its halo beyond them is not filled)
+        (x0, x1), (y0, y1) = points.own(patch)
+        valid = (i >= x0) & (i < x1) & (j >= y0) & (j < y1)
         if nodal:
             corners = [
                 storage[a : a + storage.shape[0] - 1, b : b + storage.shape[1] - 1]
@@ -395,11 +400,14 @@ def transfer(old: AMRHierarchy, new: AMRHierarchy, name: str) -> None:
     """Fill field ``name`` of ``new`` from ``old``, level by level (collective).
 
     A point of a new patch takes the value of an old patch of the same level
-    that has it, else the bilinear interpolation of the new level below. Only
-    the patches' own points are written; the halos stay zero.
+    that has it, else the bilinear interpolation of the new level below (for a
+    conservative field, the conservative one of
+    :func:`~patchwork.halos.conservative_from_below`). Only the patches' own
+    points are written; the halos stay zero.
     """
     spec = new._field_specs[name]
     nodal = spec["centering"] == "node"
+    conservative = spec["conservative"]
     old_points = _Points(old, nodal)
     points = _Points(new, nodal)
 
@@ -437,7 +445,8 @@ def transfer(old: AMRHierarchy, new: AMRHierarchy, name: str) -> None:
             if level == 0:
                 continue
             i, j = np.nonzero(~covered)
-            interpolation = interpolate_from_below(
+            fill = conservative_from_below if conservative else interpolate_from_below
+            interpolation = fill(
                 new,
                 points,
                 patch,

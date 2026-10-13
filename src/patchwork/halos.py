@@ -135,36 +135,21 @@ class _Points:
         return lower, position - lower
 
 
-def interpolate_from_below(
+def _coarse_buffer(
     hierarchy: AMRHierarchy,
     points: _Points,
     patch: Patch,
     field_of: Any,
-    array: Any,
-    i: np.ndarray,
-    j: np.ndarray,
+    buffer_box: Box,
     dtype: Any,
     copies: list,
-) -> tuple | None:
-    """Bilinear interpolation of the level below ``patch`` at its points ``(i, j)``.
+) -> tuple[Any, np.ndarray]:
+    """A buffer on the patch's ranks for a box of the level below, and its copies.
 
-    ``(i, j)`` are level indices of points of ``patch`` (own or halo),
-    ``field_of(coarse)`` the array of a patch of the level below (``None``
-    where this rank does not hold it) and ``array`` the patch's own array
-    (``None`` likewise). Appends to ``copies`` the copies that bring the coarse
-    values into a buffer on the patch's ranks; the weights leave out coarse
-    points on no patch and are renormalised. Returns what to compute after the
-    copies, ``(array, storage index, buffer, flat indices, weights)``, on the
-    ranks that hold some of the points, else ``None``.
+    Appends to ``copies`` the copies of the coarse patches (across periodic
+    faces too) into the buffer. Returns the buffer (``None`` where the patch is
+    not held) and which of its points a coarse patch provides.
     """
-    if not i.size:
-        return None
-    below = patch.level - 1
-    (ci, wi), (cj, wj) = points.stencil(i, 0, below), points.stencil(j, 1, below)
-    buffer_box = (
-        (int(ci.min()), int(ci.max()) + 2),
-        (int(cj.min()), int(cj.max()) + 2),
-    )
     shape = tuple(hi - lo for lo, hi in buffer_box)
     available = np.zeros(shape, dtype=bool)
     buffer = (
@@ -185,6 +170,72 @@ def interpolate_from_below(
             target = _shift(part, tuple(-lo for lo, _ in buffer_box))
             copies.append((field_of(coarse), source, buffer, target))
             available[tuple(slice(s, e) for s, e in target)] = True
+    return buffer, available
+
+
+def _storage_index(
+    array: Any, patch: Patch, i: np.ndarray, j: np.ndarray
+) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]:
+    """Which level points ``(i, j)`` of ``patch`` this rank stores, and where."""
+    origin = tuple(lo for lo, _ in patch.box)
+    layout = array.layout
+    mine = np.ones(i.shape, dtype=bool)
+    local = []
+    for values, o, (b0, b1), h in zip(
+        (i, j), origin, layout.index_bounds, layout.halo, strict=True
+    ):
+        values = values - o
+        mine &= (values >= b0 - h) & (values < b1 + h)
+        local.append(values - b0 + h)
+    return mine, (local[0][mine], local[1][mine])
+
+
+class _Bilinear:
+    """Points of an array computed as weighted sums of four points of a buffer."""
+
+    def __init__(self, array: Any, index: tuple, buffer: Any, flat: Any, weights: Any):
+        self.array, self.index, self.buffer = array, index, buffer
+        self.flat, self.weights = flat, weights
+
+    def apply(self) -> None:
+        values = np.asarray(self.buffer.local_with_halos).reshape(-1)[self.flat]
+        self.array.local_with_halos[self.index] = (values * self.weights).sum(axis=1)
+
+
+def interpolate_from_below(
+    hierarchy: AMRHierarchy,
+    points: _Points,
+    patch: Patch,
+    field_of: Any,
+    array: Any,
+    i: np.ndarray,
+    j: np.ndarray,
+    dtype: Any,
+    copies: list,
+) -> _Bilinear | None:
+    """Bilinear interpolation of the level below ``patch`` at its points ``(i, j)``.
+
+    ``(i, j)`` are level indices of points of ``patch`` (own or halo),
+    ``field_of(coarse)`` the array of a patch of the level below (``None``
+    where this rank does not hold it) and ``array`` the patch's own array
+    (``None`` likewise). Appends to ``copies`` the copies that bring the coarse
+    values into a buffer on the patch's ranks; the weights leave out coarse
+    points on no patch and are renormalised. Returns what to compute after the
+    copies (see :func:`apply_interpolations`) on the ranks that hold some of
+    the points, else ``None``.
+    """
+    if not i.size:
+        return None
+    below = patch.level - 1
+    (ci, wi), (cj, wj) = points.stencil(i, 0, below), points.stencil(j, 1, below)
+    buffer_box = (
+        (int(ci.min()), int(ci.max()) + 2),
+        (int(cj.min()), int(cj.max()) + 2),
+    )
+    shape = tuple(hi - lo for lo, hi in buffer_box)
+    buffer, available = _coarse_buffer(
+        hierarchy, points, patch, field_of, buffer_box, dtype, copies
+    )
     # the four coarse points of every point, without the unavailable ones
     corners = []
     for a, b in itertools.product((0, 1), repeat=2):
@@ -199,27 +250,117 @@ def interpolate_from_below(
         return None
     flat = np.stack([index[keep] for index, _ in corners], axis=1)
     weights = np.stack([weight[keep] / total[keep] for _, weight in corners], axis=1)
-    origin = tuple(lo for lo, _ in patch.box)
-    layout = array.layout
-    mine = np.ones(int(keep.sum()), dtype=bool)
-    local = []
-    for values, o, (b0, b1), h in zip(
-        (i[keep], j[keep]), origin, layout.index_bounds, layout.halo, strict=True
-    ):
-        values = values - o
-        mine &= (values >= b0 - h) & (values < b1 + h)
-        local.append(values - b0 + h)
+    mine, index = _storage_index(array, patch, i[keep], j[keep])
     if not mine.any():
         return None
-    index = (local[0][mine], local[1][mine])
-    return (array, index, buffer, flat[mine], weights[mine])
+    return _Bilinear(array, index, buffer, flat[mine], weights[mine])
 
 
-def apply_interpolations(interpolations: list[tuple]) -> None:
+def _minmod(*values: np.ndarray) -> np.ndarray:
+    """The value of smallest magnitude where all have one sign, else zero."""
+    stacked = np.stack(values)
+    same = np.all(stacked > 0, axis=0) | np.all(stacked < 0, axis=0)
+    smallest = np.min(np.abs(stacked), axis=0)
+    return np.where(same, np.sign(stacked[0]) * smallest, 0.0)
+
+
+class _Conservative:
+    """Fine cells as their coarse cell's value plus limited slopes (see below)."""
+
+    def __init__(
+        self,
+        array: Any,
+        index: tuple,
+        buffer: Any,
+        flat: Any,
+        available: Any,
+        offsets: Any,
+    ):
+        self.array, self.index, self.buffer = array, index, buffer
+        self.flat, self.available, self.offsets = flat, available, offsets
+
+    def apply(self) -> None:
+        values = np.asarray(self.buffer.local_with_halos).reshape(-1)[self.flat]
+        centre = values[:, 0]
+        result = centre.copy()
+        for axis in (0, 1):
+            below, above = values[:, 1 + 2 * axis], values[:, 2 + 2 * axis]
+            has_below = self.available[:, 2 * axis]
+            has_above = self.available[:, 2 * axis + 1]
+            up, down = above - centre, centre - below
+            # monotonized central (MC) where both neighbours exist; flat where
+            # one is missing, since a one-sided slope can undershoot (e.g. go
+            # negative) on the side without a neighbour
+            slope = np.where(
+                has_below & has_above,
+                _minmod(2.0 * up, 2.0 * down, 0.5 * (up + down)),
+                0.0,
+            )
+            result += slope * self.offsets[:, axis]
+        self.array.local_with_halos[self.index] = result
+
+
+def conservative_from_below(
+    hierarchy: AMRHierarchy,
+    points: _Points,
+    patch: Patch,
+    field_of: Any,
+    array: Any,
+    i: np.ndarray,
+    j: np.ndarray,
+    dtype: Any,
+    copies: list,
+) -> _Conservative | None:
+    """Conservative interpolation of the level below at cells ``(i, j)`` of ``patch``.
+
+    For cell-centered fields: each fine cell takes the value of the coarse
+    cell it lies in plus a slope along each axis times its offset from that
+    cell's centre. The slope is the monotonized central difference of the two
+    coarse neighbours, and zero where one of them is missing (at a wall, or
+    at the edge of the level below). So the fine cells of a coarse cell
+    average to its value, no new extrema appear (a positive density stays
+    positive), and a linear field is reproduced away from walls.
+    Arguments and result as for :func:`interpolate_from_below`.
+    """
+    if not i.size:
+        return None
+    ratio = points.ratio
+    parent_i, parent_j = i // ratio, j // ratio
+    offsets = np.stack(
+        [((i % ratio) + 0.5) / ratio - 0.5, ((j % ratio) + 0.5) / ratio - 0.5], axis=1
+    )
+    buffer_box = (
+        (int(parent_i.min()) - 1, int(parent_i.max()) + 2),
+        (int(parent_j.min()) - 1, int(parent_j.max()) + 2),
+    )
+    shape = tuple(hi - lo for lo, hi in buffer_box)
+    buffer, available = _coarse_buffer(
+        hierarchy, points, patch, field_of, buffer_box, dtype, copies
+    )
+    bi, bj = parent_i - buffer_box[0][0], parent_j - buffer_box[1][0]
+    stencil = [(bi, bj), (bi - 1, bj), (bi + 1, bj), (bi, bj - 1), (bi, bj + 1)]
+    flat = np.stack([a * shape[1] + b for a, b in stencil], axis=1)
+    there = np.stack([available[a, b] for a, b in stencil], axis=1)
+    keep = there[:, 0]  # a fine cell needs its coarse cell
+    if not keep.any() or array is None:
+        return None
+    mine, index = _storage_index(array, patch, i[keep], j[keep])
+    if not mine.any():
+        return None
+    return _Conservative(
+        array,
+        index,
+        buffer,
+        flat[keep][mine],
+        there[keep][mine][:, 1:],
+        offsets[keep][mine],
+    )
+
+
+def apply_interpolations(interpolations: list) -> None:
     """Compute the interpolated points from their filled buffers."""
-    for array, index, buffer, flat, weights in interpolations:
-        values = np.asarray(buffer.local_with_halos).reshape(-1)[flat]
-        array.local_with_halos[index] = (values * weights).sum(axis=1)
+    for interpolation in interpolations:
+        interpolation.apply()
 
 
 class HaloExchange:
@@ -236,7 +377,7 @@ class HaloExchange:
         self._width = int(spec["halo"])
         points = _Points(hierarchy, spec["centering"] == "node")
         copies: list[tuple] = []
-        self._interpolations: list[tuple] = []
+        self._interpolations: list[_Bilinear] = []
         for patch in hierarchy.patches if self._width else ():
             covered = self._same_level(points, patch, copies)
             if patch.level > 0:
