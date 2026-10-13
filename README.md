@@ -31,8 +31,13 @@ field storage, plotting, and two composite Poisson solves:
   embedded bodies at fixed potentials. It is factorized once and solved
   many times, which is what a particle-in-cell code needs.
 
-Particle deposition, coarse-fine halo exchange for user kernels, and
-dynamic regridding are planned next.
+`regrid` places the patches itself: tag the cells that need finer cells
+(by a field’s change across a cell, a function of the position, or by
+hand), and it covers them with properly nested patches (Berger-Rigoutsos
+clustering) and moves the fields over.
+
+Particle deposition on patches and a distributed composite solve are
+planned next.
 
 ## Quick example
 
@@ -104,8 +109,35 @@ manufactured composite solve, see
 [`examples/nested_patches.py`](examples/nested_patches.py),
 [`examples/composite_poisson.py`](examples/composite_poisson.py),
 [`examples/nodal_electrode.py`](examples/nodal_electrode.py),
-[`examples/l_shaped_domain.py`](examples/l_shaped_domain.py), and
-[`examples/t_shaped_domain.py`](examples/t_shaped_domain.py).
+[`examples/l_shaped_domain.py`](examples/l_shaped_domain.py),
+[`examples/t_shaped_domain.py`](examples/t_shaped_domain.py), and
+[`examples/regrid_moving_charge.py`](examples/regrid_moving_charge.py).
+
+## Regridding
+
+Tag the cells that need finer cells, and `regrid` covers them with
+properly nested patches and moves the fields over:
+
+``` python
+# the cells to refine: also function_tags(...), or a boolean array per level
+tags = gradient_tags(mesh, "rho", threshold=10.0)
+mesh = mesh.regrid(tags, max_patch_size=32)  # a new hierarchy, with the fields
+solver = NodalPoisson(mesh)  # numbered and factorized again
+potential = solver.solve("rho")
+```
+
+A field allocated with `conservative=True` (a density) keeps its
+integral through every regrid. In
+[`examples/regrid_moving_charge.py`](examples/regrid_moving_charge.py) a
+charge crosses a grounded box and the mesh is regridded at every step:
+four levels on a 32 x 32 base, about 5,000 unknowns instead of 261,121
+for a uniform mesh as fine as the finest patches. Tagging, regridding,
+rebuilding the solver and solving take about 21 ms per step on one core
+of an Apple M1, as long as one solve on the uniform mesh, which also
+needs 0.9 s to factorize; the two potentials agree to 0.13%.
+
+![The potential of a moving charge, with the patches that follow
+it](docs/public/figures/regrid_moving_charge.png)
 
 ## Install
 

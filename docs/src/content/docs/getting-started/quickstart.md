@@ -45,7 +45,7 @@ For nested levels and a complete script, run `python examples/nested_patches.py`
 
 The [tutorials](/patchwork/tutorials/) go further, step by step: fields on patches, the
 cell-centered and node-centered Poisson solves (faces with different conditions, periodic
-axes, electrodes), domains that are not rectangles, and halos.
+axes, electrodes), domains that are not rectangles, halos, and regridding.
 
 ## MPI and serial use
 

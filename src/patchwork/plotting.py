@@ -16,11 +16,16 @@ def plot_patches(
     ax: Any = None,
     cmap: str = "viridis",
     root: int = 0,
+    grid_linewidth: float | None = None,
+    grid_alpha: float | None = None,
 ) -> tuple[Any, Any] | None:
     """Plot patch extents and cell grids, optionally colored by a field.
 
     With ``show_grid=False`` and no ``field`` only the patch outlines are drawn,
-    e.g. over an image that is already on ``ax``.
+    e.g. over an image that is already on ``ax``. ``grid_linewidth`` and
+    ``grid_alpha`` set the cell lines of every level; by default they are thin
+    and faint, more so on the base level, which suits a large figure. A small
+    one, e.g. an animation's frames, may need stronger lines.
 
     When ``field`` is provided, each patch field is gathered collectively and
     plotted on ``root`` only. Call this function on every rank in the patch
@@ -109,13 +114,19 @@ def plot_patches(
         )
         if show_grid:
             dx, dy = hierarchy.spacing(patch.level)
+            alpha = grid_alpha
+            if alpha is None:
+                alpha = 0.62 if patch.level else 0.24
+            linewidth = grid_linewidth
+            if linewidth is None:
+                linewidth = 0.42 if patch.level else 0.32
             ax.vlines(
                 x0 + np.arange(patch.shape[0] + 1) * dx,
                 y0,
                 y1,
                 colors=[color],
-                alpha=0.62 if patch.level else 0.24,
-                linewidth=0.42 if patch.level else 0.32,
+                alpha=alpha,
+                linewidth=linewidth,
                 zorder=2 * patch.level + 2,
             )
             ax.hlines(
@@ -123,8 +134,8 @@ def plot_patches(
                 x0,
                 x1,
                 colors=[color],
-                alpha=0.62 if patch.level else 0.24,
-                linewidth=0.42 if patch.level else 0.32,
+                alpha=alpha,
+                linewidth=linewidth,
                 zorder=2 * patch.level + 2,
             )
 

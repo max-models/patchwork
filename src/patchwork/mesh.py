@@ -9,7 +9,7 @@ import mpiarray as mpa
 from maybempi import MPI
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Iterator, Mapping, Sequence
 
     from mpiarray import DistributedArray
 
@@ -113,16 +113,34 @@ class Patch:
         x, y = self.node_coordinates(hierarchy)
         return np.meshgrid(x[i0:i1], y[j0:j1], indexing="ij")
 
-    def local_cell_centers(self, hierarchy: AMRHierarchy) -> tuple[Any, Any]:
-        """Coordinates of this rank's cell centers for the first allocated field."""
+    def local_cell_centers(
+        self, hierarchy: AMRHierarchy, name: str | None = None
+    ) -> tuple[Any, Any]:
+        """Coordinates of this rank's cells of the cell-centered field ``name``.
+
+        Two arrays of the shape of ``field(name).local``, for filling it.
+        Without ``name``, of the first cell-centered field allocated.
+        """
         if not self.is_local:
             raise RuntimeError(
                 f"this rank holds no part of the level-{self.level} patch {self.box}: "
                 f"it is on ranks {self.ranks} (see AMRHierarchy.local_patches)"
             )
-        if not self._fields:
-            raise RuntimeError("allocate a field before requesting local cell centers")
-        layout = next(iter(self._fields.values())).layout
+        if name is None:
+            cell_fields = [
+                array
+                for array in self._fields.values()
+                if tuple(array.shape) == self.shape
+            ]
+            if not cell_fields:
+                raise RuntimeError(
+                    "allocate a cell-centered field before requesting local cell centers"
+                )
+            layout = cell_fields[0].layout
+        else:
+            layout = self.field(name).layout
+            if tuple(layout.shape) != self.shape:
+                raise ValueError(f"field {name!r} is not cell-centered")
         (i0, _), (j0, _) = self.box
         (li0, li1), (lj0, lj1) = layout.index_bounds
         dx, dy = hierarchy.spacing(self.level)
@@ -216,8 +234,10 @@ class AMRHierarchy:
                 f"placement must be 'all' or 'balanced', got {placement!r}"
             )
         self.placement = placement
-        # one communicator per group of ranks, shared by the patches on it
-        self._communicators: dict[tuple[int, ...], Any] = {}
+        # one communicator per group of ranks, shared by the patches on it (and
+        # by the hierarchies regrid makes from this one, which set it beforehand)
+        if not hasattr(self, "_communicators"):
+            self._communicators: dict[tuple[int, ...], Any] = {}
         self._cells_on_rank = [0.0] * self.comm.Get_size()
         # halo exchanges and restrictions, by kind and field; rebuilt after add_patch
         self._schedules: dict[tuple[str, str], Any] = {}
@@ -441,6 +461,7 @@ class AMRHierarchy:
         halo: int = 1,
         split: Any = 0,
         centering: str = "cell",
+        conservative: bool = False,
     ) -> None:
         """Allocate a named zero-filled field on every existing patch.
 
@@ -450,12 +471,26 @@ class AMRHierarchy:
         ``centering="node"`` the values sit on the cell corners: a patch of
         ``(nx, ny)`` cells holds ``(nx + 1, ny + 1)`` of them, and patches that
         touch or nest share the nodes they have in common.
+
+        A ``conservative`` field is an amount per area, such as a density, whose
+        integral (:meth:`integral`) :meth:`regrid` keeps: it is restricted
+        before a regrid, and the cells of new patches are filled from the level
+        below so that the fine cells of a coarse cell keep its mean. It must be
+        cell-centered.
         """
         if not name or name in self._field_specs:
             raise ValueError(f"field name must be non-empty and unique, got {name!r}")
         if centering not in ("cell", "node"):
             raise ValueError(f"centering must be 'cell' or 'node', got {centering!r}")
-        spec = {"dtype": dtype, "halo": halo, "split": split, "centering": centering}
+        if conservative and centering != "cell":
+            raise ValueError("a conservative field must be cell-centered")
+        spec = {
+            "dtype": dtype,
+            "halo": halo,
+            "split": split,
+            "centering": centering,
+            "conservative": bool(conservative),
+        }
         arrays = {id(p): self._zeros(p, spec) for p in self._patches if p.is_local}
         self._field_specs[name] = spec
         for patch in self._patches:
@@ -487,6 +522,115 @@ class AMRHierarchy:
         from patchwork.halos import Restriction
 
         self._schedule("restrict", name, Restriction).execute()
+
+    def regrid(
+        self,
+        tags: Mapping[int, Any],
+        *,
+        efficiency: float = 0.7,
+        buffer: int = 1,
+        nesting: int = 1,
+        max_patch_size: int | None = None,
+        placement: str | None = None,
+    ) -> AMRHierarchy:
+        """A new hierarchy with patches over the tagged cells, and the fields moved to it.
+
+        ``tags`` maps a level to booleans of that level's shape
+        (:meth:`level_shape`): the cells that need the next finer level. Make
+        them with :func:`~patchwork.regrid.gradient_tags`,
+        :func:`~patchwork.regrid.function_tags` or by hand; each rank may tag
+        from the data it holds, and the tags are combined over the ranks.
+
+        Level by level from the coarsest, the tagged cells, grown by
+        ``buffer`` cells, are covered with boxes by
+        :func:`~patchwork.regrid.cluster` (at least ``efficiency`` of their
+        cells tagged, at most ``max_patch_size`` cells of the new level long).
+        A level also covers, with a margin, what the finer levels need, and
+        each patch keeps ``nesting`` cells of the level below between itself
+        and that level's edge (the edge of the domain excepted). The base level
+        stays as it is. The levels above the last tagged one are dropped.
+
+        Every field is moved: a point takes the value of an old patch of the
+        same level that has it, else the bilinear interpolation of the new
+        level below. A conservative field (see :meth:`allocate_field`) is first
+        restricted on this hierarchy, and its new cells are filled so that the
+        fine cells of a coarse cell keep its mean: its :meth:`integral` is the
+        same before and after. Halos are not filled; call :meth:`exchange_halos`.
+
+        New patches are placed by ``placement`` (default: this hierarchy's),
+        the largest first. Collective over ``comm``; this hierarchy is left as
+        it is, except for the restriction of conservative fields.
+        """
+        from patchwork.regrid import combine_tags, new_boxes, transfer
+
+        combined = combine_tags(self, tags)
+        boxes = new_boxes(
+            self,
+            combined,
+            efficiency=efficiency,
+            buffer=buffer,
+            nesting=nesting,
+            max_patch_size=max_patch_size,
+        )
+        base = self.patches_at_level(0)
+        new = AMRHierarchy.__new__(AMRHierarchy)
+        new._communicators = self._communicators
+        new.__init__(  # type: ignore[misc]
+            self.base_shape,  # type: ignore[arg-type]
+            self.bounds,  # type: ignore[arg-type]
+            refinement_ratio=self.refinement_ratio,
+            periodic=self.periodic,
+            base_boxes=[patch.box for patch in base],
+            base_ranks=[patch.ranks for patch in base],
+            placement=self.placement if placement is None else placement,
+            comm=self.comm,
+        )
+        for level in sorted(boxes):
+            for box in sorted(boxes[level], key=lambda b: -_shared_cells(b, b)):
+                new.add_patch(level, box)
+        for name, spec in self._field_specs.items():
+            if spec["conservative"]:
+                self.restrict(name)
+            new.allocate_field(name, **spec)
+            transfer(self, new, name)
+        return new
+
+    def integral(self, name: str) -> float:
+        """The integral of field ``name`` over the domain, from the finest values.
+
+        Cell-centered: the sum of value times area over the cells that no finer
+        patch covers. Node-centered: the trapezoidal rule over those cells.
+        Collective over ``comm``; the same value on every rank.
+        """
+        import numpy as np
+
+        if self.centering(name) == "node":
+            from patchwork.nodal import CompositeNodes
+
+            nodes = CompositeNodes(self)
+            return float(nodes.volumes @ nodes.from_patches(name))
+        ratio = self.refinement_ratio
+        total = 0.0
+        for patch in self.local_patches:
+            array = patch.field(name)
+            (b0, b1), (c0, c1) = array.layout.index_bounds
+            (i0, _), (j0, _) = patch.box
+            leaf = np.ones((b1 - b0, c1 - c0), dtype=bool)
+            # this rank's block, in the patch's level indices
+            block = ((i0 + b0, i0 + b1), (j0 + c0, j0 + c1))
+            for finer in self.patches_at_level(patch.level + 1):
+                (f0, f1), (g0, g1) = finer.box
+                under = ((f0 // ratio, f1 // ratio), (g0 // ratio, g1 // ratio))
+                lo = [max(a[0], b[0]) for a, b in zip(under, block, strict=True)]
+                hi = [min(a[1], b[1]) for a, b in zip(under, block, strict=True)]
+                if lo[0] < hi[0] and lo[1] < hi[1]:
+                    leaf[
+                        lo[0] - block[0][0] : hi[0] - block[0][0],
+                        lo[1] - block[1][0] : hi[1] - block[1][0],
+                    ] = False
+            dx, dy = self.spacing(patch.level)
+            total += float(np.asarray(array.local)[leaf].sum()) * dx * dy
+        return float(self.comm.allreduce(total, op=MPI.SUM))
 
     def _schedule(self, kind: str, name: str, build: Any) -> Any:
         if name not in self._field_specs:

@@ -17,6 +17,8 @@ Step by step, from a first hierarchy to stencils on patches:
    and a T, with patches at their inner corners.
 5. [Halos: stencils on patches](/patchwork/tutorials/05-halo-exchange/): halo exchange and
    restriction.
+6. [Regridding](/patchwork/tutorials/06-regridding/): tagging cells, clustering them into
+   patches, and patches that follow a moving feature.
 
 Every notebook in `tutorials/` is executed when the site is built and published here with its
 outputs. Download a notebook from its page to run the steps yourself.

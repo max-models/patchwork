@@ -39,12 +39,13 @@ def test_patches_on_some_ranks_give_what_one_rank_gives(ranks: int) -> None:
 
 
 @pytest.mark.parametrize("ranks", [2, 3, 4])
-def test_halo_exchange_and_restriction_under_mpi(ranks: int) -> None:
-    """``test_halos.py`` on every rank, with patches on one, some and all ranks."""
+@pytest.mark.parametrize("tests", ["test_halos.py", "test_regrid.py"])
+def test_halos_and_regridding_under_mpi(tests: str, ranks: int) -> None:
+    """These test files on every rank, with patches on one, some and all ranks."""
     env = os.environ.copy()
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         env.update(OMPI_ALLOW_RUN_AS_ROOT="1", OMPI_ALLOW_RUN_AS_ROOT_CONFIRM="1")
-    tests = Path(__file__).with_name("test_halos.py")
+    path = Path(__file__).with_name(tests)
     result = subprocess.run(
         [
             MPIRUN,
@@ -57,7 +58,7 @@ def test_halo_exchange_and_restriction_under_mpi(ranks: int) -> None:
             "-q",
             "-p",
             "no:cacheprovider",
-            str(tests),
+            str(path),
         ],
         capture_output=True,
         text=True,
