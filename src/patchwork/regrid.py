@@ -205,6 +205,7 @@ def cluster(
     efficiency: float = 0.7,
     max_size: int | None = None,
     allowed: np.ndarray | None = None,
+    min_size: int = 1,
 ) -> list[IndexBox]:
     """Cover the tagged cells with boxes (the Berger-Rigoutsos algorithm).
 
@@ -221,6 +222,11 @@ def cluster(
         max_size: The longest side of a box, in cells; default: no limit.
         allowed: Booleans of the shape of ``tags``: where boxes may go.
             Tagged cells that are not allowed are dropped.
+        min_size: The shortest side a box should have, in cells. A shorter box
+            is widened, one row or column at a time, into cells that are
+            allowed and that no other box has, as far as there is room: it
+            stays shorter where there is none (the shape of ``tags`` or the
+            allowed region is narrower).
 
     Returns:
         Half-open boxes ``((i0, i1), (j0, j1))`` that do not overlap and cover
@@ -233,6 +239,10 @@ def cluster(
         raise ValueError(f"efficiency must be in (0, 1], got {efficiency}")
     if max_size is not None and max_size < 1:
         raise ValueError(f"max_size must be at least 1, got {max_size}")
+    if min_size < 1:
+        raise ValueError(f"min_size must be at least 1, got {min_size}")
+    if max_size is not None and min_size > max_size:
+        raise ValueError(f"min_size {min_size} exceeds max_size {max_size}")
     if allowed is not None:
         allowed = np.asarray(allowed, dtype=bool)
         if allowed.shape != tags.shape:
@@ -256,7 +266,52 @@ def cluster(
         first[axis] = (lo, lo + cut)
         second[axis] = (lo + cut, hi)
         pending.extend([tuple(second), tuple(first)])  # type: ignore[arg-type]
+    if min_size > 1:
+        boxes = _widen(boxes, tags.shape, allowed, min_size)
     return sorted(boxes)
+
+
+def _widen(
+    boxes: list[IndexBox],
+    shape: tuple[int, ...],
+    allowed: np.ndarray | None,
+    min_size: int,
+) -> list[IndexBox]:
+    """Widen the boxes shorter than ``min_size`` into free, allowed cells."""
+    taken = np.zeros(shape, dtype=bool)
+    for (i0, i1), (j0, j1) in boxes:
+        taken[i0:i1, j0:j1] = True
+    result = []
+    for box in boxes:
+        lows = [lo for lo, _ in box]
+        highs = [hi for _, hi in box]
+        for axis in (0, 1):
+            other = 1 - axis
+            while highs[axis] - lows[axis] < min_size:
+                grew = False
+                for side in (-1, 1):  # the lower side first, then the upper one
+                    cell = lows[axis] - 1 if side < 0 else highs[axis]
+                    if not 0 <= cell < shape[axis]:
+                        continue
+                    index: list[Any] = [slice(None), slice(None)]
+                    index[axis] = cell
+                    index[other] = slice(lows[other], highs[other])
+                    strip = tuple(index)
+                    if taken[strip].any() or (
+                        allowed is not None and not allowed[strip].all()
+                    ):
+                        continue
+                    taken[strip] = True
+                    if side < 0:
+                        lows[axis] -= 1
+                    else:
+                        highs[axis] += 1
+                    grew = True
+                    break
+                if not grew:
+                    break
+        result.append(((lows[0], highs[0]), (lows[1], highs[1])))
+    return result
 
 
 def _shrink_to_tags(tags: np.ndarray, box: Box) -> Box | None:
@@ -342,6 +397,31 @@ def combine_tags(
     return combined
 
 
+def _forbidden_cells(
+    hierarchy: AMRHierarchy, forbid: Any, level: int
+) -> np.ndarray | None:
+    """The cells of ``level`` that no patch may cover: a mask, or ``None`` for none."""
+    if forbid is None:
+        return None
+    shape = hierarchy.level_shape(level)
+    if callable(forbid):
+        dx, dy = hierarchy.spacing(level)
+        (x0, _), (y0, _) = hierarchy.bounds
+        x = x0 + (np.arange(shape[0]) + 0.5) * dx
+        y = y0 + (np.arange(shape[1]) + 0.5) * dy
+        xx, yy = np.meshgrid(x, y, indexing="ij")
+        values = np.asarray(forbid(xx, yy), dtype=bool)
+        return np.ascontiguousarray(np.broadcast_to(values, shape))
+    if level not in forbid:
+        return None
+    values = np.asarray(forbid[level], dtype=bool)
+    if values.shape != shape:
+        raise ValueError(
+            f"forbid of level {level} has the shape {values.shape}, not {shape}"
+        )
+    return values
+
+
 def new_boxes(
     hierarchy: AMRHierarchy,
     tags: Mapping[int, np.ndarray],
@@ -350,8 +430,14 @@ def new_boxes(
     buffer: int,
     nesting: int,
     max_patch_size: int | None,
+    min_patch_size: int = 1,
+    forbid: Any = None,
 ) -> dict[int, list[IndexBox]]:
-    """The boxes of every refined level, from the combined tags of each level."""
+    """The boxes of every refined level, from the combined tags of each level.
+
+    ``min_patch_size`` is in cells of the new level, ``forbid`` as for
+    :meth:`~patchwork.mesh.AMRHierarchy.regrid`.
+    """
     ratio = hierarchy.refinement_ratio
     periodic = hierarchy.periodic
     if max_patch_size is not None and max_patch_size < ratio:
@@ -360,6 +446,10 @@ def new_boxes(
         )
     if buffer < 0 or nesting < 0:
         raise ValueError("buffer and nesting must not be negative")
+    if min_patch_size < 1:
+        raise ValueError("min_patch_size must be at least 1")
+    if max_patch_size is not None and min_patch_size > max_patch_size:
+        raise ValueError("min_patch_size must not exceed max_patch_size")
     levels = [level for level, values in tags.items() if values.any()]
     top = max(levels) + 1 if levels else 0
     # each level's tags, grown by the buffer, and the cells a finer level needs
@@ -381,8 +471,16 @@ def new_boxes(
         domain = _domain_cells(hierarchy, level)
         # inside the level, away from its coarse-fine edges (the domain's edges are fine)
         allowed = _shrink(covered | ~domain, nesting, periodic) & covered
+        # a cell of this level may be refined only if none of its fine cells is forbidden
+        forbidden = _forbidden_cells(hierarchy, forbid, level + 1)
+        if forbidden is not None:
+            n, m = forbidden.shape
+            allowed &= ~forbidden.reshape(n // ratio, ratio, m // ratio, ratio).any(
+                axis=(1, 3)
+            )
         max_size = None if max_patch_size is None else max_patch_size // ratio
-        coarse = cluster(grown[level], efficiency, max_size, allowed)
+        min_size = -(-min_patch_size // ratio)
+        coarse = cluster(grown[level], efficiency, max_size, allowed, min_size)
         boxes[level + 1] = [
             ((i0 * ratio, i1 * ratio), (j0 * ratio, j1 * ratio))
             for (i0, i1), (j0, j1) in coarse

@@ -146,3 +146,110 @@ def test_the_nodes_of_a_rank_come_with_their_coordinates() -> None:
     assert x.shape == patch.field("phi").local.shape == (5, 3)
     assert x[:, 0] == pytest.approx([0.0, 0.5, 1.0, 1.5, 2.0])
     assert y[0] == pytest.approx([0.0, 0.5, 1.0])
+
+
+def _three_levels(**kwargs) -> AMRHierarchy:
+    """A 16 x 16 unit square with a level-1 patch over its middle and a level-2 patch in that."""
+    mesh = AMRHierarchy(base_shape=(16, 16), **kwargs)
+    mesh.add_patch(level=1, box=((8, 24), (8, 24)))
+    mesh.add_patch(level=2, box=((20, 36), (20, 36)))
+    return mesh
+
+
+def _holds(patch, mesh: AMRHierarchy, x: float, y: float) -> bool:
+    """Whether the half-open rectangle of ``patch`` holds the point."""
+    (x0, x1), (y0, y1) = patch.physical_bounds(mesh)
+    return bool(x0 <= x < x1 and y0 <= y < y1)
+
+
+def test_locate_gives_the_finest_patch_that_holds_each_point() -> None:
+    mesh = _three_levels()
+    patches = mesh.patches
+    rng = np.random.default_rng(3)
+    x, y = rng.random((2, 400))
+
+    found = mesh.locate(x, y)
+
+    assert found.shape == x.shape
+    assert set(patches[n].level for n in found) == {0, 1, 2}  # every level is hit
+    for n, px, py in zip(found, x, y, strict=True):
+        assert _holds(patches[n], mesh, px, py)
+        # no finer patch holds it
+        for patch in patches:
+            if patch.level > patches[n].level:
+                assert not _holds(patch, mesh, px, py)
+
+
+def test_locate_keeps_the_shape_of_the_points() -> None:
+    mesh = _three_levels()
+    x, y = np.meshgrid(
+        np.linspace(0.1, 0.9, 5), np.linspace(0.1, 0.9, 7), indexing="ij"
+    )
+
+    found = mesh.locate(x, y)
+
+    assert found.shape == (5, 7)
+    assert mesh.locate(0.5, 0.5).shape == ()
+    assert mesh.patches[int(mesh.locate(0.5, 0.5))].level == 2
+    with pytest.raises(ValueError, match="same shape"):
+        mesh.locate(np.zeros(3), np.zeros(4))
+
+
+def test_locate_finds_nothing_outside_the_domain_or_in_the_notch_of_an_l() -> None:
+    mesh = AMRHierarchy(base_shape=(16, 16), base_boxes=ELL)
+    mesh.add_patch(level=1, box=((12, 20), (20, 28)))  # over both base boxes
+
+    found = mesh.locate(
+        [0.25, 0.75, 0.75, -0.1, 1.1, 0.5, np.nan],
+        [0.5, 0.75, 0.25, 0.5, 0.5, 1.5, 0.5],
+    )
+
+    boxes = [mesh.patches[n].box if n >= 0 else None for n in found]
+    assert boxes[0] == ((0, 8), (0, 16))
+    assert boxes[1] == ((8, 16), (8, 16))
+    # the notch (lower right quadrant), left of, right of, above the domain, and NaN
+    assert list(found[2:]) == [-1, -1, -1, -1, -1]
+
+
+def test_locate_gives_an_edge_to_the_patch_that_starts_there() -> None:
+    mesh = _three_levels()
+    patches = mesh.patches
+    # exact in binary: the level-1 patch starts at x = y = 8/32 = 0.25, ends at 0.75
+    start = mesh.locate(0.25, 0.5)
+    before = mesh.locate(0.25 - 2.0**-10, 0.5)
+    end = mesh.locate(0.75, 0.5)
+
+    assert patches[int(start)].level == 1
+    assert patches[int(before)].level == 0
+    assert patches[int(end)].level == 0
+
+    # the upper faces and the lower left corner belong to the domain
+    corner = mesh.locate([0.0, 1.0, 1.0], [0.0, 1.0, 0.5])
+    assert all(patches[n].level == 0 for n in corner)
+    assert patches[corner[0]].box == ((0, 16), (0, 16))
+
+
+def test_locate_wraps_points_on_a_periodic_axis() -> None:
+    mesh = _three_levels(periodic=(True, False))
+    shift = 3.0 / 32.0
+
+    inside = mesh.locate(0.5 + shift, 0.5)
+    wrapped_up = mesh.locate(1.5 + shift, 0.5)
+    wrapped_down = mesh.locate(-0.5 + shift, 0.5)
+
+    assert inside == wrapped_up == wrapped_down
+    # not on the other axis
+    assert mesh.locate(0.5, 1.5) == -1
+    assert mesh.locate(0.5, -0.5) == -1
+
+
+def test_locate_follows_a_patch_that_is_added_later() -> None:
+    mesh = AMRHierarchy(base_shape=(16, 16))
+    before = mesh.locate(0.5, 0.5)
+    assert mesh.patches[int(before)].level == 0
+
+    mesh.add_patch(level=1, box=((8, 24), (8, 24)))
+    after = mesh.locate(0.5, 0.5)
+
+    assert mesh.patches[int(after)].level == 1
+    assert mesh.patches[int(mesh.locate(0.1, 0.1))].level == 0

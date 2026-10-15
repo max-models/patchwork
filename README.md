@@ -36,8 +36,19 @@ field storage, plotting, and two composite Poisson solves:
 hand), and it covers them with properly nested patches (Berger-Rigoutsos
 clustering) and moves the fields over.
 
-Particle deposition on patches and a distributed composite solve are
-planned next.
+Markers live on the patches too: `locate` finds the finest patch of each
+point, `owner` and `migrate` put each marker on the rank that holds its cell,
+and `deposit` spreads the charge of the markers over the nodes (cloud-in-cell)
+patch by patch. `accumulate_halos` then brings it to the composite nodes: the
+halos of the blocks and the copies of a node in several patches are added to
+one copy, the one `CompositeNodes.from_patches` reads, so the charge is that of
+`CompositeNodes.deposit`, to round-off. `regrid` can fill the halos afterwards
+(`fill_halos`), keep patches off given cells (`forbid`, for example a periodic
+seam) and off one-cell-wide shapes (`min_patch_size`); a patch can be placed by
+a function (`placement`) and a large one split over ranks
+(`max_cells_per_rank`).
+
+A distributed composite solve is planned next.
 
 ## Quick example
 

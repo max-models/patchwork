@@ -9,7 +9,7 @@ import mpiarray as mpa
 from maybempi import MPI
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
     from mpiarray import DistributedArray
 
@@ -44,6 +44,35 @@ def _overlap(a: IndexBox, b: IndexBox) -> bool:
     return all(
         max(x0, y0) < min(x1, y1) for (x0, x1), (y0, y1) in zip(a, b, strict=True)
     )
+
+
+def _gather_blocks(
+    hierarchy: AMRHierarchy, name: str
+) -> dict[int, tuple[list[tuple[int, IndexBox]], bool]]:
+    """Which block of field ``name`` every rank holds, by patch number (collective).
+
+    For each patch (index in :attr:`AMRHierarchy.patches`): the ranks of the hierarchy's
+    communicator that hold a part of it, each with its block ``((a0, a1), (b0, b1))`` in
+    the patch's own indices, and whether the field is replicated (every rank of a patch
+    on several ranks holds all of it).
+    """
+    mine = []
+    rank = hierarchy.comm.Get_rank()
+    for number, patch in enumerate(hierarchy.patches):
+        if patch.is_local:
+            mine.append((number, rank, tuple(patch.field(name).layout.index_bounds)))
+    table: dict[int, list[tuple[int, IndexBox]]] = {}
+    for part in hierarchy.comm.allgather(mine):
+        for number, holder, bounds in part:
+            table.setdefault(number, []).append((holder, bounds))
+    result = {}
+    for number in range(len(hierarchy.patches)):
+        members = sorted(table[number])
+        replicated = len(members) > 1 and all(
+            bounds == members[0][1] for _, bounds in members
+        )
+        result[number] = (members, replicated)
+    return result
 
 
 #: Tag of the messages that carry a gathered patch field to another rank.
@@ -187,7 +216,10 @@ class AMRHierarchy:
     on several, over which mpiarray splits its fields. ``placement`` says
     where a patch goes that is added without ``ranks``: ``"all"`` puts it on
     every rank, ``"balanced"`` on the one rank that holds the fewest cells so
-    far.
+    far, or a function ``placement(level, box)`` that returns the ranks (as
+    ``ranks`` of :meth:`add_patch` takes them). With ``max_cells_per_rank``, a
+    ``"balanced"`` patch with more cells than that is split over as many of
+    the least loaded ranks as it needs (at most all of them).
 
     The domain is the rectangle of ``base_shape`` cells, or with ``base_boxes``
     the union of those boxes of base cells: an L, a T, a rectangle with a notch.
@@ -203,7 +235,8 @@ class AMRHierarchy:
         refinement_ratio: int = 2,
         periodic: tuple[bool, bool] = (False, False),
         base_boxes: Sequence[Sequence[Sequence[int]]] | None = None,
-        placement: str = "all",
+        placement: str | Callable[[int, IndexBox], Any] = "all",
+        max_cells_per_rank: int | None = None,
         base_ranks: Sequence[int | Sequence[int] | None] | None = None,
         comm: Any = None,
     ) -> None:
@@ -229,11 +262,16 @@ class AMRHierarchy:
             raise ValueError("periodic must have one flag per axis")
         self.periodic = (bool(periodic[0]), bool(periodic[1]))
         self.comm = mpa.default_comm() if comm is None else comm
-        if placement not in ("all", "balanced"):
+        if not callable(placement) and placement not in ("all", "balanced"):
             raise ValueError(
-                f"placement must be 'all' or 'balanced', got {placement!r}"
+                f"placement must be 'all', 'balanced' or a function, got {placement!r}"
             )
+        if max_cells_per_rank is not None and int(max_cells_per_rank) < 1:
+            raise ValueError("max_cells_per_rank must be at least 1")
         self.placement = placement
+        self.max_cells_per_rank = (
+            None if max_cells_per_rank is None else int(max_cells_per_rank)
+        )
         # one communicator per group of ranks, shared by the patches on it (and
         # by the hierarchies regrid makes from this one, which set it beforehand)
         if not hasattr(self, "_communicators"):
@@ -241,6 +279,8 @@ class AMRHierarchy:
         self._cells_on_rank = [0.0] * self.comm.Get_size()
         # halo exchanges and restrictions, by kind and field; rebuilt after add_patch
         self._schedules: dict[tuple[str, str], Any] = {}
+        # which patch owns each cell of a level, rebuilt after add_patch (see locate)
+        self._locators: dict[int, tuple[tuple[int, int], Any]] = {}
         self._field_specs: dict[str, dict[str, Any]] = {}
         whole = ((0, self.base_shape[0]), (0, self.base_shape[1]))
         boxes = [whole] if base_boxes is None else [_box(box) for box in base_boxes]
@@ -307,11 +347,18 @@ class AMRHierarchy:
         """A patch on ``ranks`` (or where ``placement`` puts it), with its communicator."""
         size = self.comm.Get_size()
         cells = (box[0][1] - box[0][0]) * (box[1][1] - box[1][0])
+        if ranks is None and callable(self.placement):
+            ranks = self.placement(level, box)
         if ranks is None:
             if self.placement == "all":
                 chosen = tuple(range(size))
             else:
-                chosen = (min(range(size), key=lambda r: (self._cells_on_rank[r], r)),)
+                limit = self.max_cells_per_rank
+                wanted = 1 if limit is None else min(size, max(1, -(-cells // limit)))
+                least_loaded = sorted(
+                    range(size), key=lambda r: (self._cells_on_rank[r], r)
+                )
+                chosen = tuple(sorted(least_loaded[:wanted]))
         else:
             listed = [ranks] if isinstance(ranks, int) else list(ranks)
             chosen = tuple(sorted({int(rank) for rank in listed}))
@@ -429,6 +476,7 @@ class AMRHierarchy:
             )
         patch = self._new_patch(level, normalized, ranks)
         self._schedules.clear()
+        self._locators.clear()
         if patch.is_local:
             for name, spec in self._field_specs.items():
                 patch._fields[name] = self._zeros(patch, spec)
@@ -531,7 +579,10 @@ class AMRHierarchy:
         buffer: int = 1,
         nesting: int = 1,
         max_patch_size: int | None = None,
-        placement: str | None = None,
+        min_patch_size: int = 1,
+        forbid: Any = None,
+        placement: str | Callable[[int, IndexBox], Any] | None = None,
+        fill_halos: bool = False,
     ) -> AMRHierarchy:
         """A new hierarchy with patches over the tagged cells, and the fields moved to it.
 
@@ -555,7 +606,20 @@ class AMRHierarchy:
         level below. A conservative field (see :meth:`allocate_field`) is first
         restricted on this hierarchy, and its new cells are filled so that the
         fine cells of a coarse cell keep its mean: its :meth:`integral` is the
-        same before and after. Halos are not filled; call :meth:`exchange_halos`.
+        same before and after. Halos are not filled unless ``fill_halos``
+        (then :meth:`exchange_halos` runs for every field of the new
+        hierarchy).
+
+        ``min_patch_size`` is the shortest side a patch may have, in cells of
+        its own level (rounded up to whole cells of the level below): a patch
+        that would be narrower is widened where there is room, so that no
+        patch is one cell wide. ``forbid`` keeps patches off places a code
+        cannot handle, such as a periodic seam: a mapping from a level
+        (1 and up) to booleans of that level's shape (:meth:`level_shape`),
+        true where no patch of that level may cover a cell, or a function of
+        the cell centres ``(x, y)`` of a level that returns such booleans and
+        is used for every refined level. Tags that would need a forbidden cell
+        are dropped, as are those that would need patches too close to it.
 
         New patches are placed by ``placement`` (default: this hierarchy's),
         the largest first. Collective over ``comm``; this hierarchy is left as
@@ -571,6 +635,8 @@ class AMRHierarchy:
             buffer=buffer,
             nesting=nesting,
             max_patch_size=max_patch_size,
+            min_patch_size=min_patch_size,
+            forbid=forbid,
         )
         base = self.patches_at_level(0)
         new = AMRHierarchy.__new__(AMRHierarchy)
@@ -583,6 +649,7 @@ class AMRHierarchy:
             base_boxes=[patch.box for patch in base],
             base_ranks=[patch.ranks for patch in base],
             placement=self.placement if placement is None else placement,
+            max_cells_per_rank=self.max_cells_per_rank,
             comm=self.comm,
         )
         for level in sorted(boxes):
@@ -593,6 +660,9 @@ class AMRHierarchy:
                 self.restrict(name)
             new.allocate_field(name, **spec)
             transfer(self, new, name)
+        if fill_halos:
+            for name in new.field_names:
+                new.exchange_halos(name)
         return new
 
     def integral(self, name: str) -> float:
@@ -631,6 +701,284 @@ class AMRHierarchy:
             dx, dy = self.spacing(patch.level)
             total += float(np.asarray(array.local)[leaf].sum()) * dx * dy
         return float(self.comm.allreduce(total, op=MPI.SUM))
+
+    def _locator(self, level: int) -> tuple[tuple[int, int], Any]:
+        """Which patch holds each cell of ``level``: the corner of the table and the table.
+
+        The table covers the bounding box of the level's patches and holds the index
+        into :attr:`patches` of the patch over each cell, -1 where there is none.
+        """
+        import numpy as np
+
+        if level not in self._locators:
+            members = [
+                (number, patch)
+                for number, patch in enumerate(self.patches)
+                if patch.level == level
+            ]
+            i_low = min(patch.box[0][0] for _, patch in members)
+            i_high = max(patch.box[0][1] for _, patch in members)
+            j_low = min(patch.box[1][0] for _, patch in members)
+            j_high = max(patch.box[1][1] for _, patch in members)
+            table = np.full((i_high - i_low, j_high - j_low), -1, dtype=np.intp)
+            for number, patch in members:
+                (i0, i1), (j0, j1) = patch.box
+                table[i0 - i_low : i1 - i_low, j0 - j_low : j1 - j_low] = number
+            self._locators[level] = ((i_low, j_low), table)
+        return self._locators[level]
+
+    def _cells(self, x: Any, y: Any) -> tuple[Any, Any, Any, tuple[Any, Any]]:
+        """Where flat arrays of points are: patch, cell and wrapped coordinates.
+
+        Returns, for each point, the index of the finest patch that holds it
+        (-1 outside the domain), its cell on the level of that patch (level
+        indices), and the coordinates wrapped into the domain on periodic axes.
+        """
+        import numpy as np
+
+        coordinates = []
+        inside = np.ones(x.size, dtype=bool)
+        for axis, values in enumerate((x, y)):
+            low, high = self.bounds[axis]
+            if self.periodic[axis]:
+                values = low + np.mod(values - low, high - low)
+            inside &= (values >= low) & (values <= high)  # False for NaN
+            coordinates.append(values)
+        found = np.full(x.size, -1, dtype=np.intp)
+        cell_i = np.zeros(x.size, dtype=np.intp)
+        cell_j = np.zeros(x.size, dtype=np.intp)
+        for level in range(self.max_level, -1, -1):
+            pending = np.flatnonzero(inside & (found < 0))
+            if pending.size == 0:
+                break
+            (i_low, j_low), table = self._locator(level)
+            cells = []
+            for axis in (0, 1):
+                low = self.bounds[axis][0]
+                spacing = self.spacing(level)[axis]
+                count = self.level_shape(level)[axis]
+                index = np.floor((coordinates[axis][pending] - low) / spacing)
+                cells.append(np.minimum(index.astype(np.intp), count - 1))
+            i = cells[0] - i_low
+            j = cells[1] - j_low
+            within = (i >= 0) & (i < table.shape[0]) & (j >= 0) & (j < table.shape[1])
+            owner = np.full(pending.size, -1, dtype=np.intp)
+            owner[within] = table[i[within], j[within]]
+            hit = owner >= 0
+            found[pending[hit]] = owner[hit]
+            cell_i[pending[hit]] = cells[0][hit]
+            cell_j[pending[hit]] = cells[1][hit]
+        return found, cell_i, cell_j, (coordinates[0], coordinates[1])
+
+    @staticmethod
+    def _points(x: Any, y: Any) -> tuple[Any, Any, tuple[int, ...]]:
+        """Flat float arrays of the coordinates of points, and their common shape."""
+        import numpy as np
+
+        x = np.asarray(x, dtype=float)
+        y = np.asarray(y, dtype=float)
+        if x.shape != y.shape:
+            raise ValueError(
+                f"x and y must have the same shape, got {x.shape} and {y.shape}"
+            )
+        return x.reshape(-1), y.reshape(-1), x.shape
+
+    def locate(self, x: Any, y: Any) -> Any:
+        """The finest patch that holds each point: its index in :attr:`patches`.
+
+        ``x`` and ``y`` are arrays of the same shape (physical coordinates); the result
+        has that shape and is -1 for a point outside the domain, such as one in the notch of
+        an L. Cells are half open, so a point on the edge between two patches belongs to the
+        one that starts there; the upper faces of the domain, though, belong to the last
+        cell. On a periodic axis a point outside the domain is wrapped back into it first.
+        Local to every rank (every rank holds the whole hierarchy); no communication.
+        """
+        x, y, shape = self._points(x, y)
+        return self._cells(x, y)[0].reshape(shape)
+
+    def _owners(self, found: Any, cell_i: Any, cell_j: Any, name: str) -> Any:
+        """The rank that holds the block of field ``name`` where each marker's cell starts."""
+        import numpy as np
+
+        blocks = self._schedule("blocks", name, _gather_blocks)
+        patches = self.patches
+        result = np.full(found.shape, -1, dtype=np.int64)
+        for number in np.unique(found[found >= 0]):
+            members, replicated = blocks[int(number)]
+            if replicated:
+                raise ValueError(
+                    f"field {name!r} is replicated (split=None) on the several ranks "
+                    f"of the level-{patches[number].level} patch {patches[number].box}: "
+                    "a point has no owner; allocate it with split=0"
+                )
+            chosen = np.flatnonzero(found == number)
+            (i0, _), (j0, _) = patches[number].box
+            a, b = cell_i[chosen] - i0, cell_j[chosen] - j0
+            for rank, ((a0, a1), (b0, b1)) in members:
+                inside = (a >= a0) & (a < a1) & (b >= b0) & (b < b1)
+                result[chosen[inside]] = rank
+        return result
+
+    def owner(self, x: Any, y: Any, name: str) -> Any:
+        """The rank that should hold each marker: -1 outside the domain.
+
+        A marker belongs to the rank that holds the block of field ``name`` in which the
+        lower left corner of its cell lies, in the finest patch that holds it (see
+        :meth:`locate`). That block is the one :meth:`deposit` writes into: the other
+        corners of the cell are in its halo, which :meth:`accumulate_halos` hands on. The
+        same for a cell-centered and a node-centered field, since cell ``(i, j)`` starts at
+        node ``(i, j)``. Collective the first time for a field (until a patch is added), as
+        the ranks tell each other their blocks; the same result on every rank for the same
+        points.
+        """
+        x, y, shape = self._points(x, y)
+        found, cell_i, cell_j, _ = self._cells(x, y)
+        return self._owners(found, cell_i, cell_j, name).reshape(shape)
+
+    def migrate(
+        self, x: Any, y: Any, *arrays: Any, name: str, outside: str = "error"
+    ) -> tuple[Any, ...]:
+        """Send markers to the ranks that hold their patches; returns what this rank gets.
+
+        ``x`` and ``y`` are the positions of this rank's markers (1D) and ``arrays`` any
+        other per-marker data, with one row per marker (velocities as ``v.T`` if they are
+        stored ``(3, n)``). Each marker goes to :meth:`owner` of field ``name``, with
+        :func:`mpiarray.migrate`. Returns ``(x, y, *arrays)`` of the markers now on this
+        rank: those that stayed and those that arrived, ordered by the rank they came
+        from. Call it again on the hierarchy :meth:`regrid` returns to move the markers
+        whose patch changed ranks.
+
+        A marker outside the domain raises ``ValueError`` on every rank with
+        ``outside="error"``, or is dropped with ``outside="drop"``. Collective.
+        """
+        import numpy as np
+
+        if outside not in ("error", "drop"):
+            raise ValueError(f"outside must be 'error' or 'drop', got {outside!r}")
+        x, y, shape = self._points(x, y)
+        if len(shape) != 1:
+            raise ValueError("x and y must be one-dimensional")
+        for array in arrays:
+            if np.shape(array)[:1] != shape:
+                raise ValueError(
+                    f"an array of shape {np.shape(array)} does not have one row per "
+                    f"marker ({shape[0]})"
+                )
+        found, cell_i, cell_j, _ = self._cells(x, y)
+        destinations = self._owners(found, cell_i, cell_j, name)
+        lost = destinations < 0
+        total = int(self.comm.allreduce(int(lost.sum()), op=MPI.SUM))
+        if total and outside == "error":
+            raise ValueError(f"{total} markers are outside the domain")
+        keep = ~lost
+        received = mpa.migrate(
+            destinations[keep],
+            x[keep],
+            y[keep],
+            *(np.asarray(array)[keep] for array in arrays),
+            comm=self.comm,
+        )
+        return tuple(np.asarray(array) for array in received)
+
+    def deposit(
+        self, x: Any, y: Any, charge: Any, name: str, *, reset: bool = True
+    ) -> None:
+        """Deposit the charge of markers on the node-centered field ``name``, patch by patch.
+
+        Each marker spreads its ``charge`` over the four corners of its cell, in the finest
+        patch that holds it, with bilinear (cloud-in-cell) weights: the same weights as
+        :meth:`CompositeNodes.deposit <patchwork.nodal.CompositeNodes.deposit>`, whose
+        transposed interpolation the field gather is. The values are charges, not a density.
+        The markers must be on the ranks that :meth:`owner` gives (use :meth:`migrate`),
+        so that the corners fall in the block or its halo, and the field needs a halo of
+        at least one node. The corners in the halo, and the nodes that several patches
+        share, are not yet where the composite mesh wants them: follow with
+        :meth:`accumulate_halos`. With ``reset`` the field is zeroed first, halos included.
+        Collective (the check of the owners).
+        """
+        import numpy as np
+
+        spec = self._field_specs.get(name)
+        if spec is None:
+            raise KeyError(f"hierarchy has no field {name!r}")
+        if spec["centering"] != "node":
+            raise ValueError("deposit is for node-centered fields")
+        if spec["halo"] < 1:
+            raise ValueError("deposit needs a halo of at least one node")
+        x, y, shape = self._points(x, y)
+        charge = np.asarray(charge, dtype=float).reshape(-1)
+        if charge.size != x.size:
+            raise ValueError(f"{x.size} points but {charge.size} charges")
+        found, cell_i, cell_j, (xw, yw) = self._cells(x, y)
+        wrong = (found >= 0) & (
+            self._owners(found, cell_i, cell_j, name) != self.comm.Get_rank()
+        )
+        if self.comm.allreduce(int(wrong.sum()), op=MPI.SUM):
+            raise ValueError(
+                "markers must be on the rank that owns them (see owner and migrate)"
+            )
+        if reset:
+            for patch in self.local_patches:
+                patch.field(name).local_with_halos[...] = 0.0
+        patches = self.patches
+        for number in np.unique(found[found >= 0]):
+            patch = patches[number]
+            chosen = np.flatnonzero(found == number)
+            array = patch.field(name)
+            (b0, _), (c0, _) = array.layout.index_bounds
+            h0, h1 = array.layout.halo
+            (i0, _), (j0, _) = patch.box
+            dx, dy = self.spacing(patch.level)
+            x0, y0 = self.lower_bound
+            ci, cj = cell_i[chosen], cell_j[chosen]
+            fx = (xw[chosen] - x0) / dx - ci
+            fy = (yw[chosen] - y0) / dy - cj
+            storage = array.local_with_halos
+            a = ci - i0 - b0 + h0
+            b = cj - j0 - c0 + h1
+            columns = storage.shape[1]
+            flat, weights = [], []
+            for da, wa in ((0, 1.0 - fx), (1, fx)):
+                for db, wb in ((0, 1.0 - fy), (1, fy)):
+                    flat.append((a + da) * columns + (b + db))
+                    weights.append(wa * wb * charge[chosen])
+            added = np.bincount(
+                np.concatenate(flat),
+                weights=np.concatenate(weights),
+                minlength=storage.size,
+            )
+            storage += added.reshape(storage.shape)
+
+    def accumulate_halos(self, name: str) -> None:
+        """Bring deposited charge to the composite nodes: the scatter-add after :meth:`deposit`.
+
+        For a node-centered field, in two steps. First each patch adds the halos of its
+        blocks into the neighbouring blocks (mpiarray's ``accumulate_halos``; at the edges
+        of the patch they are dropped). Then the charge of every copy of a node goes to
+        one: the node is held by every patch that has it as a corner, and by the two
+        copies of a node on a periodic seam (the upper one, at the end of the axis, is
+        the owner there); the owner copy is that of the finest patch
+        that holds it, the one :meth:`CompositeNodes.from_patches
+        <patchwork.nodal.CompositeNodes.from_patches>` reads, and the last of the patches of
+        that level in the order of :attr:`patches`. The other copies end up zero. So the
+        total is kept, and ``from_patches`` returns what
+        :meth:`CompositeNodes.deposit <patchwork.nodal.CompositeNodes.deposit>` gives for
+        the same markers, to round-off.
+
+        This is the whole of the scatter-add of a bilinear deposit: a marker's cell is in
+        one patch, so its corners are nodes of that patch and no halo reaches over a
+        coarse-fine edge. (The charge on a hanging node is passed to its coarse neighbours
+        by :meth:`NodalPoisson.solve <patchwork.nodal.NodalPoisson.solve>`.) Cell-centered
+        fields are not supported. Collective; the schedule is built at the first call and
+        kept until a patch is added.
+        """
+        if self.centering(name) != "node":
+            raise NotImplementedError(
+                "accumulate_halos is for node-centered fields (the scatter-add of a deposit)"
+            )
+        from patchwork.accumulate import Accumulation
+
+        self._schedule("accumulate", name, Accumulation).execute()
 
     def _schedule(self, kind: str, name: str, build: Any) -> Any:
         if name not in self._field_specs:

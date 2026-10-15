@@ -20,6 +20,27 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   patches, interpolation from and to a level's uniform lattice (`from_level`, `to_level`,
   `evaluation`) and `sample_patches` for patch-wise fields such as a gradient.
 - `examples/nodal_electrode.py`.
+- `AMRHierarchy.locate(x, y)`: the finest patch that holds each point, as an index into
+  `patches` (-1 outside the domain, in the notch of an L; periodic axes wrap), from one lookup
+  table per level.
+- Markers on the ranks of their patch: `AMRHierarchy.owner(x, y, name)`, the rank whose block of
+  field `name` holds the lower corner of each marker's cell (-1 outside the domain), and
+  `AMRHierarchy.migrate(x, y, *arrays, name=..., outside="error")`, which sends the markers
+  there with `mpiarray.migrate` (call it again on the hierarchy `regrid` returns to follow a
+  patch that changed ranks).
+- Deposit patch by patch: `AMRHierarchy.deposit(x, y, charge, name)` (bilinear weights into the
+  block and its halo) and `AMRHierarchy.accumulate_halos(name)` (the scatter-add: the halos of
+  the blocks, then every copy of a node onto its owner copy, the finest patch's, which
+  `CompositeNodes.from_patches` reads). The result equals `CompositeNodes.deposit` to
+  round-off; patches on several ranks, periodic seams and coarse-fine edges included.
+  `patchwork.accumulate.Accumulation` is the schedule.
+- `regrid(..., fill_halos=True)` fills the halos of every field afterwards;
+  `regrid(..., forbid=...)` (a mask per level or a function of the cell centres) keeps patches
+  off cells; `regrid(..., min_patch_size=...)` and `cluster(..., min_size=...)` widen boxes that
+  are narrower, into free allowed cells.
+- Placement: `AMRHierarchy(placement=f)` with `f(level, box)` returning the ranks, and
+  `max_cells_per_rank` to split a large `"balanced"` patch over several of the least loaded
+  ranks; `regrid` keeps both.
 - Tutorials (executed notebooks in `tutorials/`, published in the docs): a first hierarchy, the
   cell-centered and node-centered Poisson solves, non-rectangular domains, and halos. They replace
   the placeholder tutorial and the hand-written "Node-centered Poisson" page.

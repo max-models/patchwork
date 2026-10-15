@@ -419,3 +419,197 @@ def test_only_cell_centered_fields_can_be_conservative() -> None:
     mesh = AMRHierarchy(base_shape=(8, 8), comm=WORLD)
     with pytest.raises(ValueError, match="cell-centered"):
         mesh.allocate_field("u", centering="node", conservative=True)
+
+
+# Smaller items: halos after a regrid, forbidden cells, patch sizes and placement ---------- #
+
+
+def middle_tags(mesh):
+    """Tags of level 0 over a rectangle in the middle of a 16 x 16 unit square."""
+    return function_tags(
+        mesh, lambda x, y: (x > 0.25) & (x < 0.6) & (y > 0.3) & (y < 0.7), levels=1
+    )
+
+
+def test_regrid_fills_the_halos_when_asked() -> None:
+    mesh = AMRHierarchy(base_shape=(16, 16), comm=WORLD)
+    mesh.allocate_field("u", halo=2)
+    for patch in mesh.local_patches:
+        x, y = patch.local_cell_centers(mesh)
+        patch.field("u").local[...] = 1.0 + 2.0 * x
+    tags = middle_tags(mesh)
+
+    plain = mesh.regrid(tags)
+    filled = mesh.regrid(tags, fill_halos=True)
+    reference = mesh.regrid(tags)
+    reference.exchange_halos("u")
+
+    differ = 0
+    for a, b, c in zip(
+        plain.local_patches, filled.local_patches, reference.local_patches, strict=True
+    ):
+        assert np.array_equal(
+            b.field("u").local_with_halos, c.field("u").local_with_halos
+        )
+        differ += int(
+            not np.array_equal(
+                a.field("u").local_with_halos, b.field("u").local_with_halos
+            )
+        )
+    assert differ > 0
+    assert plain.max_level == filled.max_level == 1
+
+
+def test_forbidden_cells_are_never_covered_and_the_default_is_unchanged() -> None:
+    mesh = AMRHierarchy(base_shape=(16, 16), comm=WORLD)
+    tags = middle_tags(mesh)
+    free = mesh.regrid(tags)
+    assert [p.box for p in mesh.regrid(tags, forbid=None).patches] == [
+        p.box for p in free.patches
+    ]
+
+    # no patch over the cells with x > 0.4: the level-1 cells i >= 13 of 32
+    mask = np.zeros(mesh.level_shape(1), dtype=bool)
+    mask[13:, :] = True
+    by_mask = mesh.regrid(tags, forbid={1: mask})
+    by_function = mesh.regrid(tags, forbid=lambda x, y: x > 0.4)
+
+    assert max(p.box[0][1] for p in free.patches_at_level(1)) > 13
+    for new in (by_mask, by_function):
+        cover = np.zeros(new.level_shape(1), dtype=int)
+        for patch in new.patches_at_level(1):
+            (i0, i1), (j0, j1) = patch.box
+            cover[i0:i1, j0:j1] += 1
+        assert cover.max() == 1
+        assert not cover[13:, :].any()
+        assert cover[:13, :].any()  # the tags left of it are still refined
+    assert [p.box for p in by_mask.patches] == [p.box for p in by_function.patches]
+
+
+def test_forbidden_cells_keep_patches_off_a_periodic_seam() -> None:
+    mesh = AMRHierarchy(base_shape=(16, 16), periodic=(False, True), comm=WORLD)
+    tags = function_tags(mesh, lambda x, y: (x > 0.3) & (x < 0.6), levels=1)
+
+    free = mesh.regrid(tags)
+    away = mesh.regrid(tags, forbid=lambda x, y: (y < 0.1) | (y > 0.9))
+
+    assert any(p.box[1][0] == 0 for p in free.patches_at_level(1))  # touches the seam
+    ny = away.level_shape(1)[1]
+    for patch in away.patches_at_level(1):
+        assert patch.box[1][0] > 0 and patch.box[1][1] < ny
+
+
+def test_forbid_checks_its_mask() -> None:
+    mesh = AMRHierarchy(base_shape=(16, 16), comm=WORLD)
+    with pytest.raises(ValueError, match="shape"):
+        mesh.regrid(middle_tags(mesh), forbid={1: np.zeros((3, 3), dtype=bool)})
+
+
+def test_a_box_shorter_than_the_minimum_is_widened_where_there_is_room() -> None:
+    tags = np.zeros((20, 20), dtype=bool)
+    tags[0, 0] = True  # in a corner
+    tags[10, 10] = True
+    tags[10, 12] = True  # close to the one before
+
+    assert cluster(tags, efficiency=0.1) == [((0, 1), (0, 1)), ((10, 11), (10, 13))]
+    boxes = cluster(tags, efficiency=0.1, min_size=3)
+
+    count = covered_cells((20, 20), boxes)
+    assert count.max() == 1  # still disjoint
+    assert np.all(count[tags] == 1)
+    for (i0, i1), (j0, j1) in boxes:
+        assert i1 - i0 >= 3 and j1 - j0 >= 3
+    assert ((0, 3), (0, 3)) in boxes  # grown away from the corner
+
+    # no room: allowed leaves a strip two cells wide
+    allowed = np.zeros((20, 20), dtype=bool)
+    allowed[:, 9:11] = True
+    boxes = cluster(tags & allowed, efficiency=0.1, allowed=allowed, min_size=3)
+    # the box is as wide as the strip allows (2 cells on y) and widened on x
+    assert boxes == [((8, 11), (9, 11))]
+    with pytest.raises(ValueError, match="min_size"):
+        cluster(tags, min_size=0)
+    with pytest.raises(ValueError, match="exceeds max_size"):
+        cluster(tags, min_size=5, max_size=4)
+
+
+def test_regrid_has_no_patch_narrower_than_the_minimum() -> None:
+    mesh = AMRHierarchy(base_shape=(16, 16), comm=WORLD)
+    tags = {0: np.zeros((16, 16), dtype=bool)}
+    tags[0][8, 8] = True  # one cell: a 2 x 2 patch of level 1 without a minimum
+
+    small = mesh.regrid(tags, buffer=0)
+    wide = mesh.regrid(tags, buffer=0, min_patch_size=8)
+
+    assert small.patches_at_level(1)[0].shape == (2, 2)
+    for patch in wide.patches_at_level(1):
+        assert min(patch.shape) >= 8
+        assert patch.box[0][0] % 2 == 0 and patch.box[1][0] % 2 == 0  # aligned
+    with pytest.raises(ValueError, match="min_patch_size"):
+        mesh.regrid(tags, min_patch_size=0)
+    with pytest.raises(ValueError, match="max_patch_size"):
+        mesh.regrid(tags, min_patch_size=8, max_patch_size=4)
+
+
+def test_placement_can_be_a_function_of_the_patch() -> None:
+    last = SIZE - 1
+
+    def where(level, box):
+        cells = (box[0][1] - box[0][0]) * (box[1][1] - box[1][0])
+        return tuple(range(SIZE)) if cells > 100 else last
+
+    mesh = AMRHierarchy(
+        base_shape=(16, 16),
+        placement=where,
+        base_boxes=[((0, 8), (0, 8)), ((8, 16), (0, 16))],
+        comm=WORLD,
+    )
+    small = mesh.add_patch(level=1, box=((0, 8), (0, 8)))  # 64 cells: the last rank
+    large = mesh.add_patch(level=1, box=((16, 32), (0, 16)))  # 256 cells: every rank
+    explicit = mesh.add_patch(level=1, box=((16, 24), (16, 24)), ranks=0)  # a rank wins
+
+    assert [p.ranks for p in mesh.patches_at_level(0)] == [(last,), tuple(range(SIZE))]
+    assert small.ranks == (last,)
+    assert large.ranks == tuple(range(SIZE))
+    assert explicit.ranks == (0,)
+    with pytest.raises(ValueError, match="placement"):
+        AMRHierarchy(base_shape=(16, 16), placement="everywhere")
+
+
+def test_large_patches_are_split_over_several_ranks() -> None:
+    mesh = AMRHierarchy(
+        base_shape=(16, 16),
+        placement="balanced",
+        max_cells_per_rank=100,
+        base_boxes=[((0, 16), (0, 16))],
+        comm=WORLD,
+    )
+    big = mesh.patches_at_level(0)[
+        0
+    ]  # 256 cells: three ranks of 100, at most all of them
+    assert len(big.ranks) == min(SIZE, 3)
+    assert big.ranks == tuple(
+        range(len(big.ranks))
+    )  # the least loaded, and all are equal
+
+    small = mesh.add_patch(
+        level=1, box=((0, 8), (0, 8))
+    )  # 64 cells: one rank, the lightest
+    assert len(small.ranks) == 1
+    if SIZE > 3:
+        assert small.ranks == (3,)
+
+    new = mesh.regrid(middle_tags(mesh))  # the policy goes on in the new hierarchy
+    assert new.max_cells_per_rank == 100 and new.placement == "balanced"
+    for patch in new.patches_at_level(1):
+        cells = patch.shape[0] * patch.shape[1]
+        assert len(patch.ranks) == min(SIZE, max(1, -(-cells // 100)))
+    with pytest.raises(ValueError, match="max_cells_per_rank"):
+        AMRHierarchy(base_shape=(16, 16), max_cells_per_rank=0)
+
+
+def test_without_a_limit_a_balanced_patch_stays_on_one_rank() -> None:
+    mesh = AMRHierarchy(base_shape=(16, 16), placement="balanced", comm=WORLD)
+
+    assert len(mesh.patches_at_level(0)[0].ranks) == 1
+    assert mesh.max_cells_per_rank is None
