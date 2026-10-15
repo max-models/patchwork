@@ -558,3 +558,46 @@ def test_fields_outside_the_domain_are_zero_on_a_uniform_lattice() -> None:
     )
     assert np.all(sampled[(fine_x > 0.0) & (fine_y < 0.0)] == 0.0)
     assert np.all(sampled[(fine_x <= 0.0) | (fine_y >= 0.0)] == 1.0)
+
+
+@pytest.mark.parametrize("layout", sorted(LAYOUTS))
+def test_the_deposit_keeps_the_charge_and_is_the_transposed_evaluation(layout) -> None:
+    nodes = CompositeNodes(_mesh(layout))
+    rng = np.random.default_rng(1)
+    points = rng.uniform(0.0, 1.0, (2, 500))
+    charges = rng.normal(size=500)
+    deposited = nodes.deposit(points, charges)
+    assert deposited.shape == (nodes.num_nodes,)
+    assert deposited.sum() == pytest.approx(charges.sum())
+    # the transpose of the interpolation: u . deposit(q) == q . (E u)
+    values = rng.normal(size=nodes.num_nodes)
+    assert values @ deposited == pytest.approx(
+        charges @ (nodes.evaluation(points) @ values)
+    )
+    # handing the charge of the hanging nodes on keeps it too
+    assert (nodes.reduction.T @ deposited).sum() == pytest.approx(charges.sum())
+
+
+def test_points_outside_the_domain_deposit_nothing() -> None:
+    nodes = CompositeNodes(_mesh("nested"))
+    points = np.array([[1.5, -0.2, 0.5], [0.5, 0.5, 2.0]])
+    assert not nodes.deposit(points, np.ones(3)).any()
+    with pytest.raises(ValueError, match="charges"):
+        nodes.deposit(points, np.ones(2))
+
+
+@pytest.mark.parametrize("layout", ["nested", "level jump"])
+def test_a_charge_solve_is_the_source_solve_of_the_same_charge(layout) -> None:
+    solver = NodalPoisson(_mesh(layout))
+    nodes = solver.nodes
+    rng = np.random.default_rng(2)
+    charge = nodes.deposit(rng.uniform(0.0, 1.0, (2, 300)), rng.normal(size=300))
+    by_charge = solver.solve(charge=charge)
+    by_source = solver.solve(charge / nodes.volumes)
+    assert by_charge == pytest.approx(by_source, abs=1e-12 * np.abs(by_source).max())
+    with pytest.raises(ValueError, match="either"):
+        solver.solve()
+    with pytest.raises(ValueError, match="either"):
+        solver.solve(charge / nodes.volumes, charge=charge)
+    with pytest.raises(ValueError, match="charge on the"):
+        solver.solve(charge=charge[:-1])

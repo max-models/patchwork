@@ -425,6 +425,47 @@ class CompositeNodes:
         gets an empty row: the value zero.
         """
         points = np.asarray(points, dtype=float)
+        corners, weights = self.cell_weights(points)
+        rows = np.repeat(np.arange(points.shape[1]), 4)
+        matrix = sparse.csr_matrix(
+            sparse.coo_matrix(
+                (weights.reshape(-1), (rows, corners.reshape(-1))),
+                shape=(points.shape[1], self.num_nodes),
+            )
+        )
+        matrix.eliminate_zeros()
+        return matrix
+
+    def deposit(self, points: np.ndarray, charges: np.ndarray) -> np.ndarray:
+        """The charges of point particles at ``points`` ``(2, k)`` on the nodes: ``(n,)``.
+
+        Each charge is spread over the corners of its leaf cell with the
+        bilinear weights of :meth:`evaluation`, whose transpose this is: the
+        work a field interpolated with :meth:`evaluation` does on the particles
+        is the work their deposited charge feels, and no particle pushes
+        itself through the coupling. Hanging nodes receive charge like any
+        other; :meth:`NodalPoisson.solve` with ``charge=`` hands it to the
+        nodes they hang from with the transposed interpolation, so the total
+        charge is kept. Points outside the domain deposit nothing.
+        """
+        points = np.asarray(points, dtype=float)
+        charges = np.asarray(charges, dtype=float).reshape(-1)
+        if charges.shape[0] != points.shape[1]:
+            raise ValueError(f"{points.shape[1]} points but {charges.shape[0]} charges")
+        corners, weights = self.cell_weights(points)
+        return np.bincount(
+            corners.reshape(-1),
+            weights=(weights * charges[:, None]).reshape(-1),
+            minlength=self.num_nodes,
+        )
+
+    def cell_weights(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Corner nodes ``(k, 4)`` and bilinear weights ``(k, 4)`` of the leaf cell of each point.
+
+        The corners are in the order of :attr:`cell_corners`; a point outside
+        the domain has weights zero.
+        """
+        points = np.asarray(points, dtype=float)
         position = (points - self._origin[:, None]) / self._spacing[:, None]
         cell, local = [], []
         for axis in range(2):
@@ -453,6 +494,13 @@ class CompositeNodes:
                 cell[0][missing] - step[0], cell[1][missing] - step[1]
             ]
         inside = leaf >= 0
+        for axis in range(2):
+            if not self._periodic[axis]:
+                # beyond a non-periodic face: no value (the clipped cell would
+                # extrapolate)
+                inside &= (position[axis] >= 0.0) & (
+                    position[axis] <= self._cells[axis]
+                )
         leaf = np.where(inside, leaf, 0)
         span = self.cell_span[leaf]
         fraction = [
@@ -467,15 +515,7 @@ class CompositeNodes:
             ]
         )
         weights[~inside] = 0.0  # outside the domain: no value
-        rows = np.repeat(np.arange(points.shape[1]), 4)
-        matrix = sparse.csr_matrix(
-            sparse.coo_matrix(
-                (weights.reshape(-1), (rows, self.cell_corners[leaf].reshape(-1))),
-                shape=(points.shape[1], self.num_nodes),
-            )
-        )
-        matrix.eliminate_zeros()
-        return matrix
+        return self.cell_corners[leaf], weights
 
     def to_level(self, level: int) -> sparse.csr_matrix:
         """The composite interpolant on a level's lattice over the whole domain.
@@ -815,6 +855,8 @@ class NodalPoisson:
         reduced = sparse.csr_matrix(reduction.T @ operator @ reduction)
         self._wall = sparse.csr_matrix(reduction.T @ wall)
         self._load = sparse.csr_matrix(reduction.T @ sparse.diags(nodes.volumes))
+        # a source already integrated over the control volumes (a deposited charge)
+        self._integral_load = sparse.csr_matrix(reduction.T)
 
         self.fixed = np.zeros(n, dtype=bool)
         for face, condition in self._faces.items():
@@ -827,6 +869,7 @@ class NodalPoisson:
         self._fixed_nodes = fixed
         self._lift = reduced[self.free][:, fixed].tocsr()
         self._load = self._load[self.free]
+        self._integral_load = self._integral_load[self.free]
         self._wall = self._wall[self.free]
         self._reduction_rows = reduction[np.nonzero(nodes.hanging)[0]].tocsr()
         matrix = reduced[self.free][:, self.free].tocsc()
@@ -999,6 +1042,16 @@ class NodalPoisson:
         return self._load
 
     @property
+    def integral_load(self) -> sparse.csr_matrix:
+        """Map from a source integrated over each node's control volume to the right-hand side.
+
+        The transposed interpolation of the hanging nodes, restricted to the
+        unknowns: what a deposited charge (:meth:`CompositeNodes.deposit`)
+        needs. ``load == integral_load @ diag(volumes)``.
+        """
+        return self._integral_load
+
+    @property
     def constant(self) -> np.ndarray:
         """The share of the right-hand side that the prescribed values give."""
         return self._constant
@@ -1019,24 +1072,44 @@ class NodalPoisson:
         return potential
 
     def solve(
-        self, source: np.ndarray | str, potential: str | None = None
+        self,
+        source: np.ndarray | str | None = None,
+        potential: str | None = None,
+        *,
+        charge: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Solve for a source given on the nodes; the potential on all nodes.
+        r"""Solve for a source given on the nodes; the potential on all nodes.
 
         ``source`` is an array ``(n,)`` over :attr:`nodes`, or the name of a
-        node-centered field of the hierarchy. With ``potential`` the result is
-        also written to the node-centered field of that name (allocated if
-        needed).
+        node-centered field of the hierarchy. Or ``charge`` is the source
+        integrated over each node's control volume, ``(n,)``, as
+        :meth:`CompositeNodes.deposit` gives it for point particles (divide a
+        charge by the permittivity for :math:`-\nabla^2\phi = \rho /
+        \varepsilon_0`); the charge on hanging nodes goes to the nodes they hang
+        from, and the charge on fixed nodes is ignored. With ``potential`` the
+        result is also written to the node-centered field of that name
+        (allocated if needed).
         """
         nodes = self.nodes
-        if isinstance(source, str):
-            source = nodes.from_patches(source)
-        source = np.asarray(source, dtype=float)
-        if source.shape != (nodes.num_nodes,):
-            raise ValueError(
-                f"expected a source on the {nodes.num_nodes} nodes, got {source.shape}"
-            )
-        result = self.solve_reduced(self._load @ source + self._constant)
+        if (source is None) == (charge is None):
+            raise ValueError("give either a source or a charge")
+        if charge is not None:
+            charge = np.asarray(charge, dtype=float)
+            if charge.shape != (nodes.num_nodes,):
+                raise ValueError(
+                    f"expected a charge on the {nodes.num_nodes} nodes, got {charge.shape}"
+                )
+            right_hand_side = self._integral_load @ charge + self._constant
+        else:
+            if isinstance(source, str):
+                source = nodes.from_patches(source)
+            source = np.asarray(source, dtype=float)
+            if source.shape != (nodes.num_nodes,):
+                raise ValueError(
+                    f"expected a source on the {nodes.num_nodes} nodes, got {source.shape}"
+                )
+            right_hand_side = self._load @ source + self._constant
+        result = self.solve_reduced(right_hand_side)
         if potential is not None:
             hierarchy = nodes.hierarchy
             if potential not in hierarchy.field_names:
