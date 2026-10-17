@@ -22,7 +22,7 @@ concurrency:
 
 jobs:
   docs:
-    uses: max-models/starlight-theme/.github/workflows/docs.yml@v0.1.0
+    uses: max-models/starlight-theme/.github/workflows/docs.yml@v0.3.0
     with:
       smoke-paths: |
         getting-started/installation/index.html
