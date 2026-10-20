@@ -11,6 +11,10 @@ updates:
         patterns: ["*"]
   - package-ecosystem: npm
     directory: /docs
+    # not the theme: it is installed from a git tag, which Dependabot compares wrongly (it
+    # "updated" v0.3.1 to v0.2.0); bump it by hand with the docs workflow tag
+    ignore:
+      - dependency-name: "@max-models/starlight-theme"
     schedule:
       interval: weekly
     groups:
