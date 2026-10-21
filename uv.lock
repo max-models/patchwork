@@ -2654,7 +2654,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'test'" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "scipy" },
-    { name = "scope-profiler", git = "https://github.com/max-models/scope-profiler?rev=devel" },
+    { name = "scope-profiler", git = "https://github.com/max-models/scope-profiler?branch=devel" },
 ]
 provides-extras = ["mpi", "plot", "dev", "docs", "test"]
 
@@ -3735,8 +3735,8 @@ wheels = [
 
 [[package]]
 name = "scope-profiler"
-version = "0.7.4"
-source = { git = "https://github.com/max-models/scope-profiler?rev=devel#19f59c4ed98cf61ba6bd7c9244aee133983924b3" }
+version = "0.7.5"
+source = { git = "https://github.com/max-models/scope-profiler?branch=devel#2abb4ca4fe74166be554d30c3b78af8041f930ae" }
 dependencies = [
     { name = "h5py" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },

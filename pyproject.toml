@@ -60,9 +60,6 @@ where = [ "src" ]
 [tool.setuptools.package-data]
 "*" = [ "py.typed" ]
 
-[tool.uv.sources]
-scope-profiler = { git = "https://github.com/max-models/scope-profiler", branch = "devel" }
-
 [tool.ruff]
 target-version = "py310"
 line-length = 88
@@ -99,3 +96,4 @@ show_missing = true
 [tool.uv.sources]
 maybempi = { git = "https://github.com/max-models/maybempi", branch = "devel" }
 mpiarray = { git = "https://github.com/max-models/mpiarray", branch = "devel" }
+scope-profiler = { git = "https://github.com/max-models/scope-profiler", branch = "devel" }
