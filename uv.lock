@@ -868,8 +868,8 @@ toml = [
 
 [[package]]
 name = "cunumpy"
-version = "0.6.3"
-source = { git = "https://github.com/max-models/cunumpy.git?rev=devel#3114eb733c5721e4b2b95d72924e805de6dc9d5f" }
+version = "0.7.1"
+source = { git = "https://github.com/max-models/cunumpy.git?branch=devel#9fb918b130b08a2c159005997186efdb5edacb4f" }
 dependencies = [
     { name = "array-api-compat" },
     { name = "maybempi" },
@@ -2155,11 +2155,7 @@ wheels = [
 [[package]]
 name = "maybempi"
 version = "0.1.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c4/0d/ed782142085f56da45eb4511dd3fb2a7b1ed167fe5495dd429c61272774e/maybempi-0.1.2.tar.gz", hash = "sha256:0b0fadd2897281df50a2cf3f08ddf080d1ca00c9d2e4e5aee2af7cf5222ba04d", size = 42851, upload-time = "2026-10-07T05:38:48.594Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/88/d3/b161669937ee87dba4c61a6ac2be70bd1399269c76c66524e3f8be071839/maybempi-0.1.2-py3-none-any.whl", hash = "sha256:1fc9a2eb7e4f55a6b91da32e8e77bade35df157e6ce5de3b228cdf799e99970b", size = 47478, upload-time = "2026-10-07T05:38:47.046Z" },
-]
+source = { git = "https://github.com/max-models/maybempi?branch=devel#0146f000137c58b84381c176e03ffd2b3e191ce7" }
 
 [[package]]
 name = "mistune"
@@ -2223,8 +2219,8 @@ wheels = [
 
 [[package]]
 name = "mpiarray"
-version = "0.1.1"
-source = { git = "https://github.com/max-models/mpiarray?rev=devel#7dd658b74fde6260ef0a1837c0dcf825d44e70cf" }
+version = "0.2.1"
+source = { git = "https://github.com/max-models/mpiarray?branch=devel#7d3490a566ebbc2489c5172d5cd09282fae87efe" }
 dependencies = [
     { name = "cunumpy" },
     { name = "maybempi" },
@@ -2643,9 +2639,9 @@ requires-dist = [
     { name = "ipykernel", marker = "extra == 'docs'" },
     { name = "jupyterlab", marker = "extra == 'dev'" },
     { name = "matplotlib", marker = "extra == 'plot'" },
-    { name = "maybempi", specifier = ">=0.1.2" },
-    { name = "mpiarray", git = "https://github.com/max-models/mpiarray?rev=devel" },
-    { name = "mpiarray", extras = ["mpi"], marker = "extra == 'mpi'", git = "https://github.com/max-models/mpiarray?rev=devel" },
+    { name = "maybempi", git = "https://github.com/max-models/maybempi?branch=devel" },
+    { name = "mpiarray", git = "https://github.com/max-models/mpiarray?branch=devel" },
+    { name = "mpiarray", extras = ["mpi"], marker = "extra == 'mpi'", git = "https://github.com/max-models/mpiarray?branch=devel" },
     { name = "nbclient", marker = "extra == 'docs'", specifier = ">=0.11.0" },
     { name = "nbformat", marker = "extra == 'docs'", specifier = ">=5.11.1" },
     { name = "numpy" },

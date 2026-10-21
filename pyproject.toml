@@ -22,14 +22,14 @@ classifiers = [
 ]
 dependencies = [
   "maybempi>=0.1.2",
-  "mpiarray @ git+https://github.com/max-models/mpiarray@devel",
+  "mpiarray>=0.2.1",
   "numpy",
   "scipy",
   "scope-profiler>=0.7.5",
 ]
 
 [project.optional-dependencies]
-mpi = [ "mpiarray[mpi] @ git+https://github.com/max-models/mpiarray@devel" ]
+mpi = [ "mpiarray[mpi]>=0.2.1" ]
 plot = [ "matplotlib" ]
 dev = [
   "jupyterlab",
@@ -93,3 +93,9 @@ omit = [ "*/tests/*" ]
 
 [tool.coverage.report]
 show_missing = true
+
+# PRs to devel test against the devel branches of the max-models packages (pinned in
+# uv.lock); PRs to main and the release use PyPI only (CI sets UV_NO_SOURCES).
+[tool.uv.sources]
+maybempi = { git = "https://github.com/max-models/maybempi", branch = "devel" }
+mpiarray = { git = "https://github.com/max-models/mpiarray", branch = "devel" }
