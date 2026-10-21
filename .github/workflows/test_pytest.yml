@@ -10,6 +10,11 @@ on:
       - main
       - devel
 
+env:
+  # A PR to main or a push to main (the release) uses PyPI versions only; devel uses the
+  # devel branches from [tool.uv.sources].
+  UV_NO_SOURCES: ${{ (github.base_ref || github.ref_name) == 'main' }}
+
 jobs:
   pytest:
     runs-on: ubuntu-latest
@@ -41,3 +46,25 @@ jobs:
           files: coverage.xml
           flags: python-${{ matrix.python-version }}
           fail_ci_if_error: false
+
+  # PyPI rejects a release whose metadata has a direct reference (name @ git+...), so a pull
+  # request to main fails here instead of the release after the merge.
+  no-direct-references:
+    if: (github.base_ref || github.ref_name) == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+
+      - name: Check that the wheel has no direct references (name @ git+...)
+        run: |
+          uv build --wheel -o dist
+          if unzip -p dist/*.whl '*.dist-info/METADATA' | grep -E '^Requires-Dist: [^;]*@'; then
+            echo "::error::Requires-Dist has a direct reference; use a version range and [tool.uv.sources]"
+            exit 1
+          fi
