@@ -25,6 +25,7 @@ dependencies = [
   "mpiarray @ git+https://github.com/max-models/mpiarray@devel",
   "numpy",
   "scipy",
+  "scope-profiler>=0.7.5",
 ]
 
 [project.optional-dependencies]
@@ -58,6 +59,9 @@ where = [ "src" ]
 
 [tool.setuptools.package-data]
 "*" = [ "py.typed" ]
+
+[tool.uv.sources]
+scope-profiler = { git = "https://github.com/max-models/scope-profiler", branch = "devel" }
 
 [tool.ruff]
 target-version = "py310"

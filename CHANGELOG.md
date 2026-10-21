@@ -80,6 +80,12 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the frames of an animation. The tutorial publisher turns GIF outputs into animated images.
 - `Patch.local_cell_centers(hierarchy, name)` takes the field whose cells are wanted; without
   one, the first cell-centered field (it used the first field of any centering).
+- Profiling regions, off by default: halo exchanges, restriction, deposit, migration, regridding,
+  tagging and both Poisson solvers record `patchwork.<operation>` scope-profiler regions tagged
+  `patchwork`, an opt-in tag that an application enables with `enable_tags=["patchwork"]`,
+  `SCOPE_PROFILER_ENABLE_TAGS=patchwork` or `scope-profiler run --enable-tag patchwork`.
+  `scope-profiler>=0.7.5` is a new dependency, which uv takes from its `devel` branch until
+  0.7.5 is released.
 
 ### Changed
 

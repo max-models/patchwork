@@ -6,7 +6,10 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import mpiarray as mpa
+import scope_profiler as sp
 from maybempi import MPI
+
+from patchwork._profiling import PROFILE_TAGS
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -545,6 +548,7 @@ class AMRHierarchy:
             if patch.is_local:
                 patch._fields[name] = arrays[id(patch)]
 
+    @sp.profile("patchwork.exchange_halos", tags=PROFILE_TAGS)
     def exchange_halos(self, name: str) -> None:
         """Fill the halo of every patch of field ``name`` from the rest of the hierarchy.
 
@@ -559,6 +563,7 @@ class AMRHierarchy:
 
         self._schedule("halo", name, HaloExchange).execute()
 
+    @sp.profile("patchwork.restrict", tags=PROFILE_TAGS)
     def restrict(self, name: str) -> None:
         """Give the points of field ``name`` under finer patches the fine values.
 
@@ -571,6 +576,7 @@ class AMRHierarchy:
 
         self._schedule("restrict", name, Restriction).execute()
 
+    @sp.profile("patchwork.regrid", tags=PROFILE_TAGS)
     def regrid(
         self,
         tags: Mapping[int, Any],
@@ -835,6 +841,7 @@ class AMRHierarchy:
         found, cell_i, cell_j, _ = self._cells(x, y)
         return self._owners(found, cell_i, cell_j, name).reshape(shape)
 
+    @sp.profile("patchwork.migrate", tags=PROFILE_TAGS)
     def migrate(
         self, x: Any, y: Any, *arrays: Any, name: str, outside: str = "error"
     ) -> tuple[Any, ...]:
@@ -880,6 +887,7 @@ class AMRHierarchy:
         )
         return tuple(np.asarray(array) for array in received)
 
+    @sp.profile("patchwork.deposit", tags=PROFILE_TAGS)
     def deposit(
         self, x: Any, y: Any, charge: Any, name: str, *, reset: bool = True
     ) -> None:
@@ -949,6 +957,7 @@ class AMRHierarchy:
             )
             storage += added.reshape(storage.shape)
 
+    @sp.profile("patchwork.accumulate_halos", tags=PROFILE_TAGS)
     def accumulate_halos(self, name: str) -> None:
         """Bring deposited charge to the composite nodes: the scatter-add after :meth:`deposit`.
 
@@ -985,7 +994,8 @@ class AMRHierarchy:
             raise KeyError(f"hierarchy has no field {name!r}")
         key = (kind, name)
         if key not in self._schedules:
-            self._schedules[key] = build(self, name)
+            with sp.region("patchwork.build_schedule", tags=PROFILE_TAGS):
+                self._schedules[key] = build(self, name)
         return self._schedules[key]
 
     def __iter__(self) -> Iterator[Patch]:

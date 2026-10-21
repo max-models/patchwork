@@ -26,8 +26,10 @@ from typing import TYPE_CHECKING, Any
 
 import mpiarray as mpa
 import numpy as np
+import scope_profiler as sp
 from maybempi import MPI
 
+from patchwork._profiling import PROFILE_TAGS
 from patchwork.halos import (
     _overlap,
     _Points,
@@ -70,6 +72,7 @@ def function_tags(
     return tags
 
 
+@sp.profile("patchwork.gradient_tags", tags=PROFILE_TAGS)
 def gradient_tags(
     hierarchy: AMRHierarchy, name: str, threshold: float
 ) -> dict[int, np.ndarray]:
@@ -494,6 +497,7 @@ def new_boxes(
     return boxes
 
 
+@sp.profile("patchwork.regrid_transfer", tags=PROFILE_TAGS)
 def transfer(old: AMRHierarchy, new: AMRHierarchy, name: str) -> None:
     """Fill field ``name`` of ``new`` from ``old``, level by level (collective).
 
