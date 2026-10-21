@@ -18,7 +18,12 @@ cache:
   paths:
     - .cache/pip
 
+# PyPI versions only when targeting main; otherwise the devel branches from [tool.uv.sources]
+.uv-no-sources: &uv-no-sources
+  - export UV_NO_SOURCES=$([ "${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-$CI_COMMIT_BRANCH}" = main ] && echo true || echo false)
+
 before_script:
+  - *uv-no-sources
   - python --version ; pip --version # For debugging
   - pip install uv
   - uv sync --extra dev
@@ -39,7 +44,8 @@ build:
 
 pages:
   image: node:22
-  before_script: []
+  before_script:
+    - *uv-no-sources
   script:
     - apt-get update && apt-get install -y python3 python3-pip python3-venv
     - pip install uv && uv sync --extra docs

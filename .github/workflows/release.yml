@@ -11,6 +11,10 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # The release (a push to main) builds against PyPI versions only, never [tool.uv.sources].
+  UV_NO_SOURCES: true
+
 jobs:
   release:
     runs-on: ubuntu-latest
