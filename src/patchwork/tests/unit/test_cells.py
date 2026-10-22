@@ -305,7 +305,9 @@ def test_conditions_are_checked() -> None:
         )
     with pytest.raises(ValueError, match="azimuthal"):
         CellOperator(AMRHierarchy(base_shape=(4, 4)), component="azimuthal")
-    with pytest.raises(ValueError, match="positive"):
+    with pytest.raises(ValueError, match="negative"):
+        CellOperator(AMRHierarchy(base_shape=(4, 4)), diffusion=-1.0)
+    with pytest.raises(ValueError, match="singular"):
         CellOperator(AMRHierarchy(base_shape=(4, 4)), diffusion=0.0)
     with pytest.raises(ValueError, match="coarse_fine"):
         CellOperator(AMRHierarchy(base_shape=(4, 4)), coarse_fine="other")

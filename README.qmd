@@ -38,7 +38,9 @@ storage, plotting, and composite linear solves:
   diffusion coefficient and a real or complex reaction (a skin layer, an
   inductive field), the same faces, periodic axes and bodies, quadratic
   interpolation along coarse-fine faces (symmetric, or conservative face by
-  face), factorized once.
+  face), factorized once; fixed and floating bodies (`EmbeddedFloating`, one
+  unknown with a given net flux), bodies made of cells (`cell_body`), and the
+  gradient and curl of a solution from the operator's own faces.
 
 A hierarchy can also be the axisymmetric r–z plane
 (`AMRHierarchy(geometry="cylindrical")`): cells are rings, `integral`,

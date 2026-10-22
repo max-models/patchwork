@@ -7,6 +7,28 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `EmbeddedFloating`: a floating body of `CellOperator`, one unknown (its uniform value) whose
+  row is the net flux into it, set to its `source` (zero for an isolated conductor); the
+  operator stays symmetric. `floating_coupling` and `floating_values`.
+- `cell_body`: a body of the leaf cells a mask selects, its surface on their faces (e.g. the
+  cells outside a plasma held at zero); `CompositeCells.locate` finds the leaf cell of points.
+- `CellOperator.gradient`, `.curl` and `.face_gradients`: derivatives of a solution from the
+  operator's own faces (coarse–fine interpolation, body surfaces, the domain's conditions);
+  exact for linear fields and for the uniform axial field `A_phi = B r / 2`, second order in
+  the maximum norm across coarse–fine faces. The curl is the magnetic field of a vector
+  potential, `(d_y A, -d_x A)` or `(-d_z A_phi, (1/r) d_r(r A_phi))`.
+- `CellOperator(factorize=False)`: assembled only, factorized on the first `solve`.
+
+### Changed
+
+- A zero diffusion coefficient is allowed (negative ones are not); unknowns with neither
+  diffusion nor reaction are reported as a singular operator.
+- Coarse values along a coarse–fine face interpolate to their mirror image beyond a face of
+  the domain with no gradient (`Neumann(0.0)`) and beyond the axis (minus the value for an
+  azimuthal component), instead of falling back to a one-sided line: a field that does not
+  vary along such a wall is now exact next to a patch (it was off by about 1e-3 with the
+  symmetric variant).
+
 - `CellOperator`, a cell-centered composite solve of `-div(a grad u) + c u = f`: variable
   diffusion (harmonic face mean, or arithmetic), real or complex reaction, `Dirichlet` and
   `Neumann` faces, periodic axes, embedded bodies (`EmbeddedDirichlet`, the surface located
