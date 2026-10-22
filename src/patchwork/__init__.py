@@ -20,7 +20,7 @@ from patchwork.regrid import cluster, function_tags, gradient_tags
 # patchwork's profiling regions are off unless an application enables the tag
 sp.register_opt_in_tag(*PROFILE_TAGS)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "AMRHierarchy",
