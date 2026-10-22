@@ -3,7 +3,7 @@
 import scope_profiler as sp
 
 from patchwork._profiling import PROFILE_TAGS
-from patchwork.cells import CellOperator, CompositeCells
+from patchwork.cells import CellOperator, CompositeCells, EmbeddedFloating, cell_body
 from patchwork.mesh import AMRHierarchy, IndexBox, Patch
 from patchwork.nodal import (
     CompositeNodes,
@@ -29,11 +29,13 @@ __all__ = [
     "CompositeNodes",
     "Dirichlet",
     "EmbeddedDirichlet",
+    "EmbeddedFloating",
     "IndexBox",
     "Neumann",
     "NodalPoisson",
     "Patch",
     "__version__",
+    "cell_body",
     "cluster",
     "function_tags",
     "gradient_tags",
