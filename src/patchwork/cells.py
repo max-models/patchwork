@@ -26,7 +26,8 @@ coupling by the interpolation weights. This keeps the operator symmetric, which
 makes an energy balance (power absorbed equals power delivered) hold to
 round-off, and is second order in the mean; next to a coarse–fine edge the
 error is first order, since the difference of the fine centre and the coarse
-value is centred a quarter cell off the face. ``coarse_fine="conservative"``
+value is centred a quarter cell off the face. In 1D a face is a point, and the
+coarse value is that of the coarse cell itself. ``coarse_fine="conservative"``
 instead builds a fine ghost value beyond the face, quadratic through the two
 fine cells and the interpolated coarse value, and adds that face flux to the
 fine cell and takes it from the coarse one: second order everywhere and
@@ -75,14 +76,22 @@ import scipy.sparse.linalg
 import scope_profiler as sp
 
 from patchwork._profiling import PROFILE_TAGS
-from patchwork.nodal import FACES, INNER, Dirichlet, EmbeddedDirichlet, Neumann
+from patchwork.nodal import (
+    FACES,
+    INNER,
+    Dirichlet,
+    EmbeddedDirichlet,
+    Neumann,
+    faces_of,
+)
 
 if TYPE_CHECKING:
     from patchwork.mesh import AMRHierarchy
 
 #: A coefficient or source on the leaf cells: a number, an array over the cells,
-#: or a function of the cell-centre coordinates ``(x, y)`` (``(r, z)`` in r–z).
-CellValue = float | complex | np.ndarray | Callable[[np.ndarray, np.ndarray], Any]
+#: or a function of the cell-centre coordinates: ``(x,)`` in 1D, ``(x, y)`` in 2D
+#: (``(r, z)`` in r–z).
+CellValue = float | complex | np.ndarray | Callable[..., Any]
 
 COMPONENTS = ("scalar", "azimuthal")
 
@@ -112,18 +121,20 @@ class CompositeCells:
 
     Cells are addressed on the *finest lattice*: the cells of the finest level
     extended over the whole domain. A leaf cell of level ``L`` spans
-    ``ratio**(finest - L)`` lattice cells along each axis.
+    ``ratio**(finest - L)`` lattice cells along each axis. The arrays below
+    have one column per axis (``ndim``, 1 or 2).
 
     Attributes:
         hierarchy: The patch hierarchy.
         patch: Index into ``hierarchy.patches`` of every leaf cell, ``(n,)``.
-        index: Level indices of every leaf cell, ``(n, 2)``.
-        lattice: Finest-lattice lower corner of every leaf cell, ``(n, 2)``.
+        index: Level indices of every leaf cell, ``(n, ndim)``.
+        lattice: Finest-lattice lower corner of every leaf cell, ``(n, ndim)``.
         span: Edge length of every leaf cell on the finest lattice, ``(n,)``.
-        centers: Physical cell centres, ``(n, 2)``.
-        sizes: Physical edge lengths, ``(n, 2)``.
-        volumes: Cell volumes, ``(n,)``: areas in the Cartesian plane (per unit
-            length out of it), ring volumes ``2 pi r dr dz`` in r–z.
+        centers: Physical cell centres, ``(n, ndim)``.
+        sizes: Physical edge lengths, ``(n, ndim)``.
+        volumes: Cell volumes, ``(n,)``: lengths in 1D (per unit area), areas
+            in the Cartesian plane (per unit length out of it), ring volumes
+            ``2 pi r dr dz`` in r–z.
         owner: The leaf cell over every finest-lattice cell, -1 outside the
             domain (``AMRHierarchy(base_boxes=...)``).
     """
@@ -138,26 +149,34 @@ class CompositeCells:
         owner = np.full(hierarchy.level_shape(finest), -1, dtype=np.int64)
         count = 0
         for number, patch in enumerate(patches):
-            (i0, i1), (j0, j1) = patch.box
             leaf = np.ones(patch.shape, dtype=bool)
             for finer in hierarchy.patches_at_level(patch.level + 1):
-                (f0, f1), (g0, g1) = finer.box
-                a0, a1 = max(f0 // ratio, i0), min(f1 // ratio, i1)
-                b0, b1 = max(g0 // ratio, j0), min(g1 // ratio, j1)
-                if a0 < a1 and b0 < b1:
-                    leaf[a0 - i0 : a1 - i0, b0 - j0 : b1 - j0] = False
-            ii, jj = np.nonzero(leaf)
+                shared = [
+                    (max(f0 // ratio, i0) - i0, min(f1 // ratio, i1) - i0)
+                    for (f0, f1), (i0, i1) in zip(finer.box, patch.box, strict=True)
+                ]
+                if all(a < b for a, b in shared):
+                    leaf[tuple(slice(a, b) for a, b in shared)] = False
+            where = np.nonzero(leaf)
             ids = np.full(patch.shape, -2, dtype=np.int64)
-            ids[ii, jj] = count + np.arange(ii.size)
-            count += ii.size
+            ids[where] = count + np.arange(where[0].size)
+            count += where[0].size
             scale = ratio ** (finest - patch.level)
             # coarsest first: finer patches paint over the cells they cover
-            owner[i0 * scale : i1 * scale, j0 * scale : j1 * scale] = np.repeat(
-                np.repeat(ids, scale, axis=0), scale, axis=1
+            for axis in range(ids.ndim):
+                ids = np.repeat(ids, scale, axis=axis)
+            owner[tuple(slice(lo * scale, hi * scale) for lo, hi in patch.box)] = ids
+            patch_numbers.append(np.full(where[0].size, number))
+            indices.append(
+                np.stack(
+                    [
+                        values + lo
+                        for values, (lo, _) in zip(where, patch.box, strict=True)
+                    ],
+                    axis=1,
+                )
             )
-            patch_numbers.append(np.full(ii.size, number))
-            indices.append(np.stack([ii + i0, jj + j0], axis=1))
-            spans.append(np.full(ii.size, scale))
+            spans.append(np.full(where[0].size, scale))
         self.owner = owner
         self.patch = np.concatenate(patch_numbers)
         self.index = np.concatenate(indices)
@@ -180,7 +199,7 @@ class CompositeCells:
         return int(self.span.size)
 
     def locate(self, points: np.ndarray) -> np.ndarray:
-        """The leaf cell of every point ``(2, k)``; -1 outside the domain.
+        """The leaf cell of every point ``(ndim, k)``; -1 outside the domain.
 
         Periodic axes wrap; a point on a face belongs to the cell above it, the
         upper faces of the domain to the last cell.
@@ -192,13 +211,13 @@ class CompositeCells:
         inside = np.all((lattice >= 0) & (lattice <= shape), axis=1)
         lattice = np.minimum(lattice, shape - 1)
         result = np.full(points.shape[1], -1, dtype=np.int64)
-        result[inside] = self.owner[lattice[inside, 0], lattice[inside, 1]]
+        result[inside] = self.owner[tuple(lattice[inside].T)]
         return result
 
     def evaluate(self, value: CellValue, dtype: Any = float) -> np.ndarray:
         """A :data:`CellValue` on the leaf cells, ``(n,)``."""
         if callable(value):
-            value = value(self.centers[:, 0], self.centers[:, 1])
+            value = value(*self.centers.T)
         result = np.asarray(value, dtype=dtype)
         return np.broadcast_to(result, (self.num_cells,)).copy()
 
@@ -209,7 +228,8 @@ class CompositeCells:
         Arrays over the faces: ``low`` and ``high``, the cells below and above
         it; ``plane``, its finest-lattice coordinate along ``axis`` (the
         lattice size for the wrap of a periodic axis); ``start`` and ``count``,
-        its extent along the other axis in lattice cells.
+        its extent along the other axis in lattice cells (0 and 1 in 1D, where a
+        face is a point).
         """
         low, high, plane, start, count = self._segments(axis)
         inside = (low >= 0) & (high >= 0)
@@ -246,8 +266,10 @@ class CompositeCells:
 
     def _segments(self, axis: int):
         """Runs of lattice faces with one pair of cells: low, high, plane, start, count."""
-        own = self.owner if axis == 0 else self.owner.T
-        n, m = own.shape
+        # the cells along ``axis`` first, the other axis (if any) flattened after it
+        n = self.owner.shape[axis]
+        own = np.moveaxis(self.owner, axis, 0).reshape(n, -1)
+        m = own.shape[1]
         outside = np.full((1, m), -1, dtype=np.int64)
         # the planes between lattice cells k - 1 and k: inside, then the ends
         lows, highs, planes = [own[:-1]], [own[1:]], [np.arange(1, n)]
@@ -285,12 +307,15 @@ class CompositeCells:
 
         The area is the face length in the Cartesian plane; in r–z, ``2 pi r dz``
         for a radial face at ``r`` and ``pi (r1^2 - r0^2)`` for an axial one.
+        In 1D a face is a point of area 1 (per unit area) and the middle is 0.
         """
         hierarchy = self.hierarchy
-        other = 1 - axis
         lower = np.asarray(hierarchy.lower_bound, dtype=float)
         h = self._spacing
         position = lower[axis] + plane * h[axis]
+        if hierarchy.ndim == 1:
+            return np.ones(position.shape), position, np.zeros(position.shape)
+        other = 1 - axis
         t0 = lower[other] + start * h[other]
         t1 = t0 + count * h[other]
         if not hierarchy.cylindrical:
@@ -310,10 +335,10 @@ class CompositeCells:
         for number, patch in enumerate(patches):
             values = np.asarray(hierarchy.gather(patch, name))
             mine = self.patch == number
-            (i0, _), (j0, _) = patch.box
+            origin = np.array([lo for lo, _ in patch.box])
             if result is None:
                 result = np.zeros(self.num_cells, dtype=values.dtype)
-            result[mine] = values[self.index[mine, 0] - i0, self.index[mine, 1] - j0]
+            result[mine] = values[tuple((self.index[mine] - origin).T)]
         assert result is not None
         return result
 
@@ -328,14 +353,19 @@ class CompositeCells:
             if not patch.is_local:
                 continue
             array = patch.field(name)
-            (b0, b1), (c0, c1) = array.layout.index_bounds
-            (i0, _), (j0, _) = patch.box
             mine = self.patch == number
-            i = self.index[mine, 0] - i0
-            j = self.index[mine, 1] - j0
-            block = (i >= b0) & (i < b1) & (j >= c0) & (j < c1)
+            bounds = array.layout.index_bounds
+            index = (self.index[mine] - np.array([lo for lo, _ in patch.box])).T
+            block = np.ones(index.shape[1], dtype=bool)
+            for values_, (b0, b1) in zip(index, bounds, strict=True):
+                block &= (values_ >= b0) & (values_ < b1)
             local = np.asarray(array.local)
-            local[i[block] - b0, j[block] - c0] = values[mine][block]
+            local[
+                tuple(
+                    values_[block] - b0
+                    for values_, (b0, _) in zip(index, bounds, strict=True)
+                )
+            ] = values[mine][block]
             array.local[...] = local
         hierarchy.restrict(name)
 
@@ -354,8 +384,9 @@ class CellOperator:
     ``"azimuthal"`` for the curl-curl of an azimuthal vector component (see the
     module docstring).
 
-    ``faces`` maps ``"x_lower"``, ``"x_upper"``, ``"y_lower"``, ``"y_upper"`` (and
-    ``"inner"``, the edges of a domain that does not fill its rectangle) to a
+    ``faces`` maps ``"x_lower"``, ``"x_upper"``, ``"y_lower"``, ``"y_upper"``
+    (only the first two in 1D; and ``"inner"``, the edges of a domain that
+    does not fill its rectangle) to a
     :class:`~patchwork.nodal.Dirichlet` or :class:`~patchwork.nodal.Neumann`
     condition; a face that is not listed is a grounded Dirichlet face. Periodic
     axes take none, and nor does the axis of a cylindrical domain
@@ -441,13 +472,14 @@ class CellOperator:
     def _face_conditions(
         hierarchy: AMRHierarchy, faces: Mapping[str, Dirichlet | Neumann] | None
     ) -> dict[str, Dirichlet | Neumann]:
-        unknown = set(faces or ()) - set(FACES) - {INNER}
+        known = faces_of(hierarchy.ndim)
+        unknown = set(faces or ()) - set(known) - {INNER}
         if unknown:
             raise ValueError(
-                f"unknown faces {sorted(unknown)}; expected {[*FACES, INNER]}"
+                f"unknown faces {sorted(unknown)}; expected {[*known, INNER]}"
             )
         result: dict[str, Dirichlet | Neumann] = {}
-        for face, (axis, side) in FACES.items():
+        for face, (axis, side) in known.items():
             no_condition = hierarchy.periodic[axis] or (
                 hierarchy.on_axis and axis == 0 and side == 0
             )
@@ -538,7 +570,7 @@ class CellOperator:
         self._float_body: list[np.ndarray] = []
         # conservative coarse-fine fluxes: rows, columns and values
         self._unsymmetric: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-        for axis in (0, 1):
+        for axis in range(cells.hierarchy.ndim):
             self._interior(axis, stencil_cells, stencil_weights, strengths, diagonal)
             self._domain_boundary(axis, diagonal)
         if stencil_cells:
@@ -732,7 +764,7 @@ class CellOperator:
         else:
             inside = (spot[:, axis] >= 0) & (spot[:, axis] < size)
         inner = np.full(fine.size, -1, dtype=np.int64)
-        inner[inside] = cells.owner[spot[inside, 0], spot[inside, 1]]
+        inner[inside] = cells.owner[tuple(spot[inside].T)]
         has_inner = inner >= 0
         has_inner[has_inner] &= (cells.span[inner[has_inner]] == step[has_inner]) & (
             np.all(cells.lattice[inner[has_inner]] == spot[has_inner], axis=1)
@@ -788,9 +820,16 @@ class CellOperator:
         neighbour is the coarse cell's mirror image (its own value; minus it
         for an azimuthal component on the axis, which vanishes there), so a
         field symmetric about the wall, such as one that does not vary along
-        it, is interpolated exactly up to the wall.
+        it, is interpolated exactly up to the wall. In 1D the face is a point:
+        the coarse cell's own value, with weight 1 (the two others are 0).
         """
         cells = self.cells
+        if cells.hierarchy.ndim == 1:
+            ones, zeros = np.ones(coarse.size), np.zeros(coarse.size)
+            return (
+                np.stack([coarse, coarse, coarse], axis=1),
+                np.stack([ones, zeros, zeros], axis=1),
+            )
         other = 1 - axis
         span = cells.span[coarse]
         lattice = cells.lattice[coarse]
@@ -810,7 +849,7 @@ class CellOperator:
                 inside = (spot[:, other] >= 0) & (spot[:, other] < size)
                 mirror = self._mirror(other, side)
             found = np.full(coarse.size, -1, dtype=np.int64)
-            found[inside] = cells.owner[spot[inside, 0], spot[inside, 1]]
+            found[inside] = cells.owner[tuple(spot[inside].T)]
             valid = found >= 0
             valid[valid] &= (cells.span[found[valid]] == span[valid]) & np.all(
                 cells.lattice[found[valid]] == spot[valid], axis=1
@@ -962,10 +1001,7 @@ class CellOperator:
         area, position, middle = cells.face_metric(
             axis, boundary["plane"], boundary["start"], boundary["count"]
         )
-        names = np.full(cell.size, INNER, dtype=object)
-        for face, (face_axis, side) in FACES.items():
-            if face_axis == axis:
-                names[boundary["rectangle"] & (boundary["side"] == side)] = face
+        names = self._face_names(axis, boundary)
         on_axis = np.zeros(cell.size, dtype=bool)
         if hierarchy.on_axis and axis == 0:
             on_axis = names == "x_lower"
@@ -980,14 +1016,12 @@ class CellOperator:
         half = 0.5 * cells.sizes[cell, axis]
         kappa = self.diffusion[cell]
         weight = self._weight(axis, cell)
-        coordinates = (
-            (position, middle) if axis == 0 else (middle, position)
-        )  # the middle of each face, (x, y)
+        coordinates = _face_points(hierarchy.ndim, axis, position, middle)
         for face, condition in self._faces.items():
             mine = (names == face) & ~on_axis
             if not mine.any():
                 continue
-            x, y = coordinates[0][mine], coordinates[1][mine]
+            points = tuple(values[mine] for values in coordinates)
             if isinstance(condition, Dirichlet):
                 strength = kappa[mine] * self._conductance(
                     axis,
@@ -1005,15 +1039,14 @@ class CellOperator:
                     else np.ones(int(mine.sum()))
                 )
                 self._wall_value.append(
-                    lambda face=face, x=x, y=y: _evaluate_complex(
+                    lambda face=face, points=points: _evaluate_complex(
                         self._faces[face].value,  # type: ignore[union-attr]
-                        x,
-                        y,
+                        *points,
                     )
                 )
             else:
                 if self._azimuthal and axis == 0:
-                    gradient = _evaluate_complex(condition.gradient, x, y)
+                    gradient = _evaluate_complex(condition.gradient, *points)
                     if np.any(gradient != 0.0):
                         raise ValueError(
                             "an azimuthal component takes only the natural "
@@ -1022,16 +1055,24 @@ class CellOperator:
                     continue
                 self._flux_cells.append(cell[mine])
                 self._flux.append(
-                    lambda face=face, x=x, y=y, k=kappa[mine], a=area[mine]: (
+                    lambda face=face, points=points, k=kappa[mine], a=area[mine]: (
                         k
                         * a
                         * _evaluate_complex(
                             self._faces[face].gradient,  # type: ignore[union-attr]
-                            x,
-                            y,
+                            *points,
                         )
                     )
                 )
+
+    @staticmethod
+    def _face_names(axis: int, boundary: dict[str, np.ndarray]) -> np.ndarray:
+        """The name of the part of the boundary every boundary face is on."""
+        names = np.full(boundary["cell"].size, INNER, dtype=object)
+        for face, (face_axis, side) in FACES.items():
+            if face_axis == axis:
+                names[boundary["rectangle"] & (boundary["side"] == side)] = face
+        return names
 
     # Values ---------------------------------------------------------------------#
     def _update_values(self) -> None:
@@ -1362,10 +1403,7 @@ class CellOperator:
             axis, boundary["plane"], boundary["start"], boundary["count"]
         )
         length = boundary["count"].astype(float)
-        names = np.full(cell.size, INNER, dtype=object)
-        for face, (face_axis, side) in FACES.items():
-            if face_axis == axis:
-                names[boundary["rectangle"] & (boundary["side"] == side)] = face
+        names = self._face_names(axis, boundary)
         # +1: the boundary is above the cell
         sign = np.where(boundary["side"] == 1, 1.0, -1.0)
         half = 0.5 * cells.sizes[cell, axis]
@@ -1386,18 +1424,21 @@ class CellOperator:
                     )
                 else:
                     add(cell[on_axis], -c, np.zeros(c.shape), length[on_axis])
-        coordinates = (position, middle) if axis == 0 else (middle, position)
+        coordinates = _face_points(hierarchy.ndim, axis, position, middle)
         for face, condition in self._faces.items():
             mine = (names == face) & ~on_axis
             if not mine.any():
                 continue
-            x, y = coordinates[0][mine], coordinates[1][mine]
+            points = tuple(values[mine] for values in coordinates)
             s, h = sign[mine], half[mine]
             if isinstance(condition, Dirichlet):
                 wall = position[mine] if (self._azimuthal and axis == 0) else 1.0
                 value = (
                     s
-                    * (wall * _evaluate_complex(condition.value, x, y) - weighted[mine])
+                    * (
+                        wall * _evaluate_complex(condition.value, *points)
+                        - weighted[mine]
+                    )
                     / (h * radius(0.5 * (centre[mine] + position[mine])))
                 )
                 add(cell[mine], 0.5 * s * h, value, length[mine])
@@ -1405,16 +1446,17 @@ class CellOperator:
                 # the natural condition: no axial field on the face
                 add(cell[mine], s * h, np.zeros(h.shape), length[mine])
             else:
-                gradient = _evaluate_complex(condition.gradient, x, y)
+                gradient = _evaluate_complex(condition.gradient, *points)
                 add(cell[mine], s * h, s * gradient, length[mine])
 
     def _derivatives(self, u: np.ndarray) -> np.ndarray:
-        """``(n, 2)``: the estimates of :meth:`face_gradients` interpolated to the centres."""
+        """``(n, ndim)``: the estimates of :meth:`face_gradients` interpolated to the centres."""
         u = np.asarray(u)
         n = self.cells.num_cells
+        ndim = self.cells.hierarchy.ndim
         dtype = complex if np.iscomplexobj(u) else float
-        result = np.zeros((n, 2), dtype=dtype)
-        for axis in (0, 1):
+        result = np.zeros((n, ndim), dtype=dtype)
+        for axis in range(ndim):
             est = self.face_gradients(u, axis)
             sides = []
             for side in (est["offset"] < 0.0, est["offset"] > 0.0):
@@ -1443,7 +1485,7 @@ class CellOperator:
         return result
 
     def gradient(self, u: np.ndarray) -> np.ndarray:
-        """The gradient of a scalar ``u`` on the leaf cells, ``(n, 2)``; zero in bodies."""
+        """The gradient of a scalar ``u`` on the leaf cells, ``(n, ndim)``; zero in bodies."""
         if self._azimuthal:
             raise ValueError("an azimuthal component has a curl, not a gradient")
         return self._derivatives(u)
@@ -1453,8 +1495,10 @@ class CellOperator:
 
         ``curl(u z) = (d_y u, -d_x u)`` for a scalar in the Cartesian plane;
         ``curl(u phi) = (-d_z u, (1/r) d_r(r u))`` for an azimuthal component in
-        r–z (the magnetic field of a vector potential). Zero in bodies.
+        r–z (the magnetic field of a vector potential). Zero in bodies. 2D only.
         """
+        if self.cells.hierarchy.ndim != 2:
+            raise ValueError("the in-plane curl needs a 2D hierarchy")
         derivatives = self._derivatives(u)
         if self._azimuthal:
             return np.stack([-derivatives[:, 1], derivatives[:, 0]], axis=1)
@@ -1497,8 +1541,17 @@ def cell_body(
     return EmbeddedDirichlet(inside, value, fraction)  # type: ignore[arg-type]
 
 
+def _face_points(
+    ndim: int, axis: int, position: np.ndarray, middle: np.ndarray
+) -> tuple[np.ndarray, ...]:
+    """The middle of faces normal to ``axis``, one array per axis: ``(x,)`` or ``(x, y)``."""
+    if ndim == 1:
+        return (position,)
+    return (position, middle) if axis == 0 else (middle, position)
+
+
 def _wrapped(hierarchy: AMRHierarchy, points: np.ndarray) -> np.ndarray:
-    """``points`` ``(2, k)`` moved into the domain along its periodic axes."""
+    """``points`` ``(ndim, k)`` moved into the domain along its periodic axes."""
     if not any(hierarchy.periodic):
         return points
     points = points.copy()
@@ -1508,11 +1561,11 @@ def _wrapped(hierarchy: AMRHierarchy, points: np.ndarray) -> np.ndarray:
     return points
 
 
-def _evaluate_complex(value: Any, x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """A face value at points, complex allowed."""
-    result = value(x, y) if callable(value) else value
+def _evaluate_complex(value: Any, *coordinates: np.ndarray) -> np.ndarray:
+    """A face value at points (one array per axis), complex allowed."""
+    result: Any = value(*coordinates) if callable(value) else value
     dtype = complex if np.iscomplexobj(result) else float
-    return np.broadcast_to(np.asarray(result, dtype=dtype), x.shape).copy()
+    return np.broadcast_to(np.asarray(result, dtype=dtype), coordinates[0].shape).copy()
 
 
 def _solve(

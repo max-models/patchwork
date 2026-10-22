@@ -40,7 +40,8 @@ def test_patches_on_some_ranks_give_what_one_rank_gives(ranks: int) -> None:
 
 @pytest.mark.parametrize("ranks", [2, 3, 4])
 @pytest.mark.parametrize(
-    "tests", ["test_halos.py", "test_regrid.py", "test_markers.py"]
+    "tests",
+    ["test_halos.py", "test_regrid.py", "test_markers.py", "test_line_patches.py"],
 )
 def test_halos_and_regridding_under_mpi(tests: str, ranks: int) -> None:
     """These test files on every rank, with patches on one, some and all ranks."""
