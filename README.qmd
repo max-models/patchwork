@@ -12,8 +12,8 @@ format:
 [![Static analysis](https://github.com/max-models/patchwork/actions/workflows/static_analysis.yml/badge.svg)](https://github.com/max-models/patchwork/actions/workflows/static_analysis.yml)
 [![Docs](https://github.com/max-models/patchwork/actions/workflows/docs.yml/badge.svg)](https://max-models.github.io/patchwork/)
 [![codecov](https://codecov.io/gh/max-models/patchwork/branch/main/graph/badge.svg)](https://codecov.io/gh/max-models/patchwork)
-[![PyPI](https://img.shields.io/pypi/v/patchwork)](https://pypi.org/project/patchwork/)
-[![Python](https://img.shields.io/pypi/pyversions/patchwork)](https://pypi.org/project/patchwork/)
+[![PyPI](https://img.shields.io/pypi/v/patchwork-amr)](https://pypi.org/project/patchwork-amr/)
+[![Python](https://img.shields.io/pypi/pyversions/patchwork-amr)](https://pypi.org/project/patchwork-amr/)
 
 Patchwork is a small 2D block-structured adaptive mesh library. It stores
 cell-centered or node-centered fields on nested rectangular patches using
@@ -196,7 +196,14 @@ source env/bin/activate
 pip install --upgrade pip
 ```
 
-Install the code and requirements with pip:
+Install the release from PyPI, where the package is called `patchwork-amr` (`patchwork` there
+is an unrelated project); the import is `import patchwork`:
+
+```bash
+pip install patchwork-amr
+```
+
+Or install the code and requirements from a clone with pip:
 
 ```bash
 pip install -e ".[plot]"  # add ,mpi for MPI-enabled runs

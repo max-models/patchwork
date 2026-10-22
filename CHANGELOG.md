@@ -5,6 +5,11 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## Unreleased
 
+### Changed
+
+- Published on PyPI as `patchwork-amr` (`patchwork` there is an unrelated project); the import
+  stays `import patchwork`. The release workflow checks and publishes `patchwork-amr`.
+
 ### Added
 
 - `EmbeddedFloating`: a floating body of `CellOperator`, one unknown (its uniform value) whose

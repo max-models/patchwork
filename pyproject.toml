@@ -4,7 +4,9 @@ build-backend = "setuptools.build_meta"
 requires = [ "setuptools", "wheel" ]
 
 [project]
-name = "patchwork"
+# The distribution name: "patchwork" on PyPI is an unrelated project. The import stays
+# `import patchwork`.
+name = "patchwork-amr"
 version = "0.1.0"
 description = "Block-structured adaptive meshes backed by mpiarray."
 readme = "README.md"
@@ -37,11 +39,11 @@ dev = [
   "pyproject-fmt",
   "pyright",
   "ruff",
-  "patchwork[test,docs,plot]",
+  "patchwork-amr[test,docs,plot]",
 ]
 docs = [
   "griffe",
-  "patchwork[plot]",  # the tutorials draw figures
+  "patchwork-amr[plot]",  # the tutorials draw figures
   "ipykernel",
   "nbclient>=0.11.0",
   "nbformat>=5.11.1",

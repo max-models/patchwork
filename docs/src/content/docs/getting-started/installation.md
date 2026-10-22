@@ -11,7 +11,14 @@ source env/bin/activate
 pip install --upgrade pip
 ```
 
-Install the package and its requirements with pip:
+Install the release from PyPI, where the package is called `patchwork-amr` (`patchwork` there
+is an unrelated project); the import is `import patchwork`:
+
+```bash
+pip install patchwork-amr
+```
+
+Or install the package and its requirements from a clone with pip:
 
 ```bash
 pip install -e .
