@@ -7,7 +7,7 @@ requires = [ "setuptools", "wheel" ]
 # The distribution name: "patchwork" on PyPI is an unrelated project. The import stays
 # `import patchwork`.
 name = "patchwork-amr"
-version = "0.1.0"
+version = "0.2.0"
 description = "Block-structured adaptive meshes backed by mpiarray."
 readme = "README.md"
 keywords = [ "python" ]
