@@ -1,0 +1,272 @@
+r"""Conservative explicit time steps on a patch hierarchy: refluxing.
+
+A model with a conserved cell-centered quantity ``u`` (an amount per volume, such
+as a density or an energy density) advances it patch by patch with the fluxes
+through the faces of its cells,
+
+.. math::
+
+    V_i\,\frac{u_i^{n+1} - u_i^n}{\Delta t} = -\sum_{f \in \partial i} A_f\,F_f\,n_{f,i},
+
+where :math:`F_f` is the flux density through face :math:`f` along its axis,
+:math:`A_f` its area and :math:`V_i` the cell's volume (``AMRHierarchy.face_areas``
+and ``cell_volumes``: in r–z the faces and cells are rings). Each patch computes
+its fluxes from its own cells and its halo (:meth:`AMRHierarchy.exchange_halos
+<patchwork.mesh.AMRHierarchy.exchange_halos>`). Where a patch meets a coarser
+level, the coarse cell next to it takes the flux of its coarse face, while the
+fine cells on the other side take the fluxes of their fine faces. The two do not
+agree, and the :meth:`~patchwork.mesh.AMRHierarchy.integral` of ``u`` drifts.
+
+:class:`FluxRegister` restores it (Berger and Colella, *J. Comput. Phys.* 82, 1989).
+For every face of a coarse leaf cell on the edge of a finer level, it records the
+coarse flux and the sum of the fine fluxes through it, each times its area and time
+step. Fine levels may take several time steps for one of the coarse level
+(*subcycling*): their fluxes add up over the steps. :meth:`FluxRegister.reflux`
+then corrects the coarse cell by the difference, so that it sees the fine
+fluxes instead of its own, and gives the coarse cells under the finer patches
+the mean of their fine cells (:meth:`~patchwork.mesh.AMRHierarchy.restrict`).
+Every face of the leaf cells then carries one flux, and the integral changes only
+through the faces of the domain: to round-off, in the Cartesian plane and in r–z.
+
+Without subcycling, one step of all levels::
+
+    register = FluxRegister(mesh)
+    mesh.exchange_halos("n")
+    register.update("n", fluxes, dt)  # every patch: u -= dt / V * div(A F)
+    register.reflux("n")  # the coarse cells next to finer patches; restrict
+
+With subcycling, a level takes its step, then the finer one takes ``ratio``
+steps (recursively), and the level is refluxed once they are in step again::
+
+    def advance(level, dt):
+        mesh.exchange_halos("n", level=level, below=...)  # in time, see below
+        register.update("n", fluxes, dt, level=level)
+        if level < mesh.max_level:
+            for _ in range(ratio):
+                advance(level + 1, dt / ratio)
+            register.reflux("n", level=level)
+
+The halos of a subcycling level interpolate the level below at the time in between
+from a field that holds it (``exchange_halos(name, level=, below=)``), e.g. the
+linear interpolation of the coarse values before and after its step.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+import scope_profiler as sp
+from maybempi import MPI
+
+from patchwork._profiling import PROFILE_TAGS
+from patchwork.cells import CompositeCells
+
+if TYPE_CHECKING:
+    from patchwork.mesh import AMRHierarchy, Patch
+
+#: Face fluxes of a patch: ``fluxes(patch)`` returns the flux densities through
+#: the faces normal to each axis of this rank's block of the patch, ``(fx, fy)``
+#: of shapes ``(nx + 1, ny)`` and ``(nx, ny + 1)`` for a block of ``(nx, ny)``
+#: cells, positive along the axis.
+Fluxes = Callable[["Patch"], tuple[Any, Any]]
+
+
+class FluxRegister:
+    """Matches the fluxes of coarse and fine levels at their interfaces (refluxing).
+
+    Built for one hierarchy (after a regrid, build one for the new hierarchy,
+    with no step under way). One register serves any number of fields: it
+    keeps what it records per field name. See the module docstring.
+
+    The coarse–fine faces are the faces between two leaf cells of different
+    levels (:class:`~patchwork.cells.CompositeCells`): a level need not be
+    properly nested in the one below, and periodic axes and domains that are not
+    rectangles are covered. Under MPI the coarse and fine cells of a face may be
+    on different ranks: :meth:`reflux` sums the records over the hierarchy's
+    communicator (one ``allreduce`` of a value per coarse face).
+
+    Attributes:
+        hierarchy: The patch hierarchy.
+        num_faces: The number of coarse faces on the edges of finer levels.
+    """
+
+    def __init__(self, hierarchy: AMRHierarchy, cells: CompositeCells | None = None):
+        """Find the coarse–fine faces of ``hierarchy`` (``cells``: its leaf cells)."""
+        self.hierarchy = hierarchy
+        cells = CompositeCells(hierarchy) if cells is None else cells
+        keys, fine_cells, fine_axes, fine_sides = [], [], [], []
+        for axis in (0, 1):
+            faces = cells.faces(axis)
+            low, high = faces["low"], faces["high"]
+            mixed = cells.span[low] != cells.span[high]
+            low, high = low[mixed], high[mixed]
+            fine_low = cells.span[low] < cells.span[high]
+            coarse = np.where(fine_low, high, low)
+            # the side of the cell the face is on: 1 above it, 0 below
+            coarse_side = (~fine_low).astype(np.int64)
+            keys.append(coarse * 4 + axis * 2 + coarse_side)
+            fine_cells.append(np.where(fine_low, low, high))
+            fine_axes.append(np.full(low.size, axis, dtype=np.int64))
+            fine_sides.append(fine_low.astype(np.int64))
+        unique, entry = np.unique(np.concatenate(keys), return_inverse=True)
+        coarse_cells = unique // 4
+        self.num_faces = int(unique.size)
+        patches = hierarchy.patches
+        levels = np.array([patch.level for patch in patches], dtype=np.int64)
+        self._coarse_level = levels[cells.patch[coarse_cells]]
+        # per patch: (entries, local i, local j, axis, side) of its coarse faces
+        # and of its fine faces
+        self._coarse = self._by_patch(
+            cells, coarse_cells, np.arange(unique.size), (unique // 2) % 2, unique % 2
+        )
+        self._fine = self._by_patch(
+            cells,
+            np.concatenate(fine_cells),
+            entry.reshape(-1),
+            np.concatenate(fine_axes),
+            np.concatenate(fine_sides),
+        )
+        self._records: dict[str, np.ndarray] = {}
+
+    @staticmethod
+    def _by_patch(
+        cells: CompositeCells,
+        leaf: np.ndarray,
+        entry: np.ndarray,
+        axis: np.ndarray,
+        side: np.ndarray,
+    ) -> dict[int, tuple[np.ndarray, ...]]:
+        """Faces of leaf cells grouped by patch, in the patch's own cell indices."""
+        result = {}
+        boxes = [patch.box for patch in cells.hierarchy.patches]
+        for number in np.unique(cells.patch[leaf]):
+            chosen = cells.patch[leaf] == number
+            (i0, _), (j0, _) = boxes[number]
+            result[int(number)] = (
+                entry[chosen],
+                cells.index[leaf[chosen], 0] - i0,
+                cells.index[leaf[chosen], 1] - j0,
+                axis[chosen],
+                side[chosen],
+            )
+        return result
+
+    def _record(self, name: str) -> np.ndarray:
+        if name not in self._records:
+            dtype = np.result_type(self.hierarchy._field_specs[name]["dtype"], float)
+            self._records[name] = np.zeros(self.num_faces, dtype=dtype)
+        return self._records[name]
+
+    @sp.profile("patchwork.flux_update", tags=PROFILE_TAGS)
+    def update(
+        self,
+        name: str,
+        fluxes: Fluxes,
+        dt: float,
+        *,
+        level: int | None = None,
+        scale: float | None = None,
+    ) -> None:
+        """Advance field ``name`` by the divergence of face fluxes, and record them.
+
+        For every patch this rank holds (of ``level`` only, if given), the
+        cells of its block take ``u -= dt / V * sum(A F n)`` with the flux
+        densities ``fluxes(patch)`` (see :data:`Fluxes`). The fluxes through
+        coarse–fine faces are recorded times ``scale`` (default ``dt``) for
+        :meth:`reflux`. A multi-stage method records each stage with its
+        weight: the two stages of Heun's method (SSP-RK2) with ``scale=dt / 2``.
+
+        Local to this rank: no communication. The fluxes of a face that two
+        patches of the same level, or two ranks of one patch, share must agree
+        (as they do when computed alike from the values the halos give).
+        """
+        hierarchy = self.hierarchy
+        if hierarchy.centering(name) != "cell":
+            raise ValueError(f"field {name!r} is not cell-centered")
+        records = self._record(name)
+        weight = dt if scale is None else scale
+        for number, patch in enumerate(hierarchy.patches):
+            if not patch.is_local or (level is not None and patch.level != level):
+                continue
+            array = patch.field(name)
+            (b0, b1), (c0, c1) = array.layout.index_bounds
+            fx, fy = (np.asarray(flux) for flux in fluxes(patch))
+            shapes = ((b1 - b0 + 1, c1 - c0), (b1 - b0, c1 - c0 + 1))
+            if (fx.shape, fy.shape) != shapes:
+                raise ValueError(
+                    f"the fluxes of a block of {(b1 - b0, c1 - c0)} cells have the "
+                    f"shapes {shapes}, got {fx.shape} and {fy.shape}"
+                )
+            i0 = patch.box[0][0]
+            area_x = hierarchy.face_areas(patch.level, 0, i0 + np.arange(b0, b1 + 1))
+            area_y = hierarchy.face_areas(patch.level, 1, i0 + np.arange(b0, b1))
+            volume = hierarchy.cell_volumes(patch.level, i0 + np.arange(b0, b1))
+            through = (fx * area_x[:, None], fy * area_y[:, None])
+            net = (
+                through[0][1:]
+                - through[0][:-1]
+                + through[1][:, 1:]
+                - through[1][:, :-1]
+            )
+            array.local[...] -= dt * net / volume[:, None]
+            # a patch on several ranks that all hold all of it records once
+            if not array.layout.split and patch.comm.Get_rank() != 0:
+                continue
+            for faces, sign in ((self._coarse, -1.0), (self._fine, 1.0)):
+                if number not in faces:
+                    continue
+                entry, i, j, axis, side = faces[number]
+                mine = (i >= b0) & (i < b1) & (j >= c0) & (j < c1)
+                a, b = i[mine] - b0, j[mine] - c0
+                normal, side = axis[mine] == 0, side[mine]
+                value = np.empty(a.size, dtype=records.dtype)
+                value[normal] = through[0][a[normal] + side[normal], b[normal]]
+                across = ~normal
+                value[across] = through[1][a[across], b[across] + side[across]]
+                np.add.at(records, entry[mine], sign * weight * value)
+
+    @sp.profile("patchwork.reflux", tags=PROFILE_TAGS)
+    def reflux(self, name: str, *, level: int | None = None) -> None:
+        """Correct the coarse cells next to finer levels, and restrict onto them.
+
+        Each coarse leaf cell on the edge of a finer level takes, for each of
+        its faces there, the recorded sum of the fine fluxes instead of its own
+        flux (divided by its volume), and the records of those faces are
+        cleared. Then the cells under the finer patches take the mean of their
+        fine cells. With ``level``, for the coarse cells of that level only
+        (when the finer levels have caught up with it), and the restriction
+        onto that level only. Collective over the hierarchy's communicator.
+        """
+        hierarchy = self.hierarchy
+        records = self._record(name)
+        chosen = (
+            np.ones(self.num_faces, dtype=bool)
+            if level is None
+            else self._coarse_level == level
+        )
+        # a copy: a serial allreduce may hand back the array itself
+        total = np.array(hierarchy.comm.allreduce(records, op=MPI.SUM))
+        records[chosen] = 0.0
+        for number, patch in enumerate(hierarchy.patches):
+            if not patch.is_local or number not in self._coarse:
+                continue
+            if level is not None and patch.level != level:
+                continue
+            array = patch.field(name)
+            (b0, b1), (c0, c1) = array.layout.index_bounds
+            entry, i, j, axis, side = self._coarse[number]
+            mine = (i >= b0) & (i < b1) & (j >= c0) & (j < c1)
+            entry, i, side = entry[mine], i[mine], side[mine]
+            volume = hierarchy.cell_volumes(patch.level, patch.box[0][0] + i)
+            # the face above the cell carries the flux out of it, the one below in
+            change = np.where(side == 1, -1.0, 1.0) * total[entry] / volume
+            np.add.at(array.local, (i - b0, j[mine] - c0), change)
+        hierarchy.restrict(name, level=level)
+
+    def reset(self, name: str | None = None) -> None:
+        """Clear the records of field ``name`` (of every field without it)."""
+        for key in self._records if name is None else [name]:
+            if key in self._records:
+                self._records[key][...] = 0.0

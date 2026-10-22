@@ -3,6 +3,27 @@
 All notable changes to this project are documented in this file and maintained manually. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- `FluxRegister`: conservative explicit steps of a cell-centered field on the patches
+  (Berger–Colella refluxing). `update` advances every patch by the divergence of the face
+  fluxes a model computes from its halos and records the fluxes through coarse–fine faces;
+  `reflux` gives the coarse cells next to finer levels the fine fluxes instead of their own
+  and restricts onto the covered cells. The `integral` is conserved to round-off, in the
+  Cartesian plane and in r–z, with one time step for all levels or with fine levels
+  subcycling (their fluxes summed over their steps), and with multi-stage methods (`scale`).
+- `AMRHierarchy.face_areas`: the face areas that go with `cell_volumes` (rings in r–z).
+- `exchange_halos(name, level=, below=)`: the halos of one level only, interpolated from
+  another field of the level below (the coarse values at the time of a subcycled step);
+  `restrict(name, level=)`: onto one level only.
+
+### Fixed
+
+- `integral` counted a replicated field (`split=None`) once per rank of a patch on several
+  ranks.
+
 ## [0.2.0] - 2026-10-22
 
 The first release on PyPI, as `patchwork-amr`.

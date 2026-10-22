@@ -111,3 +111,46 @@ nodes the fine node at the same place, finest level first. Both are collective;
 their schedules are built at the first call for a field and kept until a patch
 is added. Each call sends its data in one `Alltoallv` over the hierarchy's
 communicator (`mpiarray.CopyPlan`), whichever ranks the patches are on.
+
+## Conservative time steps (refluxing)
+
+A model that advances a conserved cell field (a density, an energy density) with explicit
+steps computes the fluxes through the faces of each patch from its halos. Where a patch
+meets a coarser level, the coarse cell next to it would take the flux of its own face and
+the fine cells the fluxes of theirs: they do not agree, and the total drifts.
+`FluxRegister` matches them (Berger–Colella refluxing):
+
+```python
+from patchwork import FluxRegister
+
+register = FluxRegister(mesh)  # the coarse faces on the edges of finer levels
+
+
+def fluxes(patch):
+    """Flux densities through this rank's block of the patch, positive along the axis."""
+    u = patch.field("n").local_with_halos  # own cells and halo
+    ...
+    return fx, fy  # shapes (nx + 1, ny) and (nx, ny + 1) for a block of (nx, ny) cells
+
+
+for step in range(steps):
+    mesh.exchange_halos("n")
+    register.update("n", fluxes, dt)  # every patch: n -= dt / V * sum(A F)
+    register.reflux("n")  # coarse cells next to finer patches; restrict
+```
+
+- `update` advances the cells of every patch with the face areas and cell volumes of the
+  hierarchy (`face_areas`, `cell_volumes`; rings in r–z) and records the coarse flux and
+  the sum of the fine fluxes through every coarse face on the edge of a finer level.
+- `reflux` gives each such coarse cell the fine fluxes instead of its own, then the cells
+  under finer patches the mean of their fine cells. Every face of the leaf cells carries one
+  flux, and `mesh.integral("n")` changes only through the faces of the domain, to
+  round-off.
+- Fine levels may subcycle: advance a level with `update(..., level=level)`, then the finer
+  level `ratio` times with `dt / ratio`, then `reflux(..., level=level)`; the fine fluxes add
+  up over their steps. `exchange_halos(name, level=level, below="n_between")` fills the
+  halos of one level from a field that holds the level below at the time in between.
+- A multi-stage method records each stage with its weight, e.g. the two stages of Heun's
+  method with `update(..., dt, scale=dt / 2)`.
+- `update` is local to each rank; `reflux` is collective (one `allreduce` of a value per
+  coarse face). Build a new register after a regrid.

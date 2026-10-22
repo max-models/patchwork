@@ -379,16 +379,31 @@ class HaloExchange:
     Collective over the hierarchy's communicator, as is :meth:`execute`.
     """
 
-    def __init__(self, hierarchy: AMRHierarchy, name: str) -> None:
-        """Find where every halo point comes from (one ``allgather``)."""
+    def __init__(
+        self,
+        hierarchy: AMRHierarchy,
+        name: str,
+        *,
+        level: int | None = None,
+        below: str | None = None,
+    ) -> None:
+        """Find where every halo point comes from (one ``allgather``).
+
+        With ``level``, only for the patches of that level; with ``below``,
+        interpolating field ``below`` of the level below instead of ``name``.
+        """
         spec = hierarchy._field_specs[name]
         self._hierarchy = hierarchy
         self._name = name
+        self._below = name if below is None else below
+        self._level = level
         self._width = int(spec["halo"])
         points = _Points(hierarchy, spec["centering"] == "node")
         copies: list[tuple] = []
         self._interpolations: list[_Bilinear] = []
         for patch in hierarchy.patches if self._width else ():
+            if level is not None and patch.level != level:
+                continue
             covered = self._same_level(points, patch, copies)
             if patch.level > 0:
                 self._coarse_fine(points, patch, covered, spec["dtype"], copies)
@@ -396,6 +411,9 @@ class HaloExchange:
 
     def _field(self, patch: Patch) -> Any:
         return patch.field(self._name) if patch.is_local else None
+
+    def _coarse_field(self, patch: Patch) -> Any:
+        return patch.field(self._below) if patch.is_local else None
 
     def _same_level(self, points: _Points, patch: Patch, copies: list) -> np.ndarray:
         """Copies from the patches of the same level; the halo points they cover."""
@@ -450,7 +468,7 @@ class HaloExchange:
             self._hierarchy,
             points,
             patch,
-            self._field,
+            self._coarse_field,
             self._field(patch),
             i[keep],
             j[keep],
@@ -466,7 +484,8 @@ class HaloExchange:
         apply_interpolations(self._interpolations)
         if self._width:
             for patch in self._hierarchy.local_patches:
-                patch.field(self._name).update_halos()
+                if self._level is None or patch.level == self._level:
+                    patch.field(self._name).update_halos()
 
 
 class Restriction:
@@ -489,15 +508,16 @@ class Restriction:
         self._nodal = nodal
         self._ratio = ratio
         self._hierarchy = hierarchy
-        # one plan per level, finest first: a level gets its finer values
+        # one plan per fine level, finest first: a level gets its finer values
         # before it gives them to the one below
-        self._steps: list[tuple[Any, list[tuple]]] = []
+        self._steps: list[tuple[int, Any, list[tuple]]] = []
         for level in range(hierarchy.max_level, 0, -1):
             copies: list[tuple] = []
             writes: list[tuple] = []
             for fine in hierarchy.patches_at_level(level):
                 self._add(hierarchy, points, fine, copies, writes)
-            self._steps.append((mpa.CopyPlan(copies, comm=hierarchy.comm), writes))
+            plan = mpa.CopyPlan(copies, comm=hierarchy.comm)
+            self._steps.append((level, plan, writes))
 
     def _add(
         self,
@@ -547,11 +567,15 @@ class Restriction:
                     rows = (fine.level, region[0][0])
                     writes.append((coarse.field(name), target, buffer, rows))
 
-    def execute(self) -> None:
-        """Restrict. Collective over the hierarchy's communicator."""
-        for plan, writes in self._steps:
-            plan.execute()
-            self._write(writes)
+    def execute(self, level: int | None = None) -> None:
+        """Restrict onto every level, or onto ``level`` only from the next finer one.
+
+        Collective over the hierarchy's communicator.
+        """
+        for fine_level, plan, writes in self._steps:
+            if level is None or fine_level == level + 1:
+                plan.execute()
+                self._write(writes)
 
     def _write(self, writes: list[tuple]) -> None:
         r = self._ratio
