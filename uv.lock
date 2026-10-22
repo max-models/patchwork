@@ -2580,7 +2580,7 @@ wheels = [
 ]
 
 [[package]]
-name = "patchwork"
+name = "patchwork-amr"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
@@ -2645,8 +2645,8 @@ requires-dist = [
     { name = "nbclient", marker = "extra == 'docs'", specifier = ">=0.11.0" },
     { name = "nbformat", marker = "extra == 'docs'", specifier = ">=5.11.1" },
     { name = "numpy" },
-    { name = "patchwork", extras = ["plot"], marker = "extra == 'docs'" },
-    { name = "patchwork", extras = ["test", "docs", "plot"], marker = "extra == 'dev'" },
+    { name = "patchwork-amr", extras = ["plot"], marker = "extra == 'docs'" },
+    { name = "patchwork-amr", extras = ["test", "docs", "plot"], marker = "extra == 'dev'" },
     { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "pyproject-fmt", marker = "extra == 'dev'" },
     { name = "pyright", marker = "extra == 'dev'" },
