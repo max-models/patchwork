@@ -151,6 +151,27 @@ needs 0.9 s to factorize; the two potentials agree to 0.13%.
 ![The potential of a moving charge, with the patches that follow
 it](docs/public/figures/regrid_moving_charge.png)
 
+## Profiling
+
+patchwork ships
+[scope-profiler](https://github.com/max-models/scope-profiler) regions
+around its expensive operations (halo exchanges, restriction, deposit
+and migration, tagging and regridding, building and solving the Poisson
+problems), named `patchwork.<operation>`. They are off by default, so an
+application that profiles itself records only its own regions. Turn them
+on with the `patchwork` tag:
+
+``` python
+import scope_profiler as sp
+
+sp.setup(enable_tags=["patchwork"])  # or sp.session(enable_tags=["patchwork"])
+```
+
+or, without editing the code, `SCOPE_PROFILER_ENABLE_TAGS=patchwork`,
+`scope-profiler run --enable-tag patchwork`, or `enable_tags` in the
+TOML configuration. Switched off, a region costs less than 0.2 µs per
+call.
+
 ## Install
 
 With [uv](https://docs.astral.sh/uv/):

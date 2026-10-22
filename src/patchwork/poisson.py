@@ -9,6 +9,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 import scipy.sparse as sparse
 import scipy.sparse.linalg
+import scope_profiler as sp
+
+from patchwork._profiling import PROFILE_TAGS
 
 if TYPE_CHECKING:
     from patchwork.mesh import AMRHierarchy, Patch
@@ -51,6 +54,7 @@ def _parents(
     return parents
 
 
+@sp.profile("patchwork.solve_poisson", tags=PROFILE_TAGS)
 def solve_poisson(
     hierarchy: AMRHierarchy,
     rhs: str,

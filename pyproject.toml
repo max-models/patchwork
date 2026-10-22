@@ -25,6 +25,7 @@ dependencies = [
   "mpiarray>=0.2.1",
   "numpy",
   "scipy",
+  "scope-profiler>=0.7.5",
 ]
 
 [project.optional-dependencies]
@@ -95,3 +96,4 @@ show_missing = true
 [tool.uv.sources]
 maybempi = { git = "https://github.com/max-models/maybempi", branch = "devel" }
 mpiarray = { git = "https://github.com/max-models/mpiarray", branch = "devel" }
+scope-profiler = { git = "https://github.com/max-models/scope-profiler", branch = "devel" }

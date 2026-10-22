@@ -25,6 +25,9 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import scipy.sparse as sparse
 import scipy.sparse.linalg
+import scope_profiler as sp
+
+from patchwork._profiling import PROFILE_TAGS
 
 if TYPE_CHECKING:
     from patchwork.mesh import AMRHierarchy, Patch
@@ -106,6 +109,7 @@ class CompositeNodes:
             ``u`` from the others (which it leaves unchanged).
     """
 
+    @sp.profile("patchwork.composite_nodes", tags=PROFILE_TAGS)
     def __init__(self, hierarchy: AMRHierarchy) -> None:
         """Number the nodes of ``hierarchy`` and find its leaf cells and hanging nodes."""
         self.hierarchy = hierarchy
@@ -702,6 +706,7 @@ class NodalPoisson:
         fixed: Whether a node has a prescribed value (a face or a body).
     """
 
+    @sp.profile("patchwork.nodal_poisson_setup", tags=PROFILE_TAGS)
     def __init__(
         self,
         hierarchy: AMRHierarchy,
@@ -1056,6 +1061,7 @@ class NodalPoisson:
         """The share of the right-hand side that the prescribed values give."""
         return self._constant
 
+    @sp.profile("patchwork.nodal_poisson_solve_reduced", tags=PROFILE_TAGS)
     def solve_reduced(self, right_hand_side: np.ndarray) -> np.ndarray:
         """Solve for a right-hand side of the unknowns; the potential on all nodes.
 
@@ -1071,6 +1077,7 @@ class NodalPoisson:
             potential[nodes.hanging] = self._reduction_rows @ potential
         return potential
 
+    @sp.profile("patchwork.nodal_poisson_solve", tags=PROFILE_TAGS)
     def solve(
         self,
         source: np.ndarray | str | None = None,
