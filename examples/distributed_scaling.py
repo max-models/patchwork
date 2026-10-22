@@ -66,7 +66,7 @@ def main() -> None:
     args = parser.parse_args()
     base = args.base
     if args.weak:
-        base = 4 * int(round(base * np.sqrt(SIZE) / 4))
+        base = 8 * int(round(base * np.sqrt(SIZE) / 8))
 
     petsc()  # imported before timing anything
     mesh = hierarchy(base)
