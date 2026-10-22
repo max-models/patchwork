@@ -29,7 +29,10 @@ field storage, plotting, and composite linear solves:
 - `NodalPoisson`: node-centered, the five-point Laplacian wherever the
   mesh is uniform, with Dirichlet and Neumann faces, periodic axes and
   embedded bodies at fixed potentials. It is factorized once and solved
-  many times, which is what a particle-in-cell code needs.
+  many times, which is what a particle-in-cell code needs. With
+  `backend="petsc"` (the `petsc` extra) every rank assembles only the
+  rows of its patches’ nodes and PETSc solves them together (a Krylov
+  method with algebraic multigrid).
 - `CellOperator`: cell-centered, `-div(a grad u) + c u = f` with a
   variable diffusion coefficient and a real or complex reaction (a skin
   layer, an inductive field), the same faces, periodic axes and bodies,

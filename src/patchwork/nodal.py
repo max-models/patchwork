@@ -103,6 +103,11 @@ class CompositeNodes:
             in the order lower-left, lower-right, upper-left, upper-right.
         cell_span: Edge length of every leaf cell on the finest lattice.
         cell_lower: Finest-lattice coordinates of the lower-left corners.
+        cell_ranks: The rank of the hierarchy's communicator that holds every
+            leaf cell: one of its patch's ranks, the rows of a patch on several
+            ranks split over them as its arrays are.
+        node_ranks: The rank that owns every node in a distributed solve: the
+            lowest of the ranks of the leaf cells around it.
         volumes: Control volume of every node: a quarter of each cell around it.
         hanging: Whether a node is hanging (interpolated from other nodes).
         reduction: The interpolation ``T``: ``T @ u`` fills the hanging nodes of
@@ -121,7 +126,7 @@ class CompositeNodes:
         self._spacing = np.asarray(hierarchy.spacing(finest), dtype=float)
         self._origin = np.asarray(hierarchy.lower_bound, dtype=float)
 
-        lowers, spans = [], []
+        lowers, spans, owners = [], [], []
         for patch in hierarchy.patches:
             span = ratio ** (finest - patch.level)
             (i0, _), (j0, _) = patch.box
@@ -137,8 +142,19 @@ class CompositeNodes:
             i, j = np.nonzero(~covered)
             lowers.append(np.column_stack(((i + i0) * span, (j + j0) * span)))
             spans.append(np.full(i.size, span, dtype=np.int64))
+            # a patch on several ranks: its rows of cells split over them as
+            # its arrays are (near-even, along the first axis)
+            chunks = np.array_split(np.arange(patch.shape[0]), len(patch.ranks))
+            row_rank = np.concatenate(
+                [
+                    np.full(chunk.size, rank, dtype=np.int64)
+                    for chunk, rank in zip(chunks, patch.ranks, strict=True)
+                ]
+            )
+            owners.append(row_rank[i])
         self.cell_lower = np.concatenate(lowers)
         self.cell_span = np.concatenate(spans)
+        self.cell_ranks = np.concatenate(owners)
 
         offsets = np.array([[0, 0], [1, 0], [0, 1], [1, 1]], dtype=np.int64)
         corners = (
@@ -154,6 +170,12 @@ class CompositeNodes:
 
         size = self.cell_span[:, None] * self._spacing  # (m, 2) physical edge lengths
         self.cell_size = size
+        self.node_ranks = np.full(self.num_nodes, np.iinfo(np.int64).max)
+        np.minimum.at(
+            self.node_ranks,
+            self.cell_corners.reshape(-1),
+            np.repeat(self.cell_ranks, 4),
+        )
         self.volumes = np.zeros(self.num_nodes)
         np.add.at(
             self.volumes,
@@ -700,10 +722,27 @@ class NodalPoisson:
     inside the rectangle. ``embedded`` are bodies at fixed potentials
     (:class:`EmbeddedDirichlet`); where they overlap the last one listed wins.
 
+    ``backend="superlu"`` (the default) assembles the whole operator on every
+    rank and factorizes it there. ``backend="petsc"`` (needs petsc4py) assembles
+    on every rank only the rows of the unknowns it owns
+    (:attr:`CompositeNodes.node_ranks`, from where the patches are), from the
+    leaf cells around them, and solves them together with a PETSc Krylov method
+    and an algebraic multigrid preconditioner (see :class:`PetscSystem`) to the
+    relative residual ``rtol``; ``petsc_options`` are PETSc options without
+    the dash, e.g. ``{"pc_type": "gamg"}``. Both give the potential on all
+    nodes on every rank.
+
     Attributes:
         nodes: The :class:`CompositeNodes` of the hierarchy.
         free: Node numbers of the unknowns: neither hanging nor fixed.
         fixed: Whether a node has a prescribed value (a face or a body).
+        rows: Node numbers of the unknowns whose rows this rank holds: all of
+            :attr:`free` with SuperLU, those it owns with PETSc (in the order of
+            the distributed system: by rank, then by node number).
+        matrix: This rank's rows of the operator, over the columns of the
+            unknowns (in :attr:`free` order with SuperLU, in the distributed
+            order with PETSc).
+        system: The :class:`PetscSystem` (PETSc backend), else ``None``.
     """
 
     @sp.profile("patchwork.nodal_poisson_setup", tags=PROFILE_TAGS)
@@ -715,6 +754,9 @@ class NodalPoisson:
         embedded: Sequence[EmbeddedDirichlet] = (),
         min_fraction: float = 1.0e-3,
         nodes: CompositeNodes | None = None,
+        backend: str = "superlu",
+        rtol: float = 1.0e-10,
+        petsc_options: Mapping[str, Any] | None = None,
     ) -> None:
         """Assemble and factorize the operator.
 
@@ -722,6 +764,11 @@ class NodalPoisson:
         an embedded surface: a surface closer than that (through the node, up to
         round-off) is moved there, which bounds the size of that node's row.
         """
+        if backend not in ("superlu", "petsc"):
+            raise ValueError(f"backend must be 'superlu' or 'petsc', got {backend!r}")
+        self.backend = backend
+        self._rtol = float(rtol)
+        self._petsc_options = dict(petsc_options or {})
         self.nodes = CompositeNodes(hierarchy) if nodes is None else nodes
         self._embedded = tuple(embedded)
         self._min_fraction = float(min_fraction)
@@ -797,15 +844,97 @@ class NodalPoisson:
         return result
 
     def _assemble(self) -> None:
-        """Build the operator, its factorization and the right-hand-side maps."""
+        """Build this rank's rows of the operator, the solver and the right-hand-side maps."""
         nodes = self.nodes
         n = nodes.num_nodes
         self._classify_bodies()
         solid = self._owner >= 0
 
+        self.fixed = np.zeros(n, dtype=bool)
+        for face, condition in self._faces.items():
+            if isinstance(condition, Dirichlet):
+                self.fixed[nodes.face_nodes(face)] = True
+        self.fixed |= solid
+        self.fixed &= ~nodes.hanging
+        self.free = np.nonzero(~self.fixed & ~nodes.hanging)[0]
+        if not self.fixed.any():
+            raise ValueError(
+                "the Poisson operator is singular: without a Dirichlet face or "
+                "an embedded body the potential is only known up to a constant"
+            )
+        fixed = np.nonzero(self.fixed)[0]
+        self._fixed_nodes = fixed
+
+        reduction = nodes.reduction
+        if self.backend == "petsc":
+            # the unknowns by owner: every rank's rows are contiguous
+            comm = nodes.hierarchy.comm
+            owner = nodes.node_ranks[self.free]
+            self._unknowns = self.free[np.argsort(owner, kind="stable")]
+            self.rows = self.free[owner == comm.Get_rank()]
+            # the rows of the reduced operator of these unknowns take the rows
+            # of the nodes that hang from them too, which need every leaf cell
+            # around those nodes
+            support = np.zeros(n, dtype=bool)
+            support[sparse.csc_matrix(reduction[:, self.rows]).indices] = True
+            cells = np.nonzero(support[nodes.cell_corners].any(axis=1))[0]
+        else:
+            self._unknowns = self.free
+            self.rows = self.free
+            cells = None
+        operator, wall = self._operator(cells)
+
+        # rows of T^T A T for the unknowns this rank holds
+        pick = sparse.csr_matrix(reduction[:, self.rows].T)
+        reduced = sparse.csr_matrix(pick @ operator @ reduction)
+        self._wall = sparse.csr_matrix(pick @ wall)
+        self._load = sparse.csr_matrix(pick @ sparse.diags(nodes.volumes))
+        # a source already integrated over the control volumes (a deposited charge)
+        self._integral_load = pick
+        self._lift = reduced[:, fixed].tocsr()
+        self._reduction_rows = reduction[np.nonzero(nodes.hanging)[0]].tocsr()
+        self._factorization = None
+        self.system = None
+        if self.backend == "petsc":
+            from patchwork.distributed import PetscSystem
+
+            self.matrix = reduced[:, self._unknowns].tocsr()
+            if self.free.size:
+                self.system = PetscSystem(
+                    self.matrix,
+                    nodes.hierarchy.comm,
+                    symmetric=not self._embedded,
+                    options=self._petsc_options,
+                    prefix="patchwork_nodal_",
+                    rtol=self._rtol,
+                )
+            return
+        matrix = reduced[:, self.free].tocsc()
+        self.matrix = matrix
+        if self.free.size:
+            # minimum degree on the pattern of A + A^T: the mesh's own graph,
+            # about half the fill of the default column ordering
+            self._factorization = scipy.sparse.linalg.splu(
+                matrix, permc_spec="MMD_AT_PLUS_A"
+            )
+
+    def _operator(
+        self, cells: np.ndarray | None
+    ) -> tuple[sparse.csr_matrix, sparse.csr_matrix]:
+        """The operator on all nodes and the surface couplings, from some leaf cells.
+
+        The rows of nodes all of whose cells are among ``cells`` (all cells if
+        ``None``) are complete; the others are not, and are left out by the caller.
+        """
+        nodes = self.nodes
+        n = nodes.num_nodes
+        solid = self._owner >= 0
+
         # Every leaf cell's four edges, with half the stencil's conductance each.
-        ll, lr, ul, ur = (nodes.cell_corners[:, k] for k in range(4))
-        hx, hy = nodes.cell_size[:, 0], nodes.cell_size[:, 1]
+        corners = nodes.cell_corners if cells is None else nodes.cell_corners[cells]
+        size = nodes.cell_size if cells is None else nodes.cell_size[cells]
+        ll, lr, ul, ur = (corners[:, k] for k in range(4))
+        hx, hy = size[:, 0], size[:, 1]
         first = np.concatenate((ll, ul, ll, lr))
         second = np.concatenate((lr, ur, ul, ur))
         conductance = np.concatenate(
@@ -852,45 +981,9 @@ class NodalPoisson:
             sparse.coo_matrix((entries, (rows, columns)), shape=(n, n))
         )
 
-        operator, wall = self._shortley_weller(
+        return self._shortley_weller(
             operator, wall, outside, inside, fraction * cut_length
         )
-
-        reduction = nodes.reduction
-        reduced = sparse.csr_matrix(reduction.T @ operator @ reduction)
-        self._wall = sparse.csr_matrix(reduction.T @ wall)
-        self._load = sparse.csr_matrix(reduction.T @ sparse.diags(nodes.volumes))
-        # a source already integrated over the control volumes (a deposited charge)
-        self._integral_load = sparse.csr_matrix(reduction.T)
-
-        self.fixed = np.zeros(n, dtype=bool)
-        for face, condition in self._faces.items():
-            if isinstance(condition, Dirichlet):
-                self.fixed[nodes.face_nodes(face)] = True
-        self.fixed |= solid
-        self.fixed &= ~nodes.hanging
-        self.free = np.nonzero(~self.fixed & ~nodes.hanging)[0]
-        fixed = np.nonzero(self.fixed)[0]
-        self._fixed_nodes = fixed
-        self._lift = reduced[self.free][:, fixed].tocsr()
-        self._load = self._load[self.free]
-        self._integral_load = self._integral_load[self.free]
-        self._wall = self._wall[self.free]
-        self._reduction_rows = reduction[np.nonzero(nodes.hanging)[0]].tocsr()
-        matrix = reduced[self.free][:, self.free].tocsc()
-        self.matrix = matrix
-        if not self.fixed.any():
-            raise ValueError(
-                "the Poisson operator is singular: without a Dirichlet face or "
-                "an embedded body the potential is only known up to a constant"
-            )
-        self._factorization = None
-        if self.free.size:
-            # minimum degree on the pattern of A + A^T: the mesh's own graph,
-            # about half the fill of the default column ordering
-            self._factorization = scipy.sparse.linalg.splu(
-                matrix, permc_spec="MMD_AT_PLUS_A"
-            )
 
     def _shortley_weller(
         self,
@@ -1010,7 +1103,7 @@ class NodalPoisson:
         values[solid] = body_values[self._owner[solid]]
         self._values = values
         constant = self._wall @ body_values
-        constant += (nodes.reduction.T @ flux)[self.free]
+        constant += self._integral_load @ flux
         constant -= self._lift @ values[self._fixed_nodes]
         self._constant = constant
 
@@ -1043,7 +1136,7 @@ class NodalPoisson:
     # Solving -------------------------------------------------------------------#
     @property
     def load(self) -> sparse.csr_matrix:
-        """Map from a source on all nodes to the right-hand side of the unknowns."""
+        """Map from a source on all nodes to the right-hand side of this rank's :attr:`rows`."""
         return self._load
 
     @property
@@ -1063,16 +1156,19 @@ class NodalPoisson:
 
     @sp.profile("patchwork.nodal_poisson_solve_reduced", tags=PROFILE_TAGS)
     def solve_reduced(self, right_hand_side: np.ndarray) -> np.ndarray:
-        """Solve for a right-hand side of the unknowns; the potential on all nodes.
+        """Solve for a right-hand side of this rank's :attr:`rows`; the potential on all nodes.
 
         ``right_hand_side`` is ``load @ source + constant``, which callers that
         solve repeatedly with a source of fixed structure can precompute as one
-        matrix. Hanging nodes are filled by interpolation.
+        matrix. Hanging nodes are filled by interpolation. Collective with the
+        PETSc backend.
         """
         nodes = self.nodes
         potential = self._values.copy()
         if self._factorization is not None:
             potential[self.free] = self._factorization.solve(right_hand_side)
+        if self.system is not None:
+            potential[self._unknowns] = self.system.solve(right_hand_side)
         if nodes.hanging.any():
             potential[nodes.hanging] = self._reduction_rows @ potential
         return potential
@@ -1093,9 +1189,10 @@ class NodalPoisson:
         :meth:`CompositeNodes.deposit` gives it for point particles (divide a
         charge by the permittivity for :math:`-\nabla^2\phi = \rho /
         \varepsilon_0`); the charge on hanging nodes goes to the nodes they hang
-        from, and the charge on fixed nodes is ignored. With ``potential`` the
-        result is also written to the node-centered field of that name
-        (allocated if needed).
+        from, and the charge on fixed nodes is ignored. A source or charge array
+        is the whole one on every rank (the sum over the ranks' deposits); each
+        rank reads the part its rows need. With ``potential`` the result is also
+        written to the node-centered field of that name (allocated if needed).
         """
         nodes = self.nodes
         if (source is None) == (charge is None):
@@ -1132,13 +1229,14 @@ def solve_nodal_poisson(
     potential: str = "potential",
     faces: Mapping[str, Dirichlet | Neumann] | None = None,
     embedded: Sequence[EmbeddedDirichlet] = (),
+    backend: str = "superlu",
 ) -> NodalPoisson:
     r"""Solve :math:`-\nabla^2\phi = \mathrm{rhs}` once on the nodes of ``hierarchy``.
 
     ``rhs`` and ``potential`` name node-centered fields; see
-    :class:`NodalPoisson` for the conditions. Returns the solver, which can
-    solve again without assembling.
+    :class:`NodalPoisson` for the conditions and the backends. Returns the
+    solver, which can solve again without assembling.
     """
-    solver = NodalPoisson(hierarchy, faces=faces, embedded=embedded)
+    solver = NodalPoisson(hierarchy, faces=faces, embedded=embedded, backend=backend)
     solver.solve(rhs, potential=potential)
     return solver

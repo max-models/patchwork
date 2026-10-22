@@ -3,6 +3,18 @@
 All notable changes to this project are documented in this file and maintained manually. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- `NodalPoisson(backend="petsc")`: a distributed solve. Every rank assembles only the rows
+  of the unknowns it owns (`CompositeNodes.node_ranks`, from the ranks of the patches), from
+  the leaf cells around them, and PETSc solves them together: conjugate gradients (GMRES
+  with embedded bodies) and BoomerAMG, or GAMG without hypre, to `rtol`, with GMRES and
+  block Jacobi as a fallback. The potential agrees with the SuperLU solve (still the
+  default) to the solver tolerance on any number of ranks. `PetscSystem`, the `petsc` extra
+  (petsc4py), `CompositeNodes.cell_ranks` and `examples/distributed_scaling.py`.
+
 ## [0.2.0] - 2026-10-22
 
 The first release on PyPI, as `patchwork-amr`.

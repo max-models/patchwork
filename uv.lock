@@ -2624,6 +2624,9 @@ docs = [
 mpi = [
     { name = "mpiarray", extra = ["mpi"] },
 ]
+petsc = [
+    { name = "petsc4py" },
+]
 plot = [
     { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "matplotlib", version = "3.11.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
@@ -2647,6 +2650,7 @@ requires-dist = [
     { name = "numpy" },
     { name = "patchwork-amr", extras = ["plot"], marker = "extra == 'docs'" },
     { name = "patchwork-amr", extras = ["test", "docs", "plot"], marker = "extra == 'dev'" },
+    { name = "petsc4py", marker = "extra == 'petsc'" },
     { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "pyproject-fmt", marker = "extra == 'dev'" },
     { name = "pyright", marker = "extra == 'dev'" },
@@ -2656,7 +2660,25 @@ requires-dist = [
     { name = "scipy" },
     { name = "scope-profiler", git = "https://github.com/max-models/scope-profiler?branch=devel" },
 ]
-provides-extras = ["mpi", "plot", "dev", "docs", "test"]
+provides-extras = ["mpi", "petsc", "plot", "dev", "docs", "test"]
+
+[[package]]
+name = "petsc"
+version = "3.26.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/87/c3/4d7b2bc87bbf4a4f47bf31b53b88f67f8662170d0f56a6f2343782418c12/petsc-3.26.0.tar.gz", hash = "sha256:f5230023e6e22ee607802a13c82bc25f3d81e71654ad386a5b9bdff17fed93df", size = 16933940, upload-time = "2026-09-29T03:59:41.375Z" }
+
+[[package]]
+name = "petsc4py"
+version = "3.26.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "petsc" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ba/f4/a78ea74e4791014b5d8e8299d9f220e772cc255dfdb23f94682ed7fd3b3d/petsc4py-3.26.0.tar.gz", hash = "sha256:0a34bd083e24bee1a6759c4639a45d10c0117855eb9f0466834450245f75d7e5", size = 524118, upload-time = "2026-09-29T03:59:44.776Z" }
 
 [[package]]
 name = "pexpect"

@@ -4,6 +4,7 @@ import scope_profiler as sp
 
 from patchwork._profiling import PROFILE_TAGS
 from patchwork.cells import CellOperator, CompositeCells, EmbeddedFloating, cell_body
+from patchwork.distributed import PetscSystem
 from patchwork.mesh import AMRHierarchy, IndexBox, Patch
 from patchwork.nodal import (
     CompositeNodes,
@@ -34,6 +35,7 @@ __all__ = [
     "Neumann",
     "NodalPoisson",
     "Patch",
+    "PetscSystem",
     "__version__",
     "cell_body",
     "cluster",

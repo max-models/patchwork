@@ -47,6 +47,39 @@ jobs:
           flags: python-${{ matrix.python-version }}
           fail_ci_if_error: false
 
+  # The distributed solve (NodalPoisson(backend="petsc")) and the other MPI tests under
+  # mpirun: PETSc, petsc4py and Open MPI from conda-forge, which has binaries (the petsc
+  # extra from PyPI builds PETSc from source).
+  pytest-petsc:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up PETSc, petsc4py and MPI
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-name: petsc
+          create-args: python=3.12 petsc4py mpi4py openmpi
+          cache-environment: true
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+
+      - name: Install project
+        run: uv pip install --python "$(which python)" -e ".[test,mpi,plot]"
+
+      - name: Run the PETSc and MPI tests
+        env:
+          OMP_NUM_THREADS: "1"
+        run: |
+          python -c "from petsc4py import PETSc; print(PETSc.Sys.getVersion())"
+          python -m pytest -ra src/patchwork/tests/unit/test_distributed.py src/patchwork/tests/unit/test_mpi.py
+
   # PyPI rejects a release whose metadata has a direct reference (name @ git+...), so a pull
   # request to main fails here instead of the release after the merge.
   no-direct-references:
