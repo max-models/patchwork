@@ -69,8 +69,8 @@ def test_clusters_separate_at_gaps_and_keep_a_filled_box_whole() -> None:
 
 def test_cluster_checks_its_arguments() -> None:
     tags = np.ones((4, 4), dtype=bool)
-    with pytest.raises(ValueError, match="2D"):
-        cluster(np.ones(4, dtype=bool))
+    with pytest.raises(ValueError, match="1D or 2D"):
+        cluster(np.ones((2, 2, 2), dtype=bool))
     with pytest.raises(ValueError, match="efficiency"):
         cluster(tags, efficiency=0.0)
     with pytest.raises(ValueError, match="max_size"):

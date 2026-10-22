@@ -16,18 +16,24 @@ if TYPE_CHECKING:
 
     from mpiarray import DistributedArray
 
-IndexBox = tuple[tuple[int, int], tuple[int, int]]
-PhysicalBounds = tuple[tuple[float, float], tuple[float, float]]
+#: A half-open box of cells, ``((i_lower, i_upper),)`` in 1D and
+#: ``((i_lower, i_upper), (j_lower, j_upper))`` in 2D.
+IndexBox = tuple[tuple[int, int], ...]
+PhysicalBounds = tuple[tuple[float, float], ...]
+
+#: The numbers of dimensions a hierarchy may have.
+DIMENSIONS = (1, 2)
 
 #: The geometries of a hierarchy: a Cartesian plane ``(x, y)``, or the
 #: axisymmetric ``(r, z)`` plane of a body of revolution (``"cylindrical"``).
 GEOMETRIES = ("cartesian", "cylindrical")
 
 
-def _box(value: Sequence[Sequence[int]]) -> IndexBox:
-    """Normalize and validate a 2D half-open integer box."""
-    if len(value) != 2 or any(len(axis) != 2 for axis in value):
-        raise ValueError("a patch box must be ((i_lower, i_upper), (j_lower, j_upper))")
+def _box(value: Sequence[Sequence[int]], ndim: int = 2) -> IndexBox:
+    """Normalize and validate a half-open integer box of ``ndim`` axes."""
+    if len(value) != ndim or any(len(axis) != 2 for axis in value):
+        expected = ", ".join(f"({a}_lower, {a}_upper)" for a in "ij"[:ndim])
+        raise ValueError(f"a patch box must be ({expected},)")
     result = tuple((int(axis[0]), int(axis[1])) for axis in value)
     if any(lo < 0 or hi <= lo for lo, hi in result):
         raise ValueError(
@@ -108,14 +114,14 @@ class Patch:
         return self.comm is not None
 
     @property
-    def shape(self) -> tuple[int, int]:
+    def shape(self) -> tuple[int, ...]:
         """Number of cells along each axis."""
-        return tuple(hi - lo for lo, hi in self.box)  # type: ignore[return-value]
+        return tuple(hi - lo for lo, hi in self.box)
 
     @property
-    def node_shape(self) -> tuple[int, int]:
+    def node_shape(self) -> tuple[int, ...]:
         """Number of nodes (cell corners) along each axis: one more than cells."""
-        return tuple(hi - lo + 1 for lo, hi in self.box)  # type: ignore[return-value]
+        return tuple(hi - lo + 1 for lo, hi in self.box)
 
     @property
     def field_names(self) -> tuple[str, ...]:
@@ -138,24 +144,30 @@ class Patch:
 
     def local_node_coordinates(
         self, hierarchy: AMRHierarchy, name: str
-    ) -> tuple[Any, Any]:
+    ) -> tuple[Any, ...]:
         """Coordinates of this rank's nodes of the node-centered field ``name``.
 
-        Two arrays of the shape of ``field(name).local``, for filling it.
+        One array per axis (``x``, or ``x`` and ``y``) of the shape of
+        ``field(name).local``, for filling it.
         """
         import numpy as np
 
-        (i0, i1), (j0, j1) = self.field(name).layout.index_bounds
-        x, y = self.node_coordinates(hierarchy)
-        return np.meshgrid(x[i0:i1], y[j0:j1], indexing="ij")
+        bounds = self.field(name).layout.index_bounds
+        axes = self.node_coordinates(hierarchy)
+        return tuple(
+            np.meshgrid(
+                *(a[b0:b1] for a, (b0, b1) in zip(axes, bounds, strict=True)),
+                indexing="ij",
+            )
+        )
 
     def local_cell_centers(
         self, hierarchy: AMRHierarchy, name: str | None = None
-    ) -> tuple[Any, Any]:
+    ) -> tuple[Any, ...]:
         """Coordinates of this rank's cells of the cell-centered field ``name``.
 
-        Two arrays of the shape of ``field(name).local``, for filling it.
-        Without ``name``, of the first cell-centered field allocated.
+        One array per axis of the shape of ``field(name).local``, for filling
+        it. Without ``name``, of the first cell-centered field allocated.
         """
         if not self.is_local:
             raise RuntimeError(
@@ -177,35 +189,54 @@ class Patch:
             layout = self.field(name).layout
             if tuple(layout.shape) != self.shape:
                 raise ValueError(f"field {name!r} is not cell-centered")
-        (i0, _), (j0, _) = self.box
-        (li0, li1), (lj0, lj1) = layout.index_bounds
-        dx, dy = hierarchy.spacing(self.level)
-        x0, y0 = hierarchy.lower_bound
         import numpy as np
 
-        x = x0 + (i0 + np.arange(li0, li1) + 0.5) * dx
-        y = y0 + (j0 + np.arange(lj0, lj1) + 0.5) * dy
-        return np.meshgrid(x, y, indexing="ij")
+        axes = [
+            x0 + (i0 + np.arange(b0, b1) + 0.5) * h
+            for (i0, _), (b0, b1), h, x0 in zip(
+                self.box,
+                layout.index_bounds,
+                hierarchy.spacing(self.level),
+                hierarchy.lower_bound,
+                strict=True,
+            )
+        ]
+        return tuple(np.meshgrid(*axes, indexing="ij"))
 
-    def node_coordinates(self, hierarchy: AMRHierarchy) -> tuple[Any, Any]:
+    def node_coordinates(self, hierarchy: AMRHierarchy) -> tuple[Any, ...]:
         """Coordinates of the nodes of the whole patch along each axis (1D arrays)."""
         import numpy as np
 
-        dx, dy = hierarchy.spacing(self.level)
-        x0, y0 = hierarchy.lower_bound
-        (i0, i1), (j0, j1) = self.box
-        return x0 + np.arange(i0, i1 + 1) * dx, y0 + np.arange(j0, j1 + 1) * dy
+        return tuple(
+            x0 + np.arange(i0, i1 + 1) * h
+            for (i0, i1), h, x0 in zip(
+                self.box,
+                hierarchy.spacing(self.level),
+                hierarchy.lower_bound,
+                strict=True,
+            )
+        )
 
     def physical_bounds(self, hierarchy: AMRHierarchy) -> PhysicalBounds:
-        """Physical rectangle occupied by this patch."""
-        dx, dy = hierarchy.spacing(self.level)
-        x0, y0 = hierarchy.lower_bound
-        (i0, i1), (j0, j1) = self.box
-        return ((x0 + i0 * dx, x0 + i1 * dx), (y0 + j0 * dy, y0 + j1 * dy))
+        """Physical interval (1D) or rectangle (2D) occupied by this patch."""
+        return tuple(
+            (x0 + i0 * h, x0 + i1 * h)
+            for (i0, i1), h, x0 in zip(
+                self.box,
+                hierarchy.spacing(self.level),
+                hierarchy.lower_bound,
+                strict=True,
+            )
+        )
 
 
 class AMRHierarchy:
-    """A 2D nested patch hierarchy with mpiarray-backed fields.
+    """A 1D or 2D nested patch hierarchy with mpiarray-backed fields.
+
+    The number of dimensions is that of ``base_shape``: ``(nx,)`` cells for a
+    line (a uniform 1D grid is a hierarchy of one level), ``(nx, ny)`` for a
+    plane. Boxes, bounds, ``periodic`` and point coordinates then have one
+    entry per axis, and everything below works the same way in both.
 
     Patch coordinates are integer cell bounds on their own refinement level.
     A child patch's bounds must align with the parent level and lie within the
@@ -239,16 +270,17 @@ class AMRHierarchy:
     of volume ``2 pi r dr dz`` (:meth:`cell_volumes`). :meth:`integral`,
     :meth:`restrict` and the conservative interpolation of :meth:`regrid` then
     weight cells by their volumes. Fields are per unit length along ``z`` in
-    the Cartesian plane and totals over the ring in r–z.
+    the Cartesian plane and totals over the ring in r–z; in 1D they are per
+    unit area of the planes normal to ``x``. The r–z plane is 2D only.
     """
 
     def __init__(
         self,
-        base_shape: tuple[int, int],
-        bounds: PhysicalBounds = ((0.0, 1.0), (0.0, 1.0)),
+        base_shape: tuple[int, ...],
+        bounds: PhysicalBounds | None = None,
         *,
         refinement_ratio: int = 2,
-        periodic: tuple[bool, bool] = (False, False),
+        periodic: Sequence[bool] | None = None,
         base_boxes: Sequence[Sequence[Sequence[int]]] | None = None,
         placement: str | Callable[[int, IndexBox], Any] = "all",
         max_cells_per_rank: int | None = None,
@@ -258,28 +290,41 @@ class AMRHierarchy:
     ) -> None:
         """Create the base level: ``base_shape`` cells over the physical ``bounds``.
 
+        ``bounds`` is ``((x_lower, x_upper),)`` in 1D and ``((x_lower,
+        x_upper), (y_lower, y_upper))`` in 2D, the unit interval or square by
+        default; ``periodic`` has one flag per axis, none periodic by default.
         ``base_boxes`` are half-open boxes of base cells that do not overlap;
         their union is the domain. By default it is the whole rectangle.
         ``base_ranks`` gives the ranks of each base box, as ``ranks`` of
         :meth:`add_patch` does for a patch; by default ``placement`` decides.
         """
-        if len(base_shape) != 2 or any(int(n) != n or n <= 0 for n in base_shape):
-            raise ValueError("base_shape must contain two positive integer cell counts")
+        ndim = len(base_shape)
+        if ndim not in DIMENSIONS or any(int(n) != n or n <= 0 for n in base_shape):
+            raise ValueError(
+                "base_shape must contain one or two positive integer cell counts"
+            )
         if int(refinement_ratio) != refinement_ratio or refinement_ratio < 2:
             raise ValueError("refinement_ratio must be an integer of at least 2")
-        if len(bounds) != 2 or any(len(axis) != 2 for axis in bounds):
-            raise ValueError("bounds must be ((x_lower, x_upper), (y_lower, y_upper))")
+        if bounds is None:
+            bounds = ((0.0, 1.0),) * ndim
+        if len(bounds) != ndim or any(len(axis) != 2 for axis in bounds):
+            expected = ", ".join(f"({a}_lower, {a}_upper)" for a in "xy"[:ndim])
+            raise ValueError(f"bounds must be ({expected},), one pair per axis")
         if any(hi <= lo for lo, hi in bounds):
             raise ValueError("each physical upper bound must exceed its lower bound")
         self.base_shape = tuple(int(n) for n in base_shape)
         self.bounds = tuple(tuple(float(x) for x in axis) for axis in bounds)
         self.refinement_ratio = int(refinement_ratio)
-        if len(periodic) != 2:
+        if periodic is None:
+            periodic = (False,) * ndim
+        if len(periodic) != ndim:
             raise ValueError("periodic must have one flag per axis")
-        self.periodic = (bool(periodic[0]), bool(periodic[1]))
+        self.periodic = tuple(bool(flag) for flag in periodic)
         if geometry not in GEOMETRIES:
             raise ValueError(f"geometry must be one of {GEOMETRIES}, got {geometry!r}")
         if geometry == "cylindrical":
+            if ndim != 2:
+                raise ValueError("a cylindrical domain is the 2D r–z plane")
             if self.bounds[0][0] < 0.0:
                 raise ValueError("a cylindrical domain needs a radius r >= 0")
             if self.periodic[0]:
@@ -306,10 +351,12 @@ class AMRHierarchy:
         # halo exchanges and restrictions, by kind and field; rebuilt after add_patch
         self._schedules: dict[tuple[str, str], Any] = {}
         # which patch owns each cell of a level, rebuilt after add_patch (see locate)
-        self._locators: dict[int, tuple[tuple[int, int], Any]] = {}
+        self._locators: dict[int, tuple[tuple[int, ...], Any]] = {}
         self._field_specs: dict[str, dict[str, Any]] = {}
-        whole = ((0, self.base_shape[0]), (0, self.base_shape[1]))
-        boxes = [whole] if base_boxes is None else [_box(box) for box in base_boxes]
+        whole = tuple((0, n) for n in self.base_shape)
+        boxes = (
+            [whole] if base_boxes is None else [_box(box, ndim) for box in base_boxes]
+        )
         if not boxes:
             raise ValueError("base_boxes must hold at least one box")
         for number, box in enumerate(boxes):
@@ -326,14 +373,19 @@ class AMRHierarchy:
             self._patches.append(self._new_patch(0, box, ranks))
 
     @property
-    def lower_bound(self) -> tuple[float, float]:
-        """Physical lower-left corner of the domain."""
-        return self.bounds[0][0], self.bounds[1][0]
+    def ndim(self) -> int:
+        """Number of dimensions: 1 or 2."""
+        return len(self.base_shape)
 
     @property
-    def upper_bound(self) -> tuple[float, float]:
-        """Physical upper-right corner of the domain."""
-        return self.bounds[0][1], self.bounds[1][1]
+    def lower_bound(self) -> tuple[float, ...]:
+        """Physical lower (lower-left) corner of the domain."""
+        return tuple(lo for lo, _ in self.bounds)
+
+    @property
+    def upper_bound(self) -> tuple[float, ...]:
+        """Physical upper (upper-right) corner of the domain."""
+        return tuple(hi for _, hi in self.bounds)
 
     @property
     def patches(self) -> tuple[Patch, ...]:
@@ -350,13 +402,13 @@ class AMRHierarchy:
         """Names allocated throughout the hierarchy."""
         return tuple(self._field_specs)
 
-    def spacing(self, level: int = 0) -> tuple[float, float]:
-        """Cell spacing at a refinement level."""
+    def spacing(self, level: int = 0) -> tuple[float, ...]:
+        """Cell spacing at a refinement level, per axis."""
         scale = self.refinement_ratio**level
         return tuple(
             (hi - lo) / (n * scale)
             for (lo, hi), n in zip(self.bounds, self.base_shape, strict=True)
-        )  # type: ignore[return-value]
+        )
 
     @property
     def cylindrical(self) -> bool:
@@ -371,23 +423,24 @@ class AMRHierarchy:
     def cell_volumes(self, level: int, i: Any) -> Any:
         """Volumes of the cells of ``level`` with first index ``i`` (an array).
 
-        ``dx * dy`` in the Cartesian plane; ``2 pi r dr dz`` in r–z, with ``r``
-        the cell's mid-radius (the exact volume of the ring). The volume does
-        not depend on the second index.
+        ``dx`` on a line (per unit area), ``dx * dy`` in the Cartesian plane;
+        ``2 pi r dr dz`` in r–z, with ``r`` the cell's mid-radius (the exact
+        volume of the ring). The volume does not depend on the second index.
         """
         import numpy as np
 
-        dx, dy = self.spacing(level)
+        spacing = self.spacing(level)
         i = np.asarray(i, dtype=float)
         if not self.cylindrical:
-            return np.full(i.shape, dx * dy)
+            return np.full(i.shape, float(np.prod(spacing)))
+        dx, dy = spacing
         radius = self.bounds[0][0] + (i + 0.5) * dx
         return 2.0 * np.pi * radius * dx * dy
 
-    def level_shape(self, level: int) -> tuple[int, int]:
+    def level_shape(self, level: int) -> tuple[int, ...]:
         """Number of cells in the full domain at a refinement level."""
         scale = self.refinement_ratio**level
-        return self.base_shape[0] * scale, self.base_shape[1] * scale
+        return tuple(n * scale for n in self.base_shape)
 
     def patches_at_level(self, level: int) -> tuple[Patch, ...]:
         """Patches on one level."""
@@ -398,7 +451,7 @@ class AMRHierarchy:
     ) -> Patch:
         """A patch on ``ranks`` (or where ``placement`` puts it), with its communicator."""
         size = self.comm.Get_size()
-        cells = (box[0][1] - box[0][0]) * (box[1][1] - box[1][0])
+        cells = _shared_cells(box, box)
         if ranks is None and callable(self.placement):
             ranks = self.placement(level, box)
         if ranks is None:
@@ -500,7 +553,7 @@ class AMRHierarchy:
         if level < 1 or int(level) != level:
             raise ValueError("fine patch level must be a positive integer")
         level = int(level)
-        normalized = _box(box)
+        normalized = _box(box, self.ndim)
         shape = self.level_shape(level)
         if any(hi > n for (_, hi), n in zip(normalized, shape, strict=True)):
             raise ValueError(
@@ -516,8 +569,7 @@ class AMRHierarchy:
                 f"patch {normalized} overlaps an existing level-{level} patch"
             )
         # every cell of the level below that the patch refines is in a patch there
-        (i0, i1), (j0, j1) = normalized
-        coarse: IndexBox = ((i0 // ratio, i1 // ratio), (j0 // ratio, j1 // ratio))
+        coarse: IndexBox = tuple((lo // ratio, hi // ratio) for lo, hi in normalized)
         covered = sum(
             _shared_cells(coarse, parent.box)
             for parent in self.patches_at_level(level - 1)
@@ -744,27 +796,32 @@ class AMRHierarchy:
         total = 0.0
         for patch in self.local_patches:
             array = patch.field(name)
-            (b0, b1), (c0, c1) = array.layout.index_bounds
-            (i0, _), (j0, _) = patch.box
-            leaf = np.ones((b1 - b0, c1 - c0), dtype=bool)
             # this rank's block, in the patch's level indices
-            block = ((i0 + b0, i0 + b1), (j0 + c0, j0 + c1))
+            block = tuple(
+                (lo + b0, lo + b1)
+                for (lo, _), (b0, b1) in zip(
+                    patch.box, array.layout.index_bounds, strict=True
+                )
+            )
+            leaf = np.ones([hi - lo for lo, hi in block], dtype=bool)
             for finer in self.patches_at_level(patch.level + 1):
-                (f0, f1), (g0, g1) = finer.box
-                under = ((f0 // ratio, f1 // ratio), (g0 // ratio, g1 // ratio))
+                under = tuple((lo // ratio, hi // ratio) for lo, hi in finer.box)
                 lo = [max(a[0], b[0]) for a, b in zip(under, block, strict=True)]
                 hi = [min(a[1], b[1]) for a, b in zip(under, block, strict=True)]
-                if lo[0] < hi[0] and lo[1] < hi[1]:
+                if all(a < b for a, b in zip(lo, hi, strict=True)):
                     leaf[
-                        lo[0] - block[0][0] : hi[0] - block[0][0],
-                        lo[1] - block[1][0] : hi[1] - block[1][0],
+                        tuple(
+                            slice(a - first, b - first)
+                            for a, b, (first, _) in zip(lo, hi, block, strict=True)
+                        )
                     ] = False
-            volumes = self.cell_volumes(patch.level, np.arange(i0 + b0, i0 + b1))
-            weighted = np.asarray(array.local) * volumes[:, None]
+            volumes = self.cell_volumes(patch.level, np.arange(*block[0]))
+            volumes = volumes.reshape((-1,) + (1,) * (self.ndim - 1))
+            weighted = np.asarray(array.local) * volumes
             total += float(weighted[leaf].sum())
         return float(self.comm.allreduce(total, op=MPI.SUM))
 
-    def _locator(self, level: int) -> tuple[tuple[int, int], Any]:
+    def _locator(self, level: int) -> tuple[tuple[int, ...], Any]:
         """Which patch holds each cell of ``level``: the corner of the table and the table.
 
         The table covers the bounding box of the level's patches and holds the index
@@ -778,87 +835,108 @@ class AMRHierarchy:
                 for number, patch in enumerate(self.patches)
                 if patch.level == level
             ]
-            i_low = min(patch.box[0][0] for _, patch in members)
-            i_high = max(patch.box[0][1] for _, patch in members)
-            j_low = min(patch.box[1][0] for _, patch in members)
-            j_high = max(patch.box[1][1] for _, patch in members)
-            table = np.full((i_high - i_low, j_high - j_low), -1, dtype=np.intp)
+            low = tuple(
+                min(patch.box[axis][0] for _, patch in members)
+                for axis in range(self.ndim)
+            )
+            high = tuple(
+                max(patch.box[axis][1] for _, patch in members)
+                for axis in range(self.ndim)
+            )
+            table = np.full(
+                [b - a for a, b in zip(low, high, strict=True)], -1, dtype=np.intp
+            )
             for number, patch in members:
-                (i0, i1), (j0, j1) = patch.box
-                table[i0 - i_low : i1 - i_low, j0 - j_low : j1 - j_low] = number
-            self._locators[level] = ((i_low, j_low), table)
+                table[
+                    tuple(
+                        slice(lo - first, hi - first)
+                        for (lo, hi), first in zip(patch.box, low, strict=True)
+                    )
+                ] = number
+            self._locators[level] = (low, table)
         return self._locators[level]
 
-    def _cells(self, x: Any, y: Any) -> tuple[Any, Any, Any, tuple[Any, Any]]:
+    def _cells(self, coordinates: Sequence[Any]) -> tuple[Any, tuple[Any, ...], tuple]:
         """Where flat arrays of points are: patch, cell and wrapped coordinates.
 
-        Returns, for each point, the index of the finest patch that holds it
-        (-1 outside the domain), its cell on the level of that patch (level
-        indices), and the coordinates wrapped into the domain on periodic axes.
+        ``coordinates`` holds one flat array per axis. Returns, for each point,
+        the index of the finest patch that holds it (-1 outside the domain),
+        its cell on the level of that patch (level indices, one array per
+        axis), and the coordinates wrapped into the domain on periodic axes.
         """
         import numpy as np
 
-        coordinates = []
-        inside = np.ones(x.size, dtype=bool)
-        for axis, values in enumerate((x, y)):
+        size = coordinates[0].size
+        wrapped = []
+        inside = np.ones(size, dtype=bool)
+        for axis, values in enumerate(coordinates):
             low, high = self.bounds[axis]
             if self.periodic[axis]:
                 values = low + np.mod(values - low, high - low)
             inside &= (values >= low) & (values <= high)  # False for NaN
-            coordinates.append(values)
-        found = np.full(x.size, -1, dtype=np.intp)
-        cell_i = np.zeros(x.size, dtype=np.intp)
-        cell_j = np.zeros(x.size, dtype=np.intp)
+            wrapped.append(values)
+        found = np.full(size, -1, dtype=np.intp)
+        cell = [np.zeros(size, dtype=np.intp) for _ in range(self.ndim)]
         for level in range(self.max_level, -1, -1):
             pending = np.flatnonzero(inside & (found < 0))
             if pending.size == 0:
                 break
-            (i_low, j_low), table = self._locator(level)
+            corner, table = self._locator(level)
             cells = []
-            for axis in (0, 1):
+            within = np.ones(pending.size, dtype=bool)
+            for axis in range(self.ndim):
                 low = self.bounds[axis][0]
                 spacing = self.spacing(level)[axis]
                 count = self.level_shape(level)[axis]
-                index = np.floor((coordinates[axis][pending] - low) / spacing)
+                index = np.floor((wrapped[axis][pending] - low) / spacing)
                 cells.append(np.minimum(index.astype(np.intp), count - 1))
-            i = cells[0] - i_low
-            j = cells[1] - j_low
-            within = (i >= 0) & (i < table.shape[0]) & (j >= 0) & (j < table.shape[1])
+                offset = cells[axis] - corner[axis]
+                within &= (offset >= 0) & (offset < table.shape[axis])
             owner = np.full(pending.size, -1, dtype=np.intp)
-            owner[within] = table[i[within], j[within]]
+            owner[within] = table[
+                tuple(c[within] - first for c, first in zip(cells, corner, strict=True))
+            ]
             hit = owner >= 0
             found[pending[hit]] = owner[hit]
-            cell_i[pending[hit]] = cells[0][hit]
-            cell_j[pending[hit]] = cells[1][hit]
-        return found, cell_i, cell_j, (coordinates[0], coordinates[1])
+            for axis in range(self.ndim):
+                cell[axis][pending[hit]] = cells[axis][hit]
+        return found, tuple(cell), tuple(wrapped)
 
-    @staticmethod
-    def _points(x: Any, y: Any) -> tuple[Any, Any, tuple[int, ...]]:
+    def _points(self, coordinates: Sequence[Any]) -> tuple[tuple, tuple[int, ...]]:
         """Flat float arrays of the coordinates of points, and their common shape."""
         import numpy as np
 
-        x = np.asarray(x, dtype=float)
-        y = np.asarray(y, dtype=float)
-        if x.shape != y.shape:
+        if len(coordinates) != self.ndim:
+            names = ", ".join("xy"[: self.ndim])
             raise ValueError(
-                f"x and y must have the same shape, got {x.shape} and {y.shape}"
+                f"a {self.ndim}D hierarchy takes {self.ndim} coordinate arrays "
+                f"({names}), got {len(coordinates)}"
             )
-        return x.reshape(-1), y.reshape(-1), x.shape
+        arrays = [np.asarray(values, dtype=float) for values in coordinates]
+        shape = arrays[0].shape
+        if any(array.shape != shape for array in arrays):
+            raise ValueError(
+                "x and y must have the same shape, got "
+                + " and ".join(str(array.shape) for array in arrays)
+            )
+        return tuple(array.reshape(-1) for array in arrays), shape
 
-    def locate(self, x: Any, y: Any) -> Any:
+    def locate(self, *coordinates: Any) -> Any:
         """The finest patch that holds each point: its index in :attr:`patches`.
 
-        ``x`` and ``y`` are arrays of the same shape (physical coordinates); the result
-        has that shape and is -1 for a point outside the domain, such as one in the notch of
-        an L. Cells are half open, so a point on the edge between two patches belongs to the
-        one that starts there; the upper faces of the domain, though, belong to the last
-        cell. On a periodic axis a point outside the domain is wrapped back into it first.
-        Local to every rank (every rank holds the whole hierarchy); no communication.
+        ``locate(x)`` in 1D, ``locate(x, y)`` in 2D: arrays of the same shape
+        (physical coordinates); the result has that shape and is -1 for a point
+        outside the domain, such as one in the notch of an L. Cells are half
+        open, so a point on the edge between two patches belongs to the one that
+        starts there; the upper faces of the domain, though, belong to the last
+        cell. On a periodic axis a point outside the domain is wrapped back into
+        it first. Local to every rank (every rank holds the whole hierarchy); no
+        communication.
         """
-        x, y, shape = self._points(x, y)
-        return self._cells(x, y)[0].reshape(shape)
+        points, shape = self._points(coordinates)
+        return self._cells(points)[0].reshape(shape)
 
-    def _owners(self, found: Any, cell_i: Any, cell_j: Any, name: str) -> Any:
+    def _owners(self, found: Any, cell: tuple[Any, ...], name: str) -> Any:
         """The rank that holds the block of field ``name`` where each marker's cell starts."""
         import numpy as np
 
@@ -874,42 +952,69 @@ class AMRHierarchy:
                     "a point has no owner; allocate it with split=0"
                 )
             chosen = np.flatnonzero(found == number)
-            (i0, _), (j0, _) = patches[number].box
-            a, b = cell_i[chosen] - i0, cell_j[chosen] - j0
-            for rank, ((a0, a1), (b0, b1)) in members:
-                inside = (a >= a0) & (a < a1) & (b >= b0) & (b < b1)
+            local = [
+                c[chosen] - lo
+                for c, (lo, _) in zip(cell, patches[number].box, strict=True)
+            ]
+            for rank, bounds in members:
+                inside = np.ones(chosen.size, dtype=bool)
+                for values, (a0, a1) in zip(local, bounds, strict=True):
+                    inside &= (values >= a0) & (values < a1)
                 result[chosen[inside]] = rank
         return result
 
-    def owner(self, x: Any, y: Any, name: str) -> Any:
+    def _split(
+        self, arguments: tuple, name: str | None, extra: int, what: str
+    ) -> tuple[tuple, tuple, str]:
+        """``(coordinates, the next extra arguments, name)`` of a call by position.
+
+        ``name`` is the last positional argument unless it is given by keyword.
+        """
+        if name is None:
+            if not arguments or not isinstance(arguments[-1], str):
+                raise TypeError(f"{what} needs the name of a field")
+            arguments, name = arguments[:-1], arguments[-1]
+        if len(arguments) != self.ndim + extra:
+            names = ", ".join([*"xy"[: self.ndim], *(["charge"] if extra else [])])
+            raise TypeError(
+                f"{what} of a {self.ndim}D hierarchy takes ({names}, name), got "
+                f"{len(arguments)} arrays"
+            )
+        return arguments[: self.ndim], arguments[self.ndim :], name
+
+    def owner(self, *points: Any, name: str | None = None) -> Any:
         """The rank that should hold each marker: -1 outside the domain.
 
-        A marker belongs to the rank that holds the block of field ``name`` in which the
-        lower left corner of its cell lies, in the finest patch that holds it (see
-        :meth:`locate`). That block is the one :meth:`deposit` writes into: the other
-        corners of the cell are in its halo, which :meth:`accumulate_halos` hands on. The
-        same for a cell-centered and a node-centered field, since cell ``(i, j)`` starts at
-        node ``(i, j)``. Collective the first time for a field (until a patch is added), as
-        the ranks tell each other their blocks; the same result on every rank for the same
-        points.
+        ``owner(x, name)`` in 1D, ``owner(x, y, name)`` in 2D. A marker belongs
+        to the rank that holds the block of field ``name`` in which the lower
+        (left) corner of its cell lies, in the finest patch that holds it (see
+        :meth:`locate`). That block is the one :meth:`deposit` writes into: the
+        other corners of the cell are in its halo, which :meth:`accumulate_halos`
+        hands on. The same for a cell-centered and a node-centered field, since
+        cell ``(i, j)`` starts at node ``(i, j)``. Collective the first time for
+        a field (until a patch is added), as the ranks tell each other their
+        blocks; the same result on every rank for the same points.
         """
-        x, y, shape = self._points(x, y)
-        found, cell_i, cell_j, _ = self._cells(x, y)
-        return self._owners(found, cell_i, cell_j, name).reshape(shape)
+        coordinates, _, name = self._split(points, name, 0, "owner")
+        flat, shape = self._points(coordinates)
+        found, cell, _ = self._cells(flat)
+        return self._owners(found, cell, name).reshape(shape)
 
     @sp.profile("patchwork.migrate", tags=PROFILE_TAGS)
     def migrate(
-        self, x: Any, y: Any, *arrays: Any, name: str, outside: str = "error"
+        self, *points_and_arrays: Any, name: str, outside: str = "error"
     ) -> tuple[Any, ...]:
         """Send markers to the ranks that hold their patches; returns what this rank gets.
 
-        ``x`` and ``y`` are the positions of this rank's markers (1D) and ``arrays`` any
-        other per-marker data, with one row per marker (velocities as ``v.T`` if they are
-        stored ``(3, n)``). Each marker goes to :meth:`owner` of field ``name``, with
-        :func:`mpiarray.migrate`. Returns ``(x, y, *arrays)`` of the markers now on this
-        rank: those that stayed and those that arrived, ordered by the rank they came
-        from. Call it again on the hierarchy :meth:`regrid` returns to move the markers
-        whose patch changed ranks.
+        ``migrate(x, *arrays, name=...)`` in 1D, ``migrate(x, y, *arrays,
+        name=...)`` in 2D: the positions of this rank's markers (1D arrays) and
+        any other per-marker data, with one row per marker (velocities as
+        ``v.T`` if they are stored ``(3, n)``). Each marker goes to
+        :meth:`owner` of field ``name``, with :func:`mpiarray.migrate`. Returns
+        the positions and ``arrays`` of the markers now on this rank, as given:
+        those that stayed and those that arrived, ordered by the rank they came
+        from. Call it again on the hierarchy :meth:`regrid` returns to move the
+        markers whose patch changed ranks.
 
         A marker outside the domain raises ``ValueError`` on every rank with
         ``outside="error"``, or is dropped with ``outside="drop"``. Collective.
@@ -918,17 +1023,19 @@ class AMRHierarchy:
 
         if outside not in ("error", "drop"):
             raise ValueError(f"outside must be 'error' or 'drop', got {outside!r}")
-        x, y, shape = self._points(x, y)
+        coordinates = points_and_arrays[: self.ndim]
+        arrays = points_and_arrays[self.ndim :]
+        flat, shape = self._points(coordinates)
         if len(shape) != 1:
-            raise ValueError("x and y must be one-dimensional")
+            raise ValueError("the positions must be one-dimensional")
         for array in arrays:
             if np.shape(array)[:1] != shape:
                 raise ValueError(
                     f"an array of shape {np.shape(array)} does not have one row per "
                     f"marker ({shape[0]})"
                 )
-        found, cell_i, cell_j, _ = self._cells(x, y)
-        destinations = self._owners(found, cell_i, cell_j, name)
+        found, cell, _ = self._cells(flat)
+        destinations = self._owners(found, cell, name)
         lost = destinations < 0
         total = int(self.comm.allreduce(int(lost.sum()), op=MPI.SUM))
         if total and outside == "error":
@@ -936,8 +1043,7 @@ class AMRHierarchy:
         keep = ~lost
         received = mpa.migrate(
             destinations[keep],
-            x[keep],
-            y[keep],
+            *(values[keep] for values in flat),
             *(np.asarray(array)[keep] for array in arrays),
             comm=self.comm,
         )
@@ -945,23 +1051,29 @@ class AMRHierarchy:
 
     @sp.profile("patchwork.deposit", tags=PROFILE_TAGS)
     def deposit(
-        self, x: Any, y: Any, charge: Any, name: str, *, reset: bool = True
+        self, *arguments: Any, name: str | None = None, reset: bool = True
     ) -> None:
         """Deposit the charge of markers on the node-centered field ``name``, patch by patch.
 
-        Each marker spreads its ``charge`` over the four corners of its cell, in the finest
-        patch that holds it, with bilinear (cloud-in-cell) weights: the same weights as
-        :meth:`CompositeNodes.deposit <patchwork.nodal.CompositeNodes.deposit>`, whose
-        transposed interpolation the field gather is. The values are charges, not a density.
-        The markers must be on the ranks that :meth:`owner` gives (use :meth:`migrate`),
-        so that the corners fall in the block or its halo, and the field needs a halo of
-        at least one node. The corners in the halo, and the nodes that several patches
-        share, are not yet where the composite mesh wants them: follow with
-        :meth:`accumulate_halos`. With ``reset`` the field is zeroed first, halos included.
-        Collective (the check of the owners).
+        ``deposit(x, charge, name)`` in 1D, ``deposit(x, y, charge, name)`` in
+        2D. Each marker spreads its ``charge`` over the corners of its cell (two
+        in 1D, four in 2D), in the finest patch that holds it, with linear or
+        bilinear (cloud-in-cell) weights: the same weights as
+        :meth:`CompositeNodes.deposit <patchwork.nodal.CompositeNodes.deposit>`,
+        whose transposed interpolation the field gather is. The values are
+        charges, not a density. The markers must be on the ranks that
+        :meth:`owner` gives (use :meth:`migrate`), so that the corners fall in
+        the block or its halo, and the field needs a halo of at least one node.
+        The corners in the halo, and the nodes that several patches share, are
+        not yet where the composite mesh wants them: follow with
+        :meth:`accumulate_halos`. With ``reset`` the field is zeroed first,
+        halos included. Collective (the check of the owners).
         """
+        import itertools
+
         import numpy as np
 
+        coordinates, (charge,), name = self._split(arguments, name, 1, "deposit")
         spec = self._field_specs.get(name)
         if spec is None:
             raise KeyError(f"hierarchy has no field {name!r}")
@@ -969,14 +1081,13 @@ class AMRHierarchy:
             raise ValueError("deposit is for node-centered fields")
         if spec["halo"] < 1:
             raise ValueError("deposit needs a halo of at least one node")
-        x, y, shape = self._points(x, y)
+        flat, _ = self._points(coordinates)
+        size = flat[0].size
         charge = np.asarray(charge, dtype=float).reshape(-1)
-        if charge.size != x.size:
-            raise ValueError(f"{x.size} points but {charge.size} charges")
-        found, cell_i, cell_j, (xw, yw) = self._cells(x, y)
-        wrong = (found >= 0) & (
-            self._owners(found, cell_i, cell_j, name) != self.comm.Get_rank()
-        )
+        if charge.size != size:
+            raise ValueError(f"{size} points but {charge.size} charges")
+        found, cell, wrapped = self._cells(flat)
+        wrong = (found >= 0) & (self._owners(found, cell, name) != self.comm.Get_rank())
         if self.comm.allreduce(int(wrong.sum()), op=MPI.SUM):
             raise ValueError(
                 "markers must be on the rank that owns them (see owner and migrate)"
@@ -989,25 +1100,32 @@ class AMRHierarchy:
             patch = patches[number]
             chosen = np.flatnonzero(found == number)
             array = patch.field(name)
-            (b0, _), (c0, _) = array.layout.index_bounds
-            h0, h1 = array.layout.halo
-            (i0, _), (j0, _) = patch.box
-            dx, dy = self.spacing(patch.level)
-            x0, y0 = self.lower_bound
-            ci, cj = cell_i[chosen], cell_j[chosen]
-            fx = (xw[chosen] - x0) / dx - ci
-            fy = (yw[chosen] - y0) / dy - cj
+            layout = array.layout
+            spacing = self.spacing(patch.level)
             storage = array.local_with_halos
-            a = ci - i0 - b0 + h0
-            b = cj - j0 - c0 + h1
-            columns = storage.shape[1]
-            flat, weights = [], []
-            for da, wa in ((0, 1.0 - fx), (1, fx)):
-                for db, wb in ((0, 1.0 - fy), (1, fy)):
-                    flat.append((a + da) * columns + (b + db))
-                    weights.append(wa * wb * charge[chosen])
+            # the lower corner in the storage, and the fraction of the cell, per axis
+            start, fraction = [], []
+            for axis in range(self.ndim):
+                c = cell[axis][chosen]
+                fraction.append(
+                    (wrapped[axis][chosen] - self.lower_bound[axis]) / spacing[axis] - c
+                )
+                start.append(
+                    c
+                    - patch.box[axis][0]
+                    - layout.index_bounds[axis][0]
+                    + layout.halo[axis]
+                )
+            flat_index, weights = [], []
+            for corner in itertools.product((0, 1), repeat=self.ndim):
+                weight = charge[chosen].copy()
+                for axis, upper in enumerate(corner):
+                    weight *= fraction[axis] if upper else 1.0 - fraction[axis]
+                at = tuple(s + d for s, d in zip(start, corner, strict=True))
+                flat_index.append(np.ravel_multi_index(at, storage.shape))
+                weights.append(weight)
             added = np.bincount(
-                np.concatenate(flat),
+                np.concatenate(flat_index),
                 weights=np.concatenate(weights),
                 minlength=storage.size,
             )

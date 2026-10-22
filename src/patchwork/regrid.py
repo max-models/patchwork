@@ -7,7 +7,7 @@ Three steps, each usable on its own:
    cell, :func:`function_tags` where a function of the position says so, or any
    boolean array of a level's shape.
 2. **Clustering** (:func:`cluster`, the Berger-Rigoutsos algorithm) covers the
-   tagged cells of a level with few rectangles, each at least ``efficiency``
+   tagged cells of a level with few boxes (intervals in 1D, rectangles in 2D), each at least ``efficiency``
    full of tagged cells and at most ``max_size`` cells long.
 3. :meth:`AMRHierarchy.regrid <patchwork.mesh.AMRHierarchy.regrid>` builds the
    new hierarchy from the boxes, level by level from the coarsest, and moves the
@@ -22,6 +22,7 @@ below.
 
 from __future__ import annotations
 
+import itertools
 from typing import TYPE_CHECKING, Any
 
 import mpiarray as mpa
@@ -44,31 +45,40 @@ if TYPE_CHECKING:
 
     from patchwork.mesh import AMRHierarchy, IndexBox
 
-Box = tuple[tuple[int, int], tuple[int, int]]
+Box = tuple[tuple[int, int], ...]
 
 # Tagging -------------------------------------------------------------------------------- #
 
 
-def function_tags(
-    hierarchy: AMRHierarchy, function: Callable[[Any, Any], Any], levels: int
-) -> dict[int, np.ndarray]:
-    """Tag the cells of levels ``0 .. levels - 1`` where ``function(x, y)`` is true.
+def _centres(hierarchy: AMRHierarchy, level: int) -> list[np.ndarray]:
+    """The cell centres of a whole level, one array of the level's shape per axis."""
+    axes = [
+        x0 + (np.arange(n) + 0.5) * h
+        for (x0, _), n, h in zip(
+            hierarchy.bounds,
+            hierarchy.level_shape(level),
+            hierarchy.spacing(level),
+            strict=True,
+        )
+    ]
+    return list(np.meshgrid(*axes, indexing="ij"))
 
-    ``function`` gets the coordinates of the cell centres of a whole level and
-    returns booleans; cells outside the domain are never tagged. The tags of
-    level ``k`` ask for patches on level ``k + 1``, so ``levels`` is the number
-    of refined levels wanted.
+
+def function_tags(
+    hierarchy: AMRHierarchy, function: Callable[..., Any], levels: int
+) -> dict[int, np.ndarray]:
+    """Tag the cells of levels ``0 .. levels - 1`` where ``function`` is true.
+
+    ``function(x)`` in 1D, ``function(x, y)`` in 2D, gets the coordinates of
+    the cell centres of a whole level and returns booleans; cells outside the
+    domain are never tagged. The tags of level ``k`` ask for patches on level
+    ``k + 1``, so ``levels`` is the number of refined levels wanted.
     """
     tags = {}
     for level in range(levels):
-        dx, dy = hierarchy.spacing(level)
-        (x0, _), (y0, _) = hierarchy.bounds
-        nx, ny = hierarchy.level_shape(level)
-        x = x0 + (np.arange(nx) + 0.5) * dx
-        y = y0 + (np.arange(ny) + 0.5) * dy
-        xx, yy = np.meshgrid(x, y, indexing="ij")
-        values = np.broadcast_to(np.asarray(function(xx, yy), dtype=bool), (nx, ny))
-        tags[level] = values & _domain_cells(hierarchy, level)
+        shape = hierarchy.level_shape(level)
+        values = np.asarray(function(*_centres(hierarchy, level)), dtype=bool)
+        tags[level] = np.broadcast_to(values, shape) & _domain_cells(hierarchy, level)
     return tags
 
 
@@ -79,8 +89,9 @@ def gradient_tags(
     """Tag the cells across which field ``name`` changes by more than ``threshold``.
 
     Cell-centered: a cell is tagged where its value differs by more than
-    ``threshold`` from one of its four neighbours. Node-centered: where the
-    values at its four corners span more than ``threshold``. The change is per
+    ``threshold`` from one of its neighbours (two in 1D, four in 2D).
+    Node-centered: where the values at its corners span more than
+    ``threshold``. The change is per
     cell of each level, so a finer level, with smaller cells, sees a smaller
     change: tagging stops once the cells resolve the field.
 
@@ -112,45 +123,52 @@ def gradient_tags(
                 patch.box, layout.index_bounds, layout.halo, strict=True
             )
         ]
-        i, j = np.meshgrid(*axes, indexing="ij")
+        index = np.meshgrid(*axes, indexing="ij")
         # the patch's own points only (its halo beyond them is not filled)
-        (x0, x1), (y0, y1) = points.own(patch)
-        valid = (i >= x0) & (i < x1) & (j >= y0) & (j < y1)
+        valid = np.ones(storage.shape, dtype=bool)
+        for values, (lo, hi) in zip(index, points.own(patch), strict=True):
+            valid &= (values >= lo) & (values < hi)
         if nodal:
-            corners = [
-                storage[a : a + storage.shape[0] - 1, b : b + storage.shape[1] - 1]
-                for a in (0, 1)
-                for b in (0, 1)
-            ]
+            ndim = storage.ndim
+            shifts = list(itertools.product((0, 1), repeat=ndim))
+
+            def corner(array: np.ndarray, shift: tuple[int, ...]) -> np.ndarray:
+                return array[
+                    tuple(
+                        slice(s, s + n - 1)
+                        for s, n in zip(shift, array.shape, strict=True)
+                    )
+                ]
+
+            corners = [corner(storage, shift) for shift in shifts]
             ok = np.ones(corners[0].shape, dtype=bool)
-            for a in (0, 1):
-                for b in (0, 1):
-                    ok &= valid[a : a + valid.shape[0] - 1, b : b + valid.shape[1] - 1]
+            for shift in shifts:
+                ok &= corner(valid, shift)
             change = np.where(
                 ok, np.max(corners, axis=0) - np.min(corners, axis=0), 0.0
             )
-            ci, cj = i[:-1, :-1], j[:-1, :-1]
+            cells = [corner(values, (0,) * ndim) for values in index]
         else:
             change = np.zeros(storage.shape)
-            for axis in (0, 1):
+            for axis in range(storage.ndim):
                 for step in (1, -1):
                     neighbour = np.roll(storage, -step, axis=axis)
                     both = valid & np.roll(valid, -step, axis=axis)
                     # np.roll wraps around the storage: not a neighbour
-                    edge = [slice(None), slice(None)]
+                    edge = [slice(None)] * storage.ndim
                     edge[axis] = slice(-1, None) if step == 1 else slice(0, 1)
                     both[tuple(edge)] = False
                     change = np.maximum(
                         change, np.where(both, np.abs(storage - neighbour), 0.0)
                     )
-            ci, cj = i, j
-        (x0, x1), (y0, y1) = patch.box
-        (b0, b1), (c0, c1) = layout.index_bounds
+            cells = index
         # the patch's own cells in this rank's block
-        own = (ci >= x0 + b0) & (ci < x0 + b1) & (cj >= y0 + c0) & (cj < y0 + c1)
-        own &= (ci < x1) & (cj < y1)
-        hit = own & (change > threshold)
-        tags[patch.level][ci[hit], cj[hit]] = True
+        own = change > threshold
+        for values, (x0, x1), (b0, b1) in zip(
+            cells, patch.box, layout.index_bounds, strict=True
+        ):
+            own &= (values >= x0 + b0) & (values < x0 + b1) & (values < x1)
+        tags[patch.level][tuple(values[own] for values in cells)] = True
     return tags
 
 
@@ -159,19 +177,24 @@ def _domain_cells(hierarchy: AMRHierarchy, level: int) -> np.ndarray:
     scale = hierarchy.refinement_ratio**level
     cells = np.zeros(hierarchy.level_shape(level), dtype=bool)
     for patch in hierarchy.patches_at_level(0):
-        (i0, i1), (j0, j1) = patch.box
-        cells[i0 * scale : i1 * scale, j0 * scale : j1 * scale] = True
+        cells[tuple(slice(lo * scale, hi * scale) for lo, hi in patch.box)] = True
     return cells
 
 
+def _coarsen(mask: np.ndarray, ratio: int) -> np.ndarray:
+    """Which coarse cells hold a true fine cell: ``mask`` over blocks of ``ratio``."""
+    blocks = [part for n in mask.shape for part in (n // ratio, ratio)]
+    return np.asarray(mask.reshape(blocks).any(axis=tuple(range(1, 2 * mask.ndim, 2))))
+
+
 def _grow(
-    mask: np.ndarray, width: int, periodic: tuple[bool, bool], outside: bool
+    mask: np.ndarray, width: int, periodic: tuple[bool, ...], outside: bool
 ) -> np.ndarray:
     """Dilate a mask by ``width`` cells (``outside``: the value beyond non-periodic edges)."""
     result = mask.copy()
     if width <= 0:
         return result
-    for axis in (0, 1):
+    for axis in range(mask.ndim):
         grown = result.copy()
         for step in range(1, width + 1):
             for sign in (1, -1):
@@ -179,8 +202,8 @@ def _grow(
                     grown |= np.roll(result, sign * step, axis=axis)
                     continue
                 shifted = np.full(result.shape, outside, dtype=bool)
-                source = [slice(None), slice(None)]
-                target = [slice(None), slice(None)]
+                source = [slice(None)] * mask.ndim
+                target = [slice(None)] * mask.ndim
                 n = result.shape[axis]
                 if step >= n:
                     grown |= shifted if outside else False
@@ -195,7 +218,7 @@ def _grow(
     return result
 
 
-def _shrink(mask: np.ndarray, width: int, periodic: tuple[bool, bool]) -> np.ndarray:
+def _shrink(mask: np.ndarray, width: int, periodic: tuple[bool, ...]) -> np.ndarray:
     """Erode a mask by ``width`` cells; beyond non-periodic edges counts as inside."""
     return ~_grow(~mask, width, periodic, outside=False)
 
@@ -215,12 +238,13 @@ def cluster(
     A box is kept when at least ``efficiency`` of its cells are tagged, it
     holds no cell that ``allowed`` forbids, and it is at most ``max_size`` cells
     long on each axis. Otherwise it is cut: at a gap in the tagged cells (a
-    row or column without tags), else where the number of tagged cells per row
-    or column bends most (a zero crossing of its second difference), else in
-    the middle of its longest side. Each part shrinks to the tagged cells in it.
+    row or column without tags; a cell in 1D), else where the number of tagged
+    cells per row or column bends most (a zero crossing of its second
+    difference), else in the middle of its longest side. Each part shrinks to
+    the tagged cells in it. In 1D the boxes are intervals.
 
     Args:
-        tags: Booleans, one per cell.
+        tags: Booleans, one per cell: a 1D or 2D array.
         efficiency: The smallest fraction of tagged cells in a box, in (0, 1].
         max_size: The longest side of a box, in cells; default: no limit.
         allowed: Booleans of the shape of ``tags``: where boxes may go.
@@ -232,12 +256,12 @@ def cluster(
             allowed region is narrower).
 
     Returns:
-        Half-open boxes ``((i0, i1), (j0, j1))`` that do not overlap and cover
-        every allowed tagged cell.
+        Half-open boxes ``((i0, i1),)`` or ``((i0, i1), (j0, j1))`` that do not
+        overlap and cover every allowed tagged cell.
     """
     tags = np.asarray(tags, dtype=bool)
-    if tags.ndim != 2:
-        raise ValueError("tags must be a 2D array")
+    if tags.ndim not in (1, 2):
+        raise ValueError("tags must be a 1D or 2D array")
     if not 0.0 < efficiency <= 1.0:
         raise ValueError(f"efficiency must be in (0, 1], got {efficiency}")
     if max_size is not None and max_size < 1:
@@ -252,14 +276,14 @@ def cluster(
             raise ValueError("allowed must have the shape of tags")
         tags = tags & allowed
     boxes: list[IndexBox] = []
-    pending = [((0, tags.shape[0]), (0, tags.shape[1]))]
+    pending: list[Box] = [tuple((0, n) for n in tags.shape)]
     while pending:
         box = _shrink_to_tags(tags, pending.pop())
         if box is None:
             continue
-        (i0, i1), (j0, j1) = box
-        inside = tags[i0:i1, j0:j1]
-        fits = allowed is None or bool(allowed[i0:i1, j0:j1].all())
+        where = tuple(slice(lo, hi) for lo, hi in box)
+        inside = tags[where]
+        fits = allowed is None or bool(allowed[where].all())
         if inside.mean() >= efficiency and fits:
             boxes.extend(_chop(box, max_size))
             continue
@@ -282,23 +306,23 @@ def _widen(
 ) -> list[IndexBox]:
     """Widen the boxes shorter than ``min_size`` into free, allowed cells."""
     taken = np.zeros(shape, dtype=bool)
-    for (i0, i1), (j0, j1) in boxes:
-        taken[i0:i1, j0:j1] = True
+    for box in boxes:
+        taken[tuple(slice(lo, hi) for lo, hi in box)] = True
     result = []
     for box in boxes:
         lows = [lo for lo, _ in box]
         highs = [hi for _, hi in box]
-        for axis in (0, 1):
-            other = 1 - axis
+        for axis in range(len(shape)):
             while highs[axis] - lows[axis] < min_size:
                 grew = False
                 for side in (-1, 1):  # the lower side first, then the upper one
                     cell = lows[axis] - 1 if side < 0 else highs[axis]
                     if not 0 <= cell < shape[axis]:
                         continue
-                    index: list[Any] = [slice(None), slice(None)]
+                    index: list[Any] = [
+                        slice(lo, hi) for lo, hi in zip(lows, highs, strict=True)
+                    ]
                     index[axis] = cell
-                    index[other] = slice(lows[other], highs[other])
                     strip = tuple(index)
                     if taken[strip].any() or (
                         allowed is not None and not allowed[strip].all()
@@ -313,26 +337,30 @@ def _widen(
                     break
                 if not grew:
                     break
-        result.append(((lows[0], highs[0]), (lows[1], highs[1])))
+        result.append(tuple(zip(lows, highs, strict=True)))
     return result
 
 
+def _others(ndim: int, axis: int) -> tuple[int, ...]:
+    return tuple(other for other in range(ndim) if other != axis)
+
+
 def _shrink_to_tags(tags: np.ndarray, box: Box) -> Box | None:
-    (i0, i1), (j0, j1) = box
-    inside = tags[i0:i1, j0:j1]
-    rows = np.flatnonzero(inside.any(axis=1))
-    if not rows.size:
-        return None
-    columns = np.flatnonzero(inside.any(axis=0))
-    return (
-        (i0 + int(rows[0]), i0 + int(rows[-1]) + 1),
-        (j0 + int(columns[0]), j0 + int(columns[-1]) + 1),
-    )
+    inside = tags[tuple(slice(lo, hi) for lo, hi in box)]
+    result = []
+    for axis, (lo, _) in enumerate(box):
+        hit = np.flatnonzero(inside.any(axis=_others(inside.ndim, axis)))
+        if not hit.size:
+            return None
+        result.append((lo + int(hit[0]), lo + int(hit[-1]) + 1))
+    return tuple(result)
 
 
 def _cut(inside: np.ndarray) -> tuple[int, int]:
     """Where to cut a box: ``(axis, offset)`` with ``0 < offset < extent``."""
-    signatures = [inside.sum(axis=1), inside.sum(axis=0)]
+    signatures = [
+        inside.sum(axis=_others(inside.ndim, axis)) for axis in range(inside.ndim)
+    ]
     # 1. a row or column without tags, nearest the middle
     best = None
     for axis, signature in enumerate(signatures):
@@ -360,7 +388,7 @@ def _cut(inside: np.ndarray) -> tuple[int, int]:
     if best is not None:
         return best[1], best[2]
     # 3. the middle of the longest side
-    axis = 0 if inside.shape[0] >= inside.shape[1] else 1
+    axis = int(np.argmax(inside.shape))
     return axis, inside.shape[axis] // 2
 
 
@@ -373,7 +401,7 @@ def _chop(box: Box, max_size: int | None) -> list[Box]:
         parts = -(-(hi - lo) // max_size)
         edges = [lo + (hi - lo) * k // parts for k in range(parts + 1)]
         ranges.append(list(zip(edges[:-1], edges[1:], strict=True)))
-    return [(a, b) for a in ranges[0] for b in ranges[1]]
+    return [tuple(parts) for parts in itertools.product(*ranges)]
 
 
 # The new hierarchy ---------------------------------------------------------------------- #
@@ -408,12 +436,7 @@ def _forbidden_cells(
         return None
     shape = hierarchy.level_shape(level)
     if callable(forbid):
-        dx, dy = hierarchy.spacing(level)
-        (x0, _), (y0, _) = hierarchy.bounds
-        x = x0 + (np.arange(shape[0]) + 0.5) * dx
-        y = y0 + (np.arange(shape[1]) + 0.5) * dy
-        xx, yy = np.meshgrid(x, y, indexing="ij")
-        values = np.asarray(forbid(xx, yy), dtype=bool)
+        values = np.asarray(forbid(*_centres(hierarchy, level)), dtype=bool)
         return np.ascontiguousarray(np.broadcast_to(values, shape))
     if level not in forbid:
         return None
@@ -463,10 +486,7 @@ def new_boxes(
         if level + 1 in grown:
             # the next level's cells, with the margin of their own nesting
             finer = _grow(grown[level + 1], nesting, periodic, outside=False)
-            n, m = finer.shape
-            level_tags |= finer.reshape(n // ratio, ratio, m // ratio, ratio).any(
-                axis=(1, 3)
-            )
+            level_tags |= _coarsen(finer, ratio)
         grown[level] = _grow(level_tags, buffer, periodic, outside=False) & domain
     boxes: dict[int, list[IndexBox]] = {}
     covered = _domain_cells(hierarchy, 0)
@@ -477,20 +497,16 @@ def new_boxes(
         # a cell of this level may be refined only if none of its fine cells is forbidden
         forbidden = _forbidden_cells(hierarchy, forbid, level + 1)
         if forbidden is not None:
-            n, m = forbidden.shape
-            allowed &= ~forbidden.reshape(n // ratio, ratio, m // ratio, ratio).any(
-                axis=(1, 3)
-            )
+            allowed &= ~_coarsen(forbidden, ratio)
         max_size = None if max_patch_size is None else max_patch_size // ratio
         min_size = -(-min_patch_size // ratio)
         coarse = cluster(grown[level], efficiency, max_size, allowed, min_size)
         boxes[level + 1] = [
-            ((i0 * ratio, i1 * ratio), (j0 * ratio, j1 * ratio))
-            for (i0, i1), (j0, j1) in coarse
+            tuple((lo * ratio, hi * ratio) for lo, hi in box) for box in coarse
         ]
         covered = np.zeros(hierarchy.level_shape(level + 1), dtype=bool)
-        for (i0, i1), (j0, j1) in boxes[level + 1]:
-            covered[i0:i1, j0:j1] = True
+        for box in boxes[level + 1]:
+            covered[tuple(slice(lo, hi) for lo, hi in box)] = True
         if not boxes[level + 1]:
             del boxes[level + 1]
             break
@@ -546,7 +562,10 @@ def transfer(old: AMRHierarchy, new: AMRHierarchy, name: str) -> None:
                     covered[tuple(slice(s, e) for s, e in target)] = True
             if level == 0:
                 continue
-            i, j = np.nonzero(~covered)
+            index = tuple(
+                values + o
+                for values, o in zip(np.nonzero(~covered), origin, strict=True)
+            )
             fill = conservative_from_below if conservative else interpolate_from_below
             interpolation = fill(
                 new,
@@ -554,8 +573,7 @@ def transfer(old: AMRHierarchy, new: AMRHierarchy, name: str) -> None:
                 patch,
                 new_field,
                 new_field(patch),
-                i + origin[0],
-                j + origin[1],
+                index,
                 spec["dtype"],
                 copies,
             )

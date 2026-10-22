@@ -1,6 +1,6 @@
 ---
 title: patchwork
-description: 2D block-structured adaptive meshes with mpiarray-backed patch fields.
+description: 1D and 2D block-structured adaptive meshes with mpiarray-backed patch fields.
 template: splash
 hero:
   tagline: Nested rectangular patches, serial arrays or optional MPI-backed arrays, and clear plots of the grid at every level.
@@ -20,7 +20,7 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 <CardGrid>
 	<Card title="Nested patches" icon="open-book">
-		Build aligned 2D refinement levels from rectangular, half-open cell boxes.
+		Build aligned 1D or 2D refinement levels from half-open cell boxes.
 	</Card>
 	<Card title="mpiarray fields" icon="rocket">
 		Allocate cell-centered patch fields with halo storage. The same API works in serial without MPI.

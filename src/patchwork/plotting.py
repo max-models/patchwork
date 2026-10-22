@@ -27,6 +27,11 @@ def plot_patches(
     and faint, more so on the base level, which suits a large figure. A small
     one, e.g. an animation's frames, may need stronger lines.
 
+    A 1D hierarchy is drawn as a line plot: without ``field`` one bar per patch
+    at the height of its level (with its cell edges if ``show_grid``); with
+    ``field`` the values of every patch against ``x``, the finer patches on top
+    and shaded over their extent.
+
     When ``field`` is provided, each patch field is gathered collectively and
     plotted on ``root`` only. Call this function on every rank in the patch
     communicator. Layout-only plots are also returned on ``root`` only.
@@ -54,11 +59,15 @@ def plot_patches(
         return None
 
     if ax is None:
-        fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+        size = (8, 6) if hierarchy.ndim == 2 else (8, 3.5)
+        fig, ax = plt.subplots(figsize=size, constrained_layout=True)
     else:
         fig = ax.figure
 
     palette = plt.get_cmap("tab10")
+    if hierarchy.ndim == 1:
+        _plot_line(hierarchy, ax, field, gathered, show_grid, palette, grid_alpha)
+        return fig, ax
     mappable = None
     # the colour scale shared by all patches; set when a field is drawn
     limits = (0.0, 1.0)
@@ -155,3 +164,66 @@ def plot_patches(
         "Patchwork AMR hierarchy" if field is None else f"Patchwork field: {field}"
     )
     return fig, ax
+
+
+def _plot_line(
+    hierarchy: AMRHierarchy,
+    ax: Any,
+    field: str | None,
+    gathered: dict[int, Any],
+    show_grid: bool,
+    palette: Any,
+    grid_alpha: float | None,
+) -> None:
+    """:func:`plot_patches` of a 1D hierarchy."""
+    import numpy as np
+    from matplotlib.lines import Line2D
+
+    nodal = field is not None and hierarchy.centering(field) == "node"
+    for patch in hierarchy:
+        ((x0, x1),) = patch.physical_bounds(hierarchy)
+        color = palette(patch.level % 10)
+        (edges,) = patch.node_coordinates(hierarchy)
+        if field is None:
+            ax.plot([x0, x1], [patch.level, patch.level], color=color, lw=6.0)
+            if show_grid:
+                alpha = 0.8 if grid_alpha is None else grid_alpha
+                ax.vlines(
+                    edges,
+                    patch.level - 0.2,
+                    patch.level + 0.2,
+                    colors=[color],
+                    alpha=alpha,
+                    linewidth=0.8,
+                )
+            continue
+        values = np.asarray(gathered[id(patch)])
+        x = edges if nodal else 0.5 * (edges[:-1] + edges[1:])
+        if patch.level:
+            ax.axvspan(x0, x1, color=color, alpha=0.08, lw=0)
+        ax.plot(
+            x,
+            values,
+            color=color,
+            marker="." if show_grid else None,
+            lw=1.5,
+            zorder=2 * patch.level + 2,
+        )
+    ((xmin, xmax),) = hierarchy.bounds
+    ax.set_xlim(xmin, xmax)
+    ax.set_xlabel("x")
+    if field is None:
+        ax.set_ylabel("level")
+        ax.set_yticks(range(hierarchy.max_level + 1))
+        ax.set_ylim(-0.5, hierarchy.max_level + 0.5)
+    else:
+        ax.set_ylabel(field)
+    handles = [
+        Line2D([0], [0], color=palette(level % 10), lw=2, label=f"level {level}")
+        for level in range(hierarchy.max_level + 1)
+        if hierarchy.patches_at_level(level)
+    ]
+    ax.legend(handles=handles, loc="upper right", framealpha=0.9)
+    ax.set_title(
+        "Patchwork AMR hierarchy" if field is None else f"Patchwork field: {field}"
+    )

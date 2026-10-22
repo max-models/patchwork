@@ -76,8 +76,13 @@ def solve_poisson(
 
     The solution is written to a field named by ``potential`` on every patch.
     Covered coarse cells are filled by volume averaging their fine children.
-    All ranks must call this function in the same order.
+    All ranks must call this function in the same order. 2D only: in 1D (and
+    for more than this) use :class:`~patchwork.cells.CellOperator`.
     """
+    if hierarchy.ndim != 2:
+        raise NotImplementedError(
+            "solve_poisson is 2D only; use CellOperator for a 1D hierarchy"
+        )
     if rhs not in hierarchy.field_names:
         raise KeyError(f"hierarchy has no right-hand-side field {rhs!r}")
     if potential not in hierarchy.field_names:
