@@ -7,6 +7,22 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `CellOperator`, a cell-centered composite solve of `-div(a grad u) + c u = f`: variable
+  diffusion (harmonic face mean, or arithmetic), real or complex reaction, `Dirichlet` and
+  `Neumann` faces, periodic axes, embedded bodies (`EmbeddedDirichlet`, the surface located
+  along the line of the centres), one factorization for many solves, `set_reaction` (new `c`
+  without assembling) and `set_conditions`. Coarse-fine faces interpolate the coarse value
+  quadratically along the face; `coarse_fine="symmetric"` (default) keeps the operator
+  symmetric (complex symmetric for a complex `c`), second order in L2 and first order next to
+  coarse-fine edges; `"conservative"` takes one face flux from a quadratic ghost value,
+  second order everywhere and conservative face by face, not symmetric.
+- `CompositeCells`: the leaf cells of a hierarchy, their faces (from a finest-lattice owner
+  table) and the maps to and from the patches.
+- `AMRHierarchy(geometry="cylindrical")`: the axisymmetric r–z plane, `cell_volumes`,
+  `cylindrical`, `on_axis`; `integral`, `restrict` and the conservative interpolation of
+  `regrid` weight cells by their ring volumes. `CellOperator(component="azimuthal")`: the
+  curl-curl of an azimuthal component, `A_phi = 0` on the axis through the half cell next to
+  it, a uniform axial field a null field across coarse-fine faces too.
 - Node-centered fields: `allocate_field(name, centering="node")`, `Patch.node_shape`,
   `Patch.node_coordinates`.
 - `AMRHierarchy(periodic=...)`: axes on which the last cell neighbours the first.

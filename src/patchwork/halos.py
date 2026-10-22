@@ -318,8 +318,10 @@ def conservative_from_below(
     cell's centre. The slope is the monotonized central difference of the two
     coarse neighbours, and zero where one of them is missing (at a wall, or
     at the edge of the level below). So the fine cells of a coarse cell
-    average to its value, no new extrema appear (a positive density stays
-    positive), and a linear field is reproduced away from walls.
+    average to its value (weighted by their volumes in r–z, where the radial
+    offsets are measured from the cell's volume-weighted centre), no new
+    extrema appear (a positive density stays positive), and a linear field is
+    reproduced away from walls.
     Arguments and result as for :func:`interpolate_from_below`.
     """
     if not i.size:
@@ -329,6 +331,14 @@ def conservative_from_below(
     offsets = np.stack(
         [((i % ratio) + 0.5) / ratio - 0.5, ((j % ratio) + 0.5) / ratio - 0.5], axis=1
     )
+    if hierarchy.cylindrical:
+        # In r–z the fine cells weigh with their radius: measure the radial
+        # offsets from the volume-weighted centre of the coarse cell, so that the
+        # volume-weighted mean of the fine cells is the coarse value.
+        spacing = hierarchy.spacing(patch.level - 1)[0]
+        radius = hierarchy.bounds[0][0] + (parent_i + 0.5) * spacing
+        squares = np.sum((((np.arange(ratio) + 0.5) / ratio) - 0.5) ** 2)
+        offsets[:, 0] -= spacing * squares / (ratio * radius)
     buffer_box = (
         (int(parent_i.min()) - 1, int(parent_i.max()) + 2),
         (int(parent_j.min()) - 1, int(parent_j.max()) + 2),
@@ -462,7 +472,8 @@ class HaloExchange:
 class Restriction:
     """Give the coarse points under finer patches the fine values of field ``name``.
 
-    Cell-centered: the mean of the fine cells of each coarse cell.
+    Cell-centered: the mean of the fine cells of each coarse cell, weighted by
+    their volumes in r–z (where they grow with the radius).
     Node-centered: the fine node at each coarse node. Only the points of each
     rank's block are written; the halos follow with :class:`HaloExchange`.
     Collective over the hierarchy's communicator, as is :meth:`execute`.
@@ -477,6 +488,7 @@ class Restriction:
         self._name = name
         self._nodal = nodal
         self._ratio = ratio
+        self._hierarchy = hierarchy
         # one plan per level, finest first: a level gets its finer values
         # before it gives them to the one below
         self._steps: list[tuple[Any, list[tuple]]] = []
@@ -531,7 +543,9 @@ class Restriction:
                 )
                 if coarse.is_local:
                     target = _shift(part, tuple(-lo for lo, _ in coarse.box))
-                    writes.append((coarse.field(name), target, buffer))
+                    # the fine level and first fine index weight the r–z mean
+                    rows = (fine.level, region[0][0])
+                    writes.append((coarse.field(name), target, buffer, rows))
 
     def execute(self) -> None:
         """Restrict. Collective over the hierarchy's communicator."""
@@ -541,13 +555,21 @@ class Restriction:
 
     def _write(self, writes: list[tuple]) -> None:
         r = self._ratio
-        for array, target, buffer in writes:
+        hierarchy = self._hierarchy
+        for array, target, buffer, (level, first) in writes:
             fine = np.asarray(buffer.local_with_halos)
             if self._nodal:
                 coarse = fine[::r, ::r]
             else:
                 n, m = fine.shape[0] // r, fine.shape[1] // r
-                coarse = fine.reshape(n, r, m, r).mean(axis=(1, 3))
+                if hierarchy.cylindrical:
+                    weight = hierarchy.cell_volumes(level, first + np.arange(n * r))
+                    weighted = (fine * weight[:, None]).reshape(n, r, m, r)
+                    # each coarse cell: r x r fine cells, r of each radial weight
+                    total = r * weight.reshape(n, r).sum(axis=1)
+                    coarse = weighted.sum(axis=(1, 3)) / total[:, None]
+                else:
+                    coarse = fine.reshape(n, r, m, r).mean(axis=(1, 3))
             # this rank's block only: the halo is the exchange's
             layout = array.layout
             blocked = tuple(

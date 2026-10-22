@@ -19,6 +19,10 @@ if TYPE_CHECKING:
 IndexBox = tuple[tuple[int, int], tuple[int, int]]
 PhysicalBounds = tuple[tuple[float, float], tuple[float, float]]
 
+#: The geometries of a hierarchy: a Cartesian plane ``(x, y)``, or the
+#: axisymmetric ``(r, z)`` plane of a body of revolution (``"cylindrical"``).
+GEOMETRIES = ("cartesian", "cylindrical")
+
 
 def _box(value: Sequence[Sequence[int]]) -> IndexBox:
     """Normalize and validate a 2D half-open integer box."""
@@ -228,6 +232,14 @@ class AMRHierarchy:
     the union of those boxes of base cells: an L, a T, a rectangle with a notch.
     The boxes are the patches of level zero. Where the domain does not fill
     the rectangle, its edge is a boundary like the rectangle's own faces.
+
+    ``geometry`` is ``"cartesian"``, a plane ``(x, y)``, or ``"cylindrical"``,
+    the axisymmetric plane ``(r, z)`` of a body of revolution: the first axis
+    is the radius (``bounds[0][0] >= 0``, not periodic), and a cell is a ring
+    of volume ``2 pi r dr dz`` (:meth:`cell_volumes`). :meth:`integral`,
+    :meth:`restrict` and the conservative interpolation of :meth:`regrid` then
+    weight cells by their volumes. Fields are per unit length along ``z`` in
+    the Cartesian plane and totals over the ring in r–z.
     """
 
     def __init__(
@@ -242,6 +254,7 @@ class AMRHierarchy:
         max_cells_per_rank: int | None = None,
         base_ranks: Sequence[int | Sequence[int] | None] | None = None,
         comm: Any = None,
+        geometry: str = "cartesian",
     ) -> None:
         """Create the base level: ``base_shape`` cells over the physical ``bounds``.
 
@@ -264,6 +277,16 @@ class AMRHierarchy:
         if len(periodic) != 2:
             raise ValueError("periodic must have one flag per axis")
         self.periodic = (bool(periodic[0]), bool(periodic[1]))
+        if geometry not in GEOMETRIES:
+            raise ValueError(f"geometry must be one of {GEOMETRIES}, got {geometry!r}")
+        if geometry == "cylindrical":
+            if self.bounds[0][0] < 0.0:
+                raise ValueError("a cylindrical domain needs a radius r >= 0")
+            if self.periodic[0]:
+                raise ValueError(
+                    "the radius of a cylindrical domain cannot be periodic"
+                )
+        self.geometry = geometry
         self.comm = mpa.default_comm() if comm is None else comm
         if not callable(placement) and placement not in ("all", "balanced"):
             raise ValueError(
@@ -334,6 +357,32 @@ class AMRHierarchy:
             (hi - lo) / (n * scale)
             for (lo, hi), n in zip(self.bounds, self.base_shape, strict=True)
         )  # type: ignore[return-value]
+
+    @property
+    def cylindrical(self) -> bool:
+        """Whether the hierarchy is the axisymmetric r–z plane."""
+        return self.geometry == "cylindrical"
+
+    @property
+    def on_axis(self) -> bool:
+        """Whether a cylindrical domain reaches the axis (its radius starts at 0)."""
+        return self.cylindrical and self.bounds[0][0] == 0.0
+
+    def cell_volumes(self, level: int, i: Any) -> Any:
+        """Volumes of the cells of ``level`` with first index ``i`` (an array).
+
+        ``dx * dy`` in the Cartesian plane; ``2 pi r dr dz`` in r–z, with ``r``
+        the cell's mid-radius (the exact volume of the ring). The volume does
+        not depend on the second index.
+        """
+        import numpy as np
+
+        dx, dy = self.spacing(level)
+        i = np.asarray(i, dtype=float)
+        if not self.cylindrical:
+            return np.full(i.shape, dx * dy)
+        radius = self.bounds[0][0] + (i + 0.5) * dx
+        return 2.0 * np.pi * radius * dx * dy
 
     def level_shape(self, level: int) -> tuple[int, int]:
         """Number of cells in the full domain at a refinement level."""
@@ -657,6 +706,7 @@ class AMRHierarchy:
             placement=self.placement if placement is None else placement,
             max_cells_per_rank=self.max_cells_per_rank,
             comm=self.comm,
+            geometry=self.geometry,
         )
         for level in sorted(boxes):
             for box in sorted(boxes[level], key=lambda b: -_shared_cells(b, b)):
@@ -674,13 +724,18 @@ class AMRHierarchy:
     def integral(self, name: str) -> float:
         """The integral of field ``name`` over the domain, from the finest values.
 
-        Cell-centered: the sum of value times area over the cells that no finer
-        patch covers. Node-centered: the trapezoidal rule over those cells.
+        Cell-centered: the sum of value times area (in r–z: times volume,
+        :meth:`cell_volumes`) over the cells that no finer patch covers.
+        Node-centered: the trapezoidal rule over those cells (Cartesian only).
         Collective over ``comm``; the same value on every rank.
         """
         import numpy as np
 
         if self.centering(name) == "node":
+            if self.cylindrical:
+                raise NotImplementedError(
+                    "the integral of a node-centered field in r–z is not implemented"
+                )
             from patchwork.nodal import CompositeNodes
 
             nodes = CompositeNodes(self)
@@ -704,8 +759,9 @@ class AMRHierarchy:
                         lo[0] - block[0][0] : hi[0] - block[0][0],
                         lo[1] - block[1][0] : hi[1] - block[1][0],
                     ] = False
-            dx, dy = self.spacing(patch.level)
-            total += float(np.asarray(array.local)[leaf].sum()) * dx * dy
+            volumes = self.cell_volumes(patch.level, np.arange(i0 + b0, i0 + b1))
+            weighted = np.asarray(array.local) * volumes[:, None]
+            total += float(weighted[leaf].sum())
         return float(self.comm.allreduce(total, op=MPI.SUM))
 
     def _locator(self, level: int) -> tuple[tuple[int, int], Any]:
