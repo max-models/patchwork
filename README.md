@@ -22,7 +22,7 @@ from its neighbours and the level below, wherever they are. Matplotlib
 plots make the level layout and each patch’s cell grid visible.
 
 It provides hierarchy construction, patch validation, mpiarray-backed
-field storage, plotting, and two composite Poisson solves:
+field storage, plotting, and composite linear solves:
 
 - `solve_poisson`: cell-centered finite volumes with one constant
   Dirichlet value on the domain boundary;
@@ -30,6 +30,17 @@ field storage, plotting, and two composite Poisson solves:
   mesh is uniform, with Dirichlet and Neumann faces, periodic axes and
   embedded bodies at fixed potentials. It is factorized once and solved
   many times, which is what a particle-in-cell code needs.
+- `CellOperator`: cell-centered, `-div(a grad u) + c u = f` with a
+  variable diffusion coefficient and a real or complex reaction (a skin
+  layer, an inductive field), the same faces, periodic axes and bodies,
+  quadratic interpolation along coarse-fine faces (symmetric, or
+  conservative face by face), factorized once.
+
+A hierarchy can also be the axisymmetric r–z plane
+(`AMRHierarchy(geometry="cylindrical")`): cells are rings, `integral`,
+`restrict` and conservative regridding weight them by their volumes, and
+`CellOperator` takes the curl-curl of an azimuthal component
+(`component="azimuthal"`), the operator of a magnetoquasistatic field.
 
 `regrid` places the patches itself: tag the cells that need finer cells
 (by a field’s change across a cell, a function of the position, or by

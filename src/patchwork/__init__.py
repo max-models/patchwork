@@ -3,6 +3,7 @@
 import scope_profiler as sp
 
 from patchwork._profiling import PROFILE_TAGS
+from patchwork.cells import CellOperator, CompositeCells
 from patchwork.mesh import AMRHierarchy, IndexBox, Patch
 from patchwork.nodal import (
     CompositeNodes,
@@ -23,6 +24,8 @@ __version__ = "0.1.0"
 
 __all__ = [
     "AMRHierarchy",
+    "CellOperator",
+    "CompositeCells",
     "CompositeNodes",
     "Dirichlet",
     "EmbeddedDirichlet",
