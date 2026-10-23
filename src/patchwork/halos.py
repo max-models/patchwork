@@ -6,8 +6,8 @@ the rest of the hierarchy:
 
 1. from the patches of the same level that the halo overlaps, across periodic
    faces too (a patch along a whole periodic axis from itself);
-2. where no patch of the same level is there, by bilinear interpolation of the
-   level below;
+2. where no patch of the same level is there, by linear (1D) or bilinear (2D)
+   interpolation of the level below;
 3. between the ranks inside each patch, with mpiarray's own ``update_halos``.
 
 Halo points outside the domain are left as they are: they belong to the
@@ -46,15 +46,25 @@ def _shift(box: Box, by: tuple[int, ...]) -> Box:
 
 
 def _frame(own: Box, width: int) -> list[Box]:
-    """The halo around ``own``: four boxes, the corners in the first two."""
-    (x0, x1), (y0, y1) = own
-    w = width
-    return [
-        ((x0 - w, x0), (y0 - w, y1 + w)),
-        ((x1, x1 + w), (y0 - w, y1 + w)),
-        ((x0, x1), (y0 - w, y0)),
-        ((x0, x1), (y1, y1 + w)),
-    ]
+    """The halo around ``own``: two boxes per axis, two in 1D and four in 2D.
+
+    The two boxes of an axis span the halo along the axes before it and only
+    ``own`` along the axes after it, so the corners are in those of the last.
+    """
+    boxes = []
+    for axis, (lo, hi) in enumerate(own):
+        for part in ((lo - width, lo), (hi, hi + width)):
+            boxes.append(
+                tuple(
+                    part
+                    if other == axis
+                    else (o0 - width, o1 + width)
+                    if other < axis
+                    else (o0, o1)
+                    for other, (o0, o1) in enumerate(own)
+                )
+            )
+    return boxes
 
 
 class _Points:
@@ -87,31 +97,37 @@ class _Points:
             scale = self.ratio**level
             cells = np.zeros(self.hierarchy.level_shape(level), dtype=bool)
             for patch in self.hierarchy.patches_at_level(0):
-                (i0, i1), (j0, j1) = patch.box
-                cells[i0 * scale : i1 * scale, j0 * scale : j1 * scale] = True
+                cells[tuple(slice(lo * scale, hi * scale) for lo, hi in patch.box)] = (
+                    True
+                )
             self._domains[level] = cells
         return self._domains[level]
 
-    def in_domain(self, level: int, i: np.ndarray, j: np.ndarray) -> np.ndarray:
+    def in_domain(self, level: int, *index: np.ndarray) -> np.ndarray:
         """Whether points (level indices, possibly beyond the domain) are in it.
 
-        A cell is if it is a cell of the domain; a node if one of the cells
-        around it is.
+        ``index`` holds one array per axis. A cell is if it is a cell of the
+        domain; a node if one of the cells around it is.
         """
         cells = self._domain(level)
         shape = cells.shape
-        offsets = [(0, 0), (-1, 0), (0, -1), (-1, -1)] if self.nodal else [(0, 0)]
-        inside = np.zeros(i.shape, dtype=bool)
-        for di, dj in offsets:
-            index, valid = [], np.ones(i.shape, dtype=bool)
-            for axis, values in enumerate((i + di, j + dj)):
+        offsets = (
+            itertools.product((0, -1), repeat=len(index))
+            if self.nodal
+            else [(0,) * len(index)]
+        )
+        inside = np.zeros(index[0].shape, dtype=bool)
+        for offset in offsets:
+            where, valid = [], np.ones(index[0].shape, dtype=bool)
+            for axis, values in enumerate(index):
+                values = values + offset[axis]
                 if self.periodic[axis]:
                     values = values % shape[axis]
                 else:
                     valid &= (values >= 0) & (values < shape[axis])
                     values = np.clip(values, 0, shape[axis] - 1)
-                index.append(values)
-            inside |= valid & cells[index[0], index[1]]
+                where.append(values)
+            inside |= valid & cells[tuple(where)]
         return inside
 
     def stencil(
@@ -174,24 +190,24 @@ def _coarse_buffer(
 
 
 def _storage_index(
-    array: Any, patch: Patch, i: np.ndarray, j: np.ndarray
-) -> tuple[np.ndarray, tuple[np.ndarray, np.ndarray]]:
-    """Which level points ``(i, j)`` of ``patch`` this rank stores, and where."""
+    array: Any, patch: Patch, index: tuple[np.ndarray, ...]
+) -> tuple[np.ndarray, tuple[np.ndarray, ...]]:
+    """Which level points ``index`` (one array per axis) of ``patch`` this rank stores, and where."""
     origin = tuple(lo for lo, _ in patch.box)
     layout = array.layout
-    mine = np.ones(i.shape, dtype=bool)
+    mine = np.ones(index[0].shape, dtype=bool)
     local = []
     for values, o, (b0, b1), h in zip(
-        (i, j), origin, layout.index_bounds, layout.halo, strict=True
+        index, origin, layout.index_bounds, layout.halo, strict=True
     ):
         values = values - o
         mine &= (values >= b0 - h) & (values < b1 + h)
         local.append(values - b0 + h)
-    return mine, (local[0][mine], local[1][mine])
+    return mine, tuple(values[mine] for values in local)
 
 
 class _Bilinear:
-    """Points of an array computed as weighted sums of four points of a buffer."""
+    """Points of an array computed as weighted sums of corners of a buffer (2 or 4)."""
 
     def __init__(self, array: Any, index: tuple, buffer: Any, flat: Any, weights: Any):
         self.array, self.index, self.buffer = array, index, buffer
@@ -208,14 +224,13 @@ def interpolate_from_below(
     patch: Patch,
     field_of: Any,
     array: Any,
-    i: np.ndarray,
-    j: np.ndarray,
+    index: tuple[np.ndarray, ...],
     dtype: Any,
     copies: list,
 ) -> _Bilinear | None:
-    """Bilinear interpolation of the level below ``patch`` at its points ``(i, j)``.
+    """(Bi)linear interpolation of the level below ``patch`` at its points ``index``.
 
-    ``(i, j)`` are level indices of points of ``patch`` (own or halo),
+    ``index`` holds the level indices of points of ``patch`` (own or halo), one array per axis,
     ``field_of(coarse)`` the array of a patch of the level below (``None``
     where this rank does not hold it) and ``array`` the patch's own array
     (``None`` likewise). Appends to ``copies`` the copies that bring the coarse
@@ -224,36 +239,43 @@ def interpolate_from_below(
     copies (see :func:`apply_interpolations`) on the ranks that hold some of
     the points, else ``None``.
     """
-    if not i.size:
+    if not index[0].size:
         return None
     below = patch.level - 1
-    (ci, wi), (cj, wj) = points.stencil(i, 0, below), points.stencil(j, 1, below)
-    buffer_box = (
-        (int(ci.min()), int(ci.max()) + 2),
-        (int(cj.min()), int(cj.max()) + 2),
+    stencils = [
+        points.stencil(values, axis, below) for axis, values in enumerate(index)
+    ]
+    buffer_box = tuple(
+        (int(lower.min()), int(lower.max()) + 2) for lower, _ in stencils
     )
     shape = tuple(hi - lo for lo, hi in buffer_box)
     buffer, available = _coarse_buffer(
         hierarchy, points, patch, field_of, buffer_box, dtype, copies
     )
-    # the four coarse points of every point, without the unavailable ones
+    # the two or four coarse points of every point, without the unavailable ones
     corners = []
-    for a, b in itertools.product((0, 1), repeat=2):
-        weight = (wi if a else 1.0 - wi) * (wj if b else 1.0 - wj)
-        bi = ci + a - buffer_box[0][0]
-        bj = cj + b - buffer_box[1][0]
-        weight = np.where(available[bi, bj], weight, 0.0)
-        corners.append((bi * shape[1] + bj, weight))
+    for corner in itertools.product((0, 1), repeat=len(index)):
+        weight = np.ones(index[0].shape)
+        at = []
+        for (lower, fraction), upper, (first, _) in zip(
+            stencils, corner, buffer_box, strict=True
+        ):
+            weight = weight * (fraction if upper else 1.0 - fraction)
+            at.append(lower + upper - first)
+        weight = np.where(available[tuple(at)], weight, 0.0)
+        corners.append((np.ravel_multi_index(tuple(at), shape), weight))
     total = np.sum([weight for _, weight in corners], axis=0)
     keep = total > 0.0
     if not keep.any() or array is None:
         return None
-    flat = np.stack([index[keep] for index, _ in corners], axis=1)
+    flat = np.stack([where[keep] for where, _ in corners], axis=1)
     weights = np.stack([weight[keep] / total[keep] for _, weight in corners], axis=1)
-    mine, index = _storage_index(array, patch, i[keep], j[keep])
+    mine, storage = _storage_index(
+        array, patch, tuple(values[keep] for values in index)
+    )
     if not mine.any():
         return None
-    return _Bilinear(array, index, buffer, flat[mine], weights[mine])
+    return _Bilinear(array, storage, buffer, flat[mine], weights[mine])
 
 
 def _minmod(*values: np.ndarray) -> np.ndarray:
@@ -283,7 +305,7 @@ class _Conservative:
         values = np.asarray(self.buffer.local_with_halos).reshape(-1)[self.flat]
         centre = values[:, 0]
         result = centre.copy()
-        for axis in (0, 1):
+        for axis in range(self.offsets.shape[1]):
             below, above = values[:, 1 + 2 * axis], values[:, 2 + 2 * axis]
             has_below = self.available[:, 2 * axis]
             has_above = self.available[:, 2 * axis + 1]
@@ -306,12 +328,11 @@ def conservative_from_below(
     patch: Patch,
     field_of: Any,
     array: Any,
-    i: np.ndarray,
-    j: np.ndarray,
+    index: tuple[np.ndarray, ...],
     dtype: Any,
     copies: list,
 ) -> _Conservative | None:
-    """Conservative interpolation of the level below at cells ``(i, j)`` of ``patch``.
+    """Conservative interpolation of the level below at cells ``index`` of ``patch``.
 
     For cell-centered fields: each fine cell takes the value of the coarse
     cell it lies in plus a slope along each axis times its offset from that
@@ -324,42 +345,47 @@ def conservative_from_below(
     reproduced away from walls.
     Arguments and result as for :func:`interpolate_from_below`.
     """
-    if not i.size:
+    if not index[0].size:
         return None
     ratio = points.ratio
-    parent_i, parent_j = i // ratio, j // ratio
+    parent = [values // ratio for values in index]
     offsets = np.stack(
-        [((i % ratio) + 0.5) / ratio - 0.5, ((j % ratio) + 0.5) / ratio - 0.5], axis=1
+        [((values % ratio) + 0.5) / ratio - 0.5 for values in index], axis=1
     )
     if hierarchy.cylindrical:
         # In r–z the fine cells weigh with their radius: measure the radial
         # offsets from the volume-weighted centre of the coarse cell, so that the
         # volume-weighted mean of the fine cells is the coarse value.
         spacing = hierarchy.spacing(patch.level - 1)[0]
-        radius = hierarchy.bounds[0][0] + (parent_i + 0.5) * spacing
+        radius = hierarchy.bounds[0][0] + (parent[0] + 0.5) * spacing
         squares = np.sum((((np.arange(ratio) + 0.5) / ratio) - 0.5) ** 2)
         offsets[:, 0] -= spacing * squares / (ratio * radius)
-    buffer_box = (
-        (int(parent_i.min()) - 1, int(parent_i.max()) + 2),
-        (int(parent_j.min()) - 1, int(parent_j.max()) + 2),
-    )
+    buffer_box = tuple((int(p.min()) - 1, int(p.max()) + 2) for p in parent)
     shape = tuple(hi - lo for lo, hi in buffer_box)
     buffer, available = _coarse_buffer(
         hierarchy, points, patch, field_of, buffer_box, dtype, copies
     )
-    bi, bj = parent_i - buffer_box[0][0], parent_j - buffer_box[1][0]
-    stencil = [(bi, bj), (bi - 1, bj), (bi + 1, bj), (bi, bj - 1), (bi, bj + 1)]
-    flat = np.stack([a * shape[1] + b for a, b in stencil], axis=1)
-    there = np.stack([available[a, b] for a, b in stencil], axis=1)
+    centre = [p - first for p, (first, _) in zip(parent, buffer_box, strict=True)]
+    # the coarse cell, then its neighbours below and above along each axis
+    stencil = [tuple(centre)]
+    for axis in range(len(index)):
+        for step in (-1, 1):
+            neighbour = list(centre)
+            neighbour[axis] = neighbour[axis] + step
+            stencil.append(tuple(neighbour))
+    flat = np.stack([np.ravel_multi_index(at, shape) for at in stencil], axis=1)
+    there = np.stack([available[at] for at in stencil], axis=1)
     keep = there[:, 0]  # a fine cell needs its coarse cell
     if not keep.any() or array is None:
         return None
-    mine, index = _storage_index(array, patch, i[keep], j[keep])
+    mine, storage = _storage_index(
+        array, patch, tuple(values[keep] for values in index)
+    )
     if not mine.any():
         return None
     return _Conservative(
         array,
-        index,
+        storage,
         buffer,
         flat[keep][mine],
         there[keep][mine][:, 1:],
@@ -403,7 +429,7 @@ class HaloExchange:
         width = self._width
         extended = tuple((lo - width, hi + width) for lo, hi in own)
         covered = np.zeros([hi - lo for lo, hi in extended], dtype=bool)
-        covered[width:-width, width:-width] = True
+        covered[(slice(width, -width),) * len(own)] = True
         origin = tuple(lo for lo, _ in own)
         for other in self._hierarchy.patches_at_level(patch.level):
             other_origin = tuple(lo for lo, _ in points.own(other))
@@ -442,18 +468,18 @@ class HaloExchange:
         """Interpolation of the level below into the halo points no patch covers."""
         own = points.own(patch)
         width = self._width
-        i, j = np.nonzero(~covered)
-        i = i + own[0][0] - width
-        j = j + own[1][0] - width
-        keep = points.in_domain(patch.level, i, j)
+        index = tuple(
+            values + lo - width
+            for values, (lo, _) in zip(np.nonzero(~covered), own, strict=True)
+        )
+        keep = points.in_domain(patch.level, *index)
         interpolation = interpolate_from_below(
             self._hierarchy,
             points,
             patch,
             self._field,
             self._field(patch),
-            i[keep],
-            j[keep],
+            tuple(values[keep] for values in index),
             dtype,
             copies,
         )
@@ -559,17 +585,21 @@ class Restriction:
         for array, target, buffer, (level, first) in writes:
             fine = np.asarray(buffer.local_with_halos)
             if self._nodal:
-                coarse = fine[::r, ::r]
+                coarse = fine[(slice(None, None, r),) * fine.ndim]
             else:
-                n, m = fine.shape[0] // r, fine.shape[1] // r
+                counts = [size // r for size in fine.shape]
+                blocks = [part for n in counts for part in (n, r)]
+                # the axes of the fine cells within each coarse cell
+                within = tuple(range(1, 2 * fine.ndim, 2))
                 if hierarchy.cylindrical:
+                    n, m = counts
                     weight = hierarchy.cell_volumes(level, first + np.arange(n * r))
                     weighted = (fine * weight[:, None]).reshape(n, r, m, r)
                     # each coarse cell: r x r fine cells, r of each radial weight
                     total = r * weight.reshape(n, r).sum(axis=1)
                     coarse = weighted.sum(axis=(1, 3)) / total[:, None]
                 else:
-                    coarse = fine.reshape(n, r, m, r).mean(axis=(1, 3))
+                    coarse = fine.reshape(blocks).mean(axis=within)
             # this rank's block only: the halo is the exchange's
             layout = array.layout
             blocked = tuple(

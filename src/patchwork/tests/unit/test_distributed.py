@@ -150,3 +150,25 @@ def test_the_distributed_solve_gives_what_one_rank_gives(ranks: int) -> None:
     )
 
     assert "MPI_JOB_OK" in result.stdout, result.stdout[-2000:] + result.stderr[-2000:]
+
+
+@pytest.mark.parametrize("periodic", [False, True])
+def test_petsc_on_a_line_gives_what_superlu_gives(periodic: bool) -> None:
+    mesh = AMRHierarchy(base_shape=(16,), periodic=(periodic,))
+    mesh.add_patch(level=1, box=((8, 24),))
+    mesh.add_patch(level=2, box=((24, 40),))
+    faces = {} if periodic else {"x_lower": Neumann(0.5), "x_upper": Dirichlet(1.0)}
+    body = EmbeddedDirichlet(lambda p: np.abs(p[0] - 0.71) < 0.03, 2.0)
+    nodes = CompositeNodes(mesh)
+    direct = NodalPoisson(mesh, faces=faces, embedded=[body], nodes=nodes)
+    iterative = NodalPoisson(
+        mesh, faces=faces, embedded=[body], nodes=nodes, backend="petsc"
+    )
+    (x,) = nodes.coordinates.T
+    source = np.exp(-((x - 0.4) ** 2) / 0.02)
+
+    expected = direct.solve(source)
+    found = iterative.solve(source)
+
+    assert np.abs(found - expected).max() < 1e-8 * np.abs(expected).max()
+    assert np.array_equal(iterative.rows, direct.free)

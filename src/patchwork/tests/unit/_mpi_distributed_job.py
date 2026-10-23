@@ -155,7 +155,32 @@ def main() -> None:
             f"the potential on patch {patch.box}",
         )
 
-    # 6. A manufactured solution converges at second order, distributed.
+    # 6. A line, its patches on one rank, a pair and all ranks.
+    def line(comm, placed: bool) -> AMRHierarchy:
+        mesh = AMRHierarchy(base_shape=(32,), comm=comm)
+        for level, box, ranks in (
+            (1, ((16, 40),), SIZE - 1),
+            (1, ((44, 60),), (0, 1)),
+            (2, ((40, 72),), SIZE - 1),
+            (2, ((92, 116),), None),
+        ):
+            mesh.add_patch(level=level, box=box, ranks=ranks if placed else None)
+        return mesh
+
+    def line_source(x):
+        return np.exp(-((x - 0.4) ** 2) / 0.02)
+
+    ends = {"x_lower": Neumann(0.5), "x_upper": Dirichlet(1.0)}
+    solver = NodalPoisson(line(WORLD, placed=True), backend="petsc", faces=ends)
+    reference = NodalPoisson(line(MPI.COMM_SELF, placed=False), faces=ends)
+    rows = np.concatenate(WORLD.allgather(solver.rows))
+    check(np.array_equal(np.sort(rows), solver.free), "a line: rows cover the unknowns")
+    check(solver.rows.size < solver.free.size, f"a line: rank {RANK} holds every row")
+    (x,) = solver.nodes.coordinates.T
+    error = np.abs(solver.solve(line_source(x)) - reference.solve(line_source(x)))
+    check(error.max() < 1e-8, f"a line: differs from SuperLU by {error.max():.2e}")
+
+    # 7. A manufactured solution converges at second order, distributed.
     def exact(x, y):
         return np.sin(np.pi * x) * np.sin(np.pi * y) + x * y
 

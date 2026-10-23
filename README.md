@@ -11,8 +11,8 @@ analysis](https://github.com/max-models/patchwork/actions/workflows/static_analy
 [![PyPI](https://img.shields.io/pypi/v/patchwork-amr.png)](https://pypi.org/project/patchwork-amr/)
 [![Python](https://img.shields.io/pypi/pyversions/patchwork-amr.png)](https://pypi.org/project/patchwork-amr/)
 
-Patchwork is a small 2D block-structured adaptive mesh library. It
-stores cell-centered or node-centered fields on nested rectangular
+Patchwork is a small 1D and 2D block-structured adaptive mesh library.
+It stores cell-centered or node-centered fields on nested rectangular
 patches using [`mpiarray`](https://github.com/max-models/mpiarray). The
 same API works without MPI installed or launched; under `mpiexec`, after
 installing the optional `mpi` extra, each patch lives on the ranks you

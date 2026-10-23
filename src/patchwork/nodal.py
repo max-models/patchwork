@@ -14,10 +14,16 @@ corner. A node on a domain face therefore gets a half control volume and no
 flux through the face, the natural (Neumann) condition. Hanging nodes are
 eliminated by the interpolation, which keeps the operator conservative and, in
 the absence of embedded boundaries, symmetric.
+
+In 1D the same assembly gives the three-point Laplacian (the linear finite
+elements), with half of each cell's length at each end. A coarse–fine
+interface is then a node of both levels: no node hangs, and the coupling
+across it is the exact flux between the two cells.
 """
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -33,19 +39,25 @@ if TYPE_CHECKING:
     from patchwork.mesh import AMRHierarchy, Patch
 
 #: The faces of the domain's bounding rectangle, as ``(axis, side)`` with side 0
-#: the lower one.
+#: the lower one. A 1D domain has the two ``x`` faces (see :func:`faces_of`).
 FACES = {"x_lower": (0, 0), "x_upper": (0, 1), "y_lower": (1, 0), "y_upper": (1, 1)}
+
+
+def faces_of(ndim: int) -> dict[str, tuple[int, int]]:
+    """The faces of the bounding box of a domain of ``ndim`` dimensions."""
+    return {face: where for face, where in FACES.items() if where[0] < ndim}
+
 
 #: The rest of the boundary of a domain that does not fill its rectangle
 #: (``AMRHierarchy(base_boxes=...)``): the edges inside the rectangle.
 INNER = "inner"
 
-Value = float | Callable[[np.ndarray, np.ndarray], Any]
+Value = float | Callable[..., Any]
 
 
 @dataclass(frozen=True)
 class Dirichlet:
-    """A prescribed potential on a domain face: a number or ``value(x, y)``."""
+    """A prescribed potential on a domain face: a number, ``value(x)`` in 1D or ``value(x, y)``."""
 
     value: Value = 0.0
 
@@ -54,8 +66,9 @@ class Dirichlet:
 class Neumann:
     """A prescribed outward normal derivative on a domain face.
 
-    ``gradient`` is a number or ``gradient(x, y)``, evaluated at the middle of
-    every cell edge on the face; zero is the natural condition.
+    ``gradient`` is a number or ``gradient(x, y)`` (``gradient(x)`` in 1D),
+    evaluated at the middle of every cell edge on the face (at the face's node
+    in 1D); zero is the natural condition.
     """
 
     gradient: Value = 0.0
@@ -65,7 +78,7 @@ class Neumann:
 class EmbeddedDirichlet:
     """A body inside the domain held at one potential.
 
-    ``inside(points)`` takes coordinates ``(2, n)`` inside the domain and returns
+    ``inside(points)`` takes coordinates ``(ndim, n)`` inside the domain and returns
     which of them the body contains. Nodes inside are fixed at ``value``. On a
     mesh edge from a node outside to a node inside, the surface is located by
     bisection of ``inside`` (or by ``fraction(outside, inside)``, the fraction
@@ -81,10 +94,18 @@ class EmbeddedDirichlet:
     fraction: Callable[[np.ndarray, np.ndarray], Any] | None = None
 
 
-def _evaluate(value: Value, x: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """A face value at points: a number, or the result of a callable."""
-    result = value(x, y) if callable(value) else value
-    return np.broadcast_to(np.asarray(result, dtype=float), x.shape).copy()
+def _evaluate(value: Value, *coordinates: np.ndarray) -> np.ndarray:
+    """A face value at points (one array per axis): a number, or the result of a callable."""
+    result = value(*coordinates) if callable(value) else value
+    return np.broadcast_to(np.asarray(result, dtype=float), coordinates[0].shape).copy()
+
+
+def _corner_offsets(ndim: int) -> np.ndarray:
+    """The corners of a cell, ``(2**ndim, ndim)``, the first axis varying fastest."""
+    return np.array(
+        [[(k >> axis) & 1 for axis in range(ndim)] for k in range(2**ndim)],
+        dtype=np.int64,
+    )
 
 
 class CompositeNodes:
@@ -95,20 +116,25 @@ class CompositeNodes:
     level)``. On a periodic axis the lattice wraps around, so the last node of
     the axis is the first.
 
+    The arrays below have one column per axis (``ndim``, 1 or 2) and a cell has
+    ``2**ndim`` corners.
+
     Attributes:
         hierarchy: The patch hierarchy.
-        lattice: Finest-lattice coordinates of the nodes, ``(n, 2)`` integers.
-        coordinates: Physical coordinates of the nodes, ``(n, 2)``.
-        cell_corners: Node numbers of the corners of every leaf cell, ``(m, 4)``
-            in the order lower-left, lower-right, upper-left, upper-right.
+        lattice: Finest-lattice coordinates of the nodes, ``(n, ndim)`` integers.
+        coordinates: Physical coordinates of the nodes, ``(n, ndim)``.
+        cell_corners: Node numbers of the corners of every leaf cell,
+            ``(m, 2**ndim)``: lower, upper in 1D; lower-left, lower-right,
+            upper-left, upper-right in 2D.
         cell_span: Edge length of every leaf cell on the finest lattice.
-        cell_lower: Finest-lattice coordinates of the lower-left corners.
+        cell_lower: Finest-lattice coordinates of the lower (lower-left) corners.
         cell_ranks: The rank of the hierarchy's communicator that holds every
             leaf cell: one of its patch's ranks, the rows of a patch on several
             ranks split over them as its arrays are.
         node_ranks: The rank that owns every node in a distributed solve: the
             lowest of the ranks of the leaf cells around it.
-        volumes: Control volume of every node: a quarter of each cell around it.
+        volumes: Control volume of every node: a share of each cell around it
+            (a half in 1D, a quarter in 2D).
         hanging: Whether a node is hanging (interpolated from other nodes).
         reduction: The interpolation ``T``: ``T @ u`` fills the hanging nodes of
             ``u`` from the others (which it leaves unchanged).
@@ -120,6 +146,7 @@ class CompositeNodes:
         self.hierarchy = hierarchy
         ratio = hierarchy.refinement_ratio
         finest = hierarchy.max_level
+        self.ndim = ndim = hierarchy.ndim
         self._finest = finest
         self._cells = np.asarray(hierarchy.level_shape(finest), dtype=np.int64)
         self._periodic = tuple(hierarchy.periodic)
@@ -129,19 +156,27 @@ class CompositeNodes:
         lowers, spans, owners = [], [], []
         for patch in hierarchy.patches:
             span = ratio ** (finest - patch.level)
-            (i0, _), (j0, _) = patch.box
-            (_, i1), (_, j1) = patch.box
             covered = np.zeros(patch.shape, dtype=bool)
             for child in hierarchy.patches_at_level(patch.level + 1):
                 # a finer patch may lie over several patches of this level
-                (c0, c1), (d0, d1) = child.box
                 covered[
-                    max(c0 // ratio, i0) - i0 : max(min(c1 // ratio, i1) - i0, 0),
-                    max(d0 // ratio, j0) - j0 : max(min(d1 // ratio, j1) - j0, 0),
+                    tuple(
+                        slice(
+                            max(c0 // ratio, i0) - i0, max(min(c1 // ratio, i1) - i0, 0)
+                        )
+                        for (c0, c1), (i0, i1) in zip(child.box, patch.box, strict=True)
+                    )
                 ] = True
-            i, j = np.nonzero(~covered)
-            lowers.append(np.column_stack(((i + i0) * span, (j + j0) * span)))
-            spans.append(np.full(i.size, span, dtype=np.int64))
+            index = np.nonzero(~covered)
+            lowers.append(
+                np.column_stack(
+                    [
+                        (values + i0) * span
+                        for values, (i0, _) in zip(index, patch.box, strict=True)
+                    ]
+                )
+            )
+            spans.append(np.full(index[0].size, span, dtype=np.int64))
             # a patch on several ranks: its rows of cells split over them as
             # its arrays are (near-even, along the first axis)
             chunks = np.array_split(np.arange(patch.shape[0]), len(patch.ranks))
@@ -151,36 +186,39 @@ class CompositeNodes:
                     for chunk, rank in zip(chunks, patch.ranks, strict=True)
                 ]
             )
-            owners.append(row_rank[i])
+            owners.append(row_rank[index[0]])
         self.cell_lower = np.concatenate(lowers)
         self.cell_span = np.concatenate(spans)
         self.cell_ranks = np.concatenate(owners)
 
-        offsets = np.array([[0, 0], [1, 0], [0, 1], [1, 1]], dtype=np.int64)
+        offsets = _corner_offsets(ndim)
         corners = (
             self.cell_lower[:, None, :] + self.cell_span[:, None, None] * offsets
-        )  # (m, 4, 2)
-        keys = self._key(corners[..., 0], corners[..., 1])
+        )  # (m, 2**ndim, ndim)
+        keys = self._key(*(corners[..., axis] for axis in range(ndim)))
         self._keys, self.cell_corners = np.unique(keys, return_inverse=True)
         self.cell_corners = self.cell_corners.reshape(keys.shape)
         self.num_nodes = int(self._keys.size)
-        stride = int(self._cells[1]) + 1
-        self.lattice = np.column_stack((self._keys // stride, self._keys % stride))
+        self.lattice = np.column_stack(
+            np.unravel_index(self._keys, tuple(int(n) + 1 for n in self._cells))
+        )
         self.coordinates = self._origin + self.lattice * self._spacing
 
-        size = self.cell_span[:, None] * self._spacing  # (m, 2) physical edge lengths
+        size = (
+            self.cell_span[:, None] * self._spacing
+        )  # (m, ndim) physical edge lengths
         self.cell_size = size
         self.node_ranks = np.full(self.num_nodes, np.iinfo(np.int64).max)
         np.minimum.at(
             self.node_ranks,
             self.cell_corners.reshape(-1),
-            np.repeat(self.cell_ranks, 4),
+            np.repeat(self.cell_ranks, 2**ndim),
         )
         self.volumes = np.zeros(self.num_nodes)
         np.add.at(
             self.volumes,
             self.cell_corners.reshape(-1),
-            np.repeat(0.25 * size[:, 0] * size[:, 1], 4),
+            np.repeat(np.prod(size, axis=1) / 2**ndim, 2**ndim),
         )
         self._find_hanging_nodes()
         self._leaf_map: np.ndarray | None = None
@@ -188,25 +226,35 @@ class CompositeNodes:
         self._find_boundary()
 
     # Construction -------------------------------------------------------------#
-    def _key(self, i: np.ndarray, j: np.ndarray) -> np.ndarray:
-        """One integer per finest-lattice point, the same for periodic images."""
-        i = np.asarray(i, dtype=np.int64)
-        j = np.asarray(j, dtype=np.int64)
-        if self._periodic[0]:
-            i = i % self._cells[0]
-        if self._periodic[1]:
-            j = j % self._cells[1]
-        return i * (int(self._cells[1]) + 1) + j
+    def _key(self, *index: np.ndarray) -> np.ndarray:
+        """One integer per finest-lattice point, the same for periodic images.
 
-    def _lookup(self, i: np.ndarray, j: np.ndarray) -> np.ndarray:
+        ``index`` holds one array of lattice coordinates per axis.
+        """
+        key = np.zeros(np.shape(index[0]), dtype=np.int64)
+        for axis, values in enumerate(index):
+            values = np.asarray(values, dtype=np.int64)
+            if self._periodic[axis]:
+                values = values % self._cells[axis]
+            key = key * (int(self._cells[axis]) + 1) + values
+        return key
+
+    def _lookup(self, *index: np.ndarray) -> np.ndarray:
         """Node numbers of finest-lattice points, -1 where there is no node."""
-        keys = self._key(i, j)
+        keys = self._key(*index)
         position = np.searchsorted(self._keys, keys)
         position = np.minimum(position, self.num_nodes - 1)
         return np.where(self._keys[position] == keys, position, -1)
 
     def _find_hanging_nodes(self) -> None:
-        """Find the nodes inside coarser cells' edges and their interpolation."""
+        """Find the nodes inside coarser cells' edges and their interpolation.
+
+        In 1D a cell's faces are nodes, and no node hangs.
+        """
+        if self.ndim == 1:
+            self.hanging = np.zeros(self.num_nodes, dtype=bool)
+            self.reduction = sparse.csr_matrix(sparse.identity(self.num_nodes))
+            return
         slaves, masters, weights, spans = [], [], [], []
         ll, lr, ul, ur = (self.cell_corners[:, k] for k in range(4))
         for span in np.unique(self.cell_span):
@@ -271,11 +319,10 @@ class CompositeNodes:
     def patch_nodes(self, patch: Patch) -> np.ndarray:
         """Node numbers of the nodes of ``patch``, in its node shape."""
         span = self.hierarchy.refinement_ratio ** (self._finest - patch.level)
-        (i0, i1), (j0, j1) = patch.box
-        i, j = np.meshgrid(
-            np.arange(i0, i1 + 1) * span, np.arange(j0, j1 + 1) * span, indexing="ij"
+        index = np.meshgrid(
+            *(np.arange(lo, hi + 1) * span for lo, hi in patch.box), indexing="ij"
         )
-        nodes = self._lookup(i, j)
+        nodes = self._lookup(*index)
         if (nodes < 0).any():
             raise RuntimeError("a patch node is not a node of the composite mesh")
         return nodes
@@ -284,8 +331,8 @@ class CompositeNodes:
         """Write node values ``(n,)`` into the node-centered field ``name``."""
         for patch in self.hierarchy.local_patches:
             array = patch.field(name)
-            (i0, i1), (j0, j1) = array.layout.index_bounds
-            array.local[...] = values[self.patch_nodes(patch)][i0:i1, j0:j1]
+            block = tuple(slice(b0, b1) for b0, b1 in array.layout.index_bounds)
+            array.local[...] = values[self.patch_nodes(patch)][block]
 
     def from_patches(self, name: str) -> np.ndarray:
         """Node values ``(n,)`` of the node-centered field ``name``.
@@ -304,34 +351,37 @@ class CompositeNodes:
 
         An edge of a leaf cell is on the boundary if there is no cell beyond
         it: on a face of the bounding rectangle (``"x_lower"``, ...), or inside
-        the rectangle where the domain does not fill it (``"inner"``).
+        the rectangle where the domain does not fill it (``"inner"``). In 1D
+        the "edge" is the cell's end node, of measure 1 (per unit area).
         """
         leaf = self._leaf_cells()
-        edges = {face: ([], [], [], []) for face in (*FACES, INNER)}
-        # the corners of the edge on each side of a cell: lower-left first
-        corners = {(0, 0): (0, 2), (0, 1): (1, 3), (1, 0): (0, 1), (1, 1): (2, 3)}
+        faces = faces_of(self.ndim)
+        edges = {face: ([], [], [], []) for face in (*faces, INNER)}
+        offsets = _corner_offsets(self.ndim)
         centre = self.cell_lower + 0.5 * self.cell_span[:, None]
-        for face, (axis, side) in FACES.items():
-            other = 1 - axis
+        for face, (axis, side) in faces.items():
             beyond = self.cell_lower[:, axis] + (self.cell_span if side else -1)
             at_rectangle = (beyond < 0) | (beyond >= self._cells[axis])
             if self._periodic[axis]:
                 beyond = beyond % self._cells[axis]
                 at_rectangle[:] = False
-            clipped = np.clip(beyond, 0, self._cells[axis] - 1)
-            along = self.cell_lower[:, other]
-            rows, columns = (clipped, along) if axis == 0 else (along, clipped)
-            outside = at_rectangle | (leaf[rows, columns] < 0)
+            where = [self.cell_lower[:, a] for a in range(self.ndim)]
+            where[axis] = np.clip(beyond, 0, self._cells[axis] - 1)
+            outside = at_rectangle | (leaf[tuple(where)] < 0)
             midpoint = centre.copy()
             midpoint[:, axis] += (0.5 if side else -0.5) * self.cell_span
-            first, second = corners[axis, side]
+            # the corners on that side of a cell: its two ends (lower-left
+            # first), one node twice in 1D
+            on_side = np.flatnonzero(offsets[:, axis] == side)
+            first, second = on_side[0], on_side[-1]
+            measure = np.prod(np.delete(self.cell_size, axis, axis=1), axis=1)
             for name, cells in (
                 (face, np.nonzero(outside & at_rectangle)[0]),
                 (INNER, np.nonzero(outside & ~at_rectangle)[0]),
             ):
                 edges[name][0].append(self.cell_corners[cells, first])
                 edges[name][1].append(self.cell_corners[cells, second])
-                edges[name][2].append(self.cell_size[cells, other])
+                edges[name][2].append(measure[cells])
                 edges[name][3].append(self._origin + midpoint[cells] * self._spacing)
         self._boundary = {
             face: (
@@ -350,7 +400,8 @@ class CompositeNodes:
 
         ``face`` is a face of the bounding rectangle (``"x_lower"``, ...) or
         ``"inner"``. Returns the two end nodes of every edge, its length and its
-        midpoint ``(k, 2)``.
+        midpoint ``(k, ndim)``. In 1D an edge is a node: both ends are that
+        node and its length is 1.
         """
         return self._boundary[face]
 
@@ -369,7 +420,7 @@ class CompositeNodes:
         return measure
 
     # Interpolation ---------------------------------------------------------------#
-    def level_shape(self, level: int) -> tuple[int, int]:
+    def level_shape(self, level: int) -> tuple[int, ...]:
         """Number of nodes of a level's lattice over the whole domain, per axis.
 
         A periodic axis has as many nodes as cells: the last node is the first.
@@ -378,15 +429,15 @@ class CompositeNodes:
         return tuple(
             n if periodic else n + 1
             for n, periodic in zip(cells, self._periodic, strict=True)
-        )  # type: ignore[return-value]
+        )
 
     def _bilinear(
         self, lower: Sequence[np.ndarray], fraction: Sequence[np.ndarray], level: int
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Columns and weights (n, 4) of bilinear interpolation on a level lattice."""
+        """Columns and weights ``(n, 2**ndim)`` of (bi)linear interpolation on a level lattice."""
         shape = self.level_shape(level)
         index, weight = [], []
-        for axis in range(2):
+        for axis in range(self.ndim):
             upper = lower[axis] + 1
             if self._periodic[axis]:
                 upper = upper % shape[axis]
@@ -394,16 +445,25 @@ class CompositeNodes:
                 upper = np.minimum(upper, shape[axis] - 1)
             index.append((lower[axis], upper))
             weight.append((1.0 - fraction[axis], fraction[axis]))
+        corners = list(itertools.product((0, 1), repeat=self.ndim))
         columns = np.column_stack(
-            [index[0][a] * shape[1] + index[1][b] for a in (0, 1) for b in (0, 1)]
+            [
+                np.ravel_multi_index(
+                    tuple(index[axis][c] for axis, c in enumerate(corner)), shape
+                )
+                for corner in corners
+            ]
         )
         weights = np.column_stack(
-            [weight[0][a] * weight[1][b] for a in (0, 1) for b in (0, 1)]
+            [
+                np.prod([weight[axis][c] for axis, c in enumerate(corner)], axis=0)
+                for corner in corners
+            ]
         )
         return columns, weights
 
     def from_level(self, level: int) -> sparse.csr_matrix:
-        """Bilinear interpolation from a level's lattice to the composite nodes.
+        """(Bi)linear interpolation from a level's lattice to the composite nodes.
 
         The matrix has shape ``(n, nodes of the level lattice)``, the lattice in
         C order with :meth:`level_shape`. It prolongs a field known on the
@@ -412,18 +472,18 @@ class CompositeNodes:
         span = self.hierarchy.refinement_ratio ** (self._finest - level)
         cells = self.hierarchy.level_shape(level)
         lower, fraction = [], []
-        for axis in range(2):
+        for axis in range(self.ndim):
             position = self.lattice[:, axis]
             index = np.minimum(position // span, cells[axis] - 1)
             lower.append(index)
             fraction.append((position - index * span) / span)
         columns, weights = self._bilinear(lower, fraction, level)
-        rows = np.repeat(np.arange(self.num_nodes), 4)
+        rows = np.repeat(np.arange(self.num_nodes), 2**self.ndim)
         shape = self.level_shape(level)
         matrix = sparse.csr_matrix(
             sparse.coo_matrix(
                 (weights.reshape(-1), (rows, columns.reshape(-1))),
-                shape=(self.num_nodes, shape[0] * shape[1]),
+                shape=(self.num_nodes, int(np.prod(shape))),
             )
         )
         matrix.eliminate_zeros()
@@ -432,27 +492,36 @@ class CompositeNodes:
     def _leaf_cells(self) -> np.ndarray:
         """The leaf cell that covers every cell of the finest lattice."""
         if self._leaf_map is None:
+            ndim = self.ndim
             leaf = np.full(tuple(self._cells), -1, dtype=np.int64)
             for span in np.unique(self.cell_span):
                 cells = np.nonzero(self.cell_span == span)[0]
                 offsets = np.arange(int(span))
-                i = self.cell_lower[cells, 0][:, None, None] + offsets[None, :, None]
-                j = self.cell_lower[cells, 1][:, None, None] + offsets[None, None, :]
-                leaf[i, j] = cells[:, None, None]
+                index = []
+                for axis in range(ndim):
+                    # the cells along the first axis, the span along each axis after
+                    shape = [1] * (ndim + 1)
+                    shape[axis + 1] = int(span)
+                    index.append(
+                        self.cell_lower[cells, axis].reshape(-1, *[1] * ndim)
+                        + offsets.reshape(shape)
+                    )
+                leaf[tuple(index)] = cells.reshape(-1, *[1] * ndim)
             self._leaf_map = leaf
         return self._leaf_map
 
     def evaluation(self, points: np.ndarray) -> sparse.csr_matrix:
-        """The composite interpolant at ``points`` ``(2, k)``: a ``(k, n)`` matrix.
+        """The composite interpolant at ``points`` ``(ndim, k)``: a ``(k, n)`` matrix.
 
-        Each point takes the bilinear interpolant of the leaf cell it is in.
+        Each point takes the linear (1D) or bilinear (2D) interpolant of the
+        leaf cell it is in.
         Apply it to node values that have their hanging nodes filled (as
         :meth:`NodalPoisson.solve` returns them). A point outside the domain
         gets an empty row: the value zero.
         """
         points = np.asarray(points, dtype=float)
         corners, weights = self.cell_weights(points)
-        rows = np.repeat(np.arange(points.shape[1]), 4)
+        rows = np.repeat(np.arange(points.shape[1]), corners.shape[1])
         matrix = sparse.csr_matrix(
             sparse.coo_matrix(
                 (weights.reshape(-1), (rows, corners.reshape(-1))),
@@ -463,10 +532,10 @@ class CompositeNodes:
         return matrix
 
     def deposit(self, points: np.ndarray, charges: np.ndarray) -> np.ndarray:
-        """The charges of point particles at ``points`` ``(2, k)`` on the nodes: ``(n,)``.
+        """The charges of point particles at ``points`` ``(ndim, k)`` on the nodes: ``(n,)``.
 
         Each charge is spread over the corners of its leaf cell with the
-        bilinear weights of :meth:`evaluation`, whose transpose this is: the
+        (bi)linear weights of :meth:`evaluation`, whose transpose this is: the
         work a field interpolated with :meth:`evaluation` does on the particles
         is the work their deposited charge feels, and no particle pushes
         itself through the coupling. Hanging nodes receive charge like any
@@ -486,15 +555,20 @@ class CompositeNodes:
         )
 
     def cell_weights(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Corner nodes ``(k, 4)`` and bilinear weights ``(k, 4)`` of the leaf cell of each point.
+        """Corner nodes and (bi)linear weights, ``(k, 2**ndim)``, of the leaf cell of each point.
 
         The corners are in the order of :attr:`cell_corners`; a point outside
         the domain has weights zero.
         """
         points = np.asarray(points, dtype=float)
+        ndim = self.ndim
+        if points.shape[0] != ndim:
+            raise ValueError(
+                f"points of a {ndim}D mesh are ({ndim}, k), got {points.shape}"
+            )
         position = (points - self._origin[:, None]) / self._spacing[:, None]
         cell, local = [], []
-        for axis in range(2):
+        for axis in range(ndim):
             index = np.floor(position[axis]).astype(np.int64)
             if self._periodic[axis]:
                 index = index % self._cells[axis]
@@ -505,22 +579,26 @@ class CompositeNodes:
             cell.append(index)
             local.append(wrapped)
         leaf_map = self._leaf_cells()
-        leaf = leaf_map[cell[0], cell[1]]
+        leaf = leaf_map[tuple(cell)]
         # a point on a lattice line may have its cell on the lower side only
         # (the edge of a domain that does not fill its rectangle)
-        on_line = [local[axis] == np.floor(local[axis]) for axis in (0, 1)]
-        for step in ((1, 0), (0, 1), (1, 1)):
+        on_line = [local[axis] == np.floor(local[axis]) for axis in range(ndim)]
+        steps = sorted(
+            (step for step in itertools.product((0, 1), repeat=ndim) if any(step)),
+            key=lambda step: (sum(step), step[::-1]),
+        )
+        for step in steps:
             missing = leaf < 0
-            for axis in (0, 1):
+            for axis in range(ndim):
                 if step[axis]:
                     missing &= on_line[axis] & (cell[axis] > 0)
             if not missing.any():
                 continue
             leaf[missing] = leaf_map[
-                cell[0][missing] - step[0], cell[1][missing] - step[1]
+                tuple(cell[axis][missing] - step[axis] for axis in range(ndim))
             ]
         inside = leaf >= 0
-        for axis in range(2):
+        for axis in range(ndim):
             if not self._periodic[axis]:
                 # beyond a non-periodic face: no value (the clipped cell would
                 # extrapolate)
@@ -530,14 +608,18 @@ class CompositeNodes:
         leaf = np.where(inside, leaf, 0)
         span = self.cell_span[leaf]
         fraction = [
-            (local[axis] - self.cell_lower[leaf, axis]) / span for axis in (0, 1)
+            (local[axis] - self.cell_lower[leaf, axis]) / span for axis in range(ndim)
         ]
         weights = np.column_stack(
             [
-                (fraction[0] if a else 1.0 - fraction[0])
-                * (fraction[1] if b else 1.0 - fraction[1])
-                for b in (0, 1)
-                for a in (0, 1)
+                np.prod(
+                    [
+                        fraction[axis] if upper else 1.0 - fraction[axis]
+                        for axis, upper in enumerate(corner)
+                    ],
+                    axis=0,
+                )
+                for corner in _corner_offsets(ndim)
             ]
         )
         weights[~inside] = 0.0  # outside the domain: no value
@@ -551,9 +633,10 @@ class CompositeNodes:
         """
         shape = self.level_shape(level)
         spacing = np.asarray(self.hierarchy.spacing(level))
-        i, j = np.meshgrid(np.arange(shape[0]), np.arange(shape[1]), indexing="ij")
+        index = np.meshgrid(*(np.arange(n) for n in shape), indexing="ij")
         points = (
-            self._origin[:, None] + np.vstack((i.ravel(), j.ravel())) * spacing[:, None]
+            self._origin[:, None]
+            + np.vstack([values.ravel() for values in index]) * spacing[:, None]
         )
         return self.evaluation(points)
 
@@ -579,27 +662,31 @@ class CompositeNodes:
         if given.
         """
         level = self._finest if level is None else level
+        ndim = self.ndim
         patches = self.hierarchy.patches
         if len(arrays) != len(patches):
             raise ValueError(f"expected {len(patches)} patch arrays, got {len(arrays)}")
         arrays = [np.asarray(array) for array in arrays]
         for patch, array in zip(patches, arrays, strict=True):
-            if array.shape[:2] != patch.node_shape:
+            if array.shape[:ndim] != patch.node_shape:
                 raise ValueError(
                     f"a level-{patch.level} patch needs an array of "
-                    f"{patch.node_shape} nodes, got {array.shape[:2]}"
+                    f"{patch.node_shape} nodes, got {array.shape[:ndim]}"
                 )
-        extra = arrays[0].shape[2:]
+        extra = arrays[0].shape[ndim:]
         if out is None:
             out = np.empty((*self.level_shape(level), *extra), dtype=arrays[0].dtype)
         if not extra:
             out[...] = self._sample_scalar(arrays, level)
             return out
         # one component at a time: loops over a short last axis are slow
-        components = out.reshape(*out.shape[:2], -1)
-        for number in range(components.shape[2]):
-            components[:, :, number] = self._sample_scalar(
-                [array.reshape(*array.shape[:2], -1)[:, :, number] for array in arrays],
+        components = out.reshape(*out.shape[:ndim], -1)
+        for number in range(components.shape[-1]):
+            components[..., number] = self._sample_scalar(
+                [
+                    array.reshape(*array.shape[:ndim], -1)[..., number]
+                    for array in arrays
+                ],
                 level,
             )
         return out
@@ -612,7 +699,7 @@ class CompositeNodes:
         current = np.zeros(self.level_shape(0), dtype=arrays[0].dtype)
         for depth in range(level + 1):
             if depth:
-                for axis in range(2):
+                for axis in range(self.ndim):
                     current = self._refine(current, axis, ratio)
             for patch, array in zip(patches, arrays, strict=True):
                 if patch.level != depth:
@@ -649,29 +736,31 @@ class CompositeNodes:
             scale = hierarchy.refinement_ratio**level
             cells = np.zeros(hierarchy.level_shape(level), dtype=bool)
             for patch in hierarchy.patches_at_level(0):
-                (i0, i1), (j0, j1) = patch.box
-                cells[i0 * scale : i1 * scale, j0 * scale : j1 * scale] = True
+                cells[tuple(slice(lo * scale, hi * scale) for lo, hi in patch.box)] = (
+                    True
+                )
             if cells.all():
                 self._outside[level] = None
             else:
                 # a node is in the domain if one of the cells around it is
                 around = cells
-                for axis in range(2):
-                    width = [(0, 0), (0, 0)]
+                for axis in range(self.ndim):
+                    width = [(0, 0)] * self.ndim
                     width[axis] = (1, 1)
                     around = np.pad(
                         around,
                         width,
                         mode="wrap" if self._periodic[axis] else "constant",
                     )
-                inside = (
-                    around[:-1, :-1]
-                    | around[1:, :-1]
-                    | around[:-1, 1:]
-                    | around[1:, 1:]
-                )
+                inside = np.zeros([n - 1 for n in around.shape], dtype=bool)
+                for shift in itertools.product((0, 1), repeat=self.ndim):
+                    inside |= around[
+                        tuple(
+                            slice(None, -1) if s == 0 else slice(1, None) for s in shift
+                        )
+                    ]
                 shape = self.level_shape(level)
-                self._outside[level] = ~inside[: shape[0], : shape[1]]
+                self._outside[level] = ~inside[tuple(slice(0, n) for n in shape)]
         return self._outside[level]
 
     def _refine(self, array: np.ndarray, axis: int, ratio: int) -> np.ndarray:
@@ -714,8 +803,8 @@ class NodalPoisson:
 
     The operator is assembled and factorized once; :meth:`solve` then costs two
     triangular solves. ``faces`` maps ``"x_lower"``, ``"x_upper"``,
-    ``"y_lower"``, ``"y_upper"`` to a :class:`Dirichlet` or :class:`Neumann`
-    condition; a face that is not listed is a grounded Dirichlet face, and the
+    ``"y_lower"``, ``"y_upper"`` (only the first two in 1D) to a
+    :class:`Dirichlet` or :class:`Neumann` condition; a face that is not listed is a grounded Dirichlet face, and the
     faces of a periodic axis take none. On a domain that does not fill its
     rectangle (``AMRHierarchy(base_boxes=...)``) these are the parts of its
     boundary on the rectangle's faces, and ``"inner"`` is the rest: the edges
@@ -772,13 +861,14 @@ class NodalPoisson:
         self.nodes = CompositeNodes(hierarchy) if nodes is None else nodes
         self._embedded = tuple(embedded)
         self._min_fraction = float(min_fraction)
-        unknown = set(faces or ()) - set(FACES) - {INNER}
+        known = faces_of(hierarchy.ndim)
+        unknown = set(faces or ()) - set(known) - {INNER}
         if unknown:
             raise ValueError(
-                f"unknown faces {sorted(unknown)}; expected {[*FACES, INNER]}"
+                f"unknown faces {sorted(unknown)}; expected {[*known, INNER]}"
             )
         self._faces: dict[str, Dirichlet | Neumann] = {}
-        for face, (axis, _) in FACES.items():
+        for face, (axis, _) in known.items():
             if hierarchy.periodic[axis]:
                 if faces and face in faces:
                     raise ValueError(
@@ -793,7 +883,7 @@ class NodalPoisson:
 
     # Assembly ------------------------------------------------------------------#
     def _wrapped(self, points: np.ndarray) -> np.ndarray:
-        """``points`` ``(2, k)`` moved into the domain along its periodic axes."""
+        """``points`` ``(ndim, k)`` moved into the domain along its periodic axes."""
         hierarchy = self.nodes.hierarchy
         if not any(hierarchy.periodic):
             return points
@@ -930,17 +1020,25 @@ class NodalPoisson:
         n = nodes.num_nodes
         solid = self._owner >= 0
 
-        # Every leaf cell's four edges, with half the stencil's conductance each.
+        # Every leaf cell's edges (four in 2D, itself in 1D), each with its share
+        # of the stencil's conductance: half in 2D, the whole in 1D.
+        ndim = nodes.ndim
         corners = nodes.cell_corners if cells is None else nodes.cell_corners[cells]
         size = nodes.cell_size if cells is None else nodes.cell_size[cells]
-        ll, lr, ul, ur = (corners[:, k] for k in range(4))
-        hx, hy = size[:, 0], size[:, 1]
-        first = np.concatenate((ll, ul, ll, lr))
-        second = np.concatenate((lr, ur, ul, ur))
-        conductance = np.concatenate(
-            (0.5 * hy / hx, 0.5 * hy / hx, 0.5 * hx / hy, 0.5 * hx / hy)
-        )
-        length = np.concatenate((hx, hx, hy, hy))
+        firsts, seconds, conductances, lengths = [], [], [], []
+        for axis in range(ndim):
+            cross = np.prod(np.delete(size, axis, axis=1), axis=1) / 2 ** (ndim - 1)
+            for k in range(2**ndim):
+                if (k >> axis) & 1:
+                    continue
+                firsts.append(corners[:, k])
+                seconds.append(corners[:, k | (1 << axis)])
+                conductances.append(cross / size[:, axis])
+                lengths.append(size[:, axis])
+        first = np.concatenate(firsts)
+        second = np.concatenate(seconds)
+        conductance = np.concatenate(conductances)
+        length = np.concatenate(lengths)
         # A periodic axis one cell wide joins a node to itself: no coupling.
         keep = first != second
         first, second = first[keep], second[keep]
@@ -995,39 +1093,41 @@ class NodalPoisson:
     ) -> tuple[sparse.csr_matrix, sparse.csr_matrix]:
         """Replace the rows of regular nodes next to a body by Shortley-Weller rows.
 
-        A node is regular if four cells of one size meet at it. Its row is then
+        A node is regular if four cells of one size meet at it (two in 1D). Its row is then
         the finite-difference Laplacian with unequal arms, times its control
         volume: second-order accurate up to the surface, as on a uniform grid.
         """
         nodes = self.nodes
         n = nodes.num_nodes
+        ndim = nodes.ndim
+        corners = 2**ndim
         if not outside.size:
             return operator, wall
         count = np.zeros(n, dtype=np.int64)
         np.add.at(count, nodes.cell_corners.reshape(-1), 1)
         smallest = np.full(n, np.iinfo(np.int64).max)
         largest = np.zeros(n, dtype=np.int64)
-        spans = np.repeat(nodes.cell_span, 4)
+        spans = np.repeat(nodes.cell_span, corners)
         np.minimum.at(smallest, nodes.cell_corners.reshape(-1), spans)
         np.maximum.at(largest, nodes.cell_corners.reshape(-1), spans)
-        regular = (count == 4) & (smallest == largest) & ~nodes.hanging
+        regular = (count == corners) & (smallest == largest) & ~nodes.hanging
         cut_nodes = np.unique(outside[regular[outside]])
         if not cut_nodes.size:
             return operator, wall
 
         span = smallest[cut_nodes]
-        spacing = span[:, None] * nodes._spacing  # (k, 2)
+        spacing = span[:, None] * nodes._spacing  # (k, ndim)
         position = {int(node): k for k, node in enumerate(cut_nodes)}
         # arm lengths and what each arm ends at: [axis][side] over the cut nodes
-        arm = np.stack([np.stack([spacing[:, axis]] * 2) for axis in range(2)])
-        body = np.full((2, 2, cut_nodes.size), -1, dtype=np.int64)
-        neighbour = np.empty((2, 2, cut_nodes.size), dtype=np.int64)
-        for axis in range(2):
+        arm = np.stack([np.stack([spacing[:, axis]] * 2) for axis in range(ndim)])
+        body = np.full((ndim, 2, cut_nodes.size), -1, dtype=np.int64)
+        neighbour = np.empty((ndim, 2, cut_nodes.size), dtype=np.int64)
+        for axis in range(ndim):
             for side, sign in enumerate((-1, 1)):
-                step = np.zeros((cut_nodes.size, 2), dtype=np.int64)
+                step = np.zeros((cut_nodes.size, ndim), dtype=np.int64)
                 step[:, axis] = sign * span
                 there = nodes.lattice[cut_nodes] + step
-                neighbour[axis, side] = nodes._lookup(there[:, 0], there[:, 1])
+                neighbour[axis, side] = nodes._lookup(*there.T)
         for out_node, in_node, d in zip(outside, inside, distance, strict=True):
             k = position.get(int(out_node))
             if k is None:
@@ -1038,9 +1138,9 @@ class NodalPoisson:
 
         rows, columns, entries = [], [], []
         wall_rows, wall_columns, wall_entries = [], [], []
-        volume = spacing[:, 0] * spacing[:, 1]
+        volume = np.prod(spacing, axis=1)
         diagonal = np.zeros(cut_nodes.size)
-        for axis in range(2):
+        for axis in range(ndim):
             total = arm[axis, 0] + arm[axis, 1]
             for side in range(2):
                 coefficient = volume * 2.0 / (arm[axis, side] * total)
@@ -1078,7 +1178,7 @@ class NodalPoisson:
         nodes = self.nodes
         n = nodes.num_nodes
         values = np.zeros(n)
-        x, y = nodes.coordinates[:, 0], nodes.coordinates[:, 1]
+        coordinates = nodes.coordinates.T
         flux = np.zeros(n)
         # x faces before y faces, lower before upper: the first one decides a corner
         decided = np.zeros(n, dtype=bool)
@@ -1086,16 +1186,12 @@ class NodalPoisson:
             if isinstance(condition, Dirichlet):
                 on_face = nodes.face_nodes(face)
                 on_face = on_face[~decided[on_face]]
-                values[on_face] = _evaluate(condition.value, x[on_face], y[on_face])
+                values[on_face] = _evaluate(condition.value, *coordinates[:, on_face])
                 decided[on_face] = True
             else:
                 # the gradient at the middle of every boundary edge, shared by its ends
                 first, second, length, midpoint = nodes.face_edges(face)
-                through = (
-                    0.5
-                    * length
-                    * _evaluate(condition.gradient, midpoint[:, 0], midpoint[:, 1])
-                )
+                through = 0.5 * length * _evaluate(condition.gradient, *midpoint.T)
                 np.add.at(flux, first, through)
                 np.add.at(flux, second, through)
         body_values = np.array([body.value for body in self._embedded] or [0.0])

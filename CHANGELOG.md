@@ -12,8 +12,32 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the leaf cells around them, and PETSc solves them together: conjugate gradients (GMRES
   with embedded bodies) and BoomerAMG, or GAMG without hypre, to `rtol`, with GMRES and
   block Jacobi as a fallback. The potential agrees with the SuperLU solve (still the
-  default) to the solver tolerance on any number of ranks. `PetscSystem`, the `petsc` extra
-  (petsc4py), `CompositeNodes.cell_ranks` and `examples/distributed_scaling.py`.
+  default) to the solver tolerance on any number of ranks, on lines and planes.
+  `PetscSystem`, the `petsc` extra (petsc4py), `CompositeNodes.cell_ranks` and
+  `examples/distributed_scaling.py`.
+- 1D hierarchies: `AMRHierarchy(base_shape=(nx,))` is a line (a uniform 1D grid is a
+  hierarchy of one level), with `bounds=((x0, x1),)` and `periodic=(flag,)`; `ndim` gives
+  the number of dimensions. The 2D code paths are now written for either: patches and
+  fields, `exchange_halos` and `restrict` (on MPI ranks too), `integral`, tagging,
+  `cluster` (on a 1D array of tags), `regrid` with conservative fields, `forbid` and
+  `min_patch_size`, `locate`, `owner`, `migrate`, `deposit` and `accumulate_halos`
+  (`locate(x)`, `owner(x, name)`, `migrate(x, *arrays, name=)`, `deposit(x, charge, name)`
+  in 1D), `CompositeNodes`, `NodalPoisson` (the three-point stencil; no node hangs),
+  `CompositeCells`, `CellOperator` with both coarse–fine treatments, bodies, floating
+  bodies and `gradient`, and `plot_patches` (a line plot). Functions of the position take
+  `(x)` in 1D. Tests: `test_line_patches.py` (also under `mpirun`) and
+  `test_line_solvers.py`, the 1D counterparts of the 2D ones: second-order manufactured
+  solutions across coarse–fine points, charge conservation of the deposit, conservation
+  through restriction and regridding, and picnic's `DirichletPoisson1D` (the same
+  potential to round-off) and `SheetField1D` (deposited sheets give its exact potential at
+  the nodes, on refined lines too).
+
+### Changed
+
+- `AMRHierarchy`'s `bounds` and `periodic` default to `None`: the unit interval or square,
+  and no periodic axis. `IndexBox`, `spacing`, `level_shape`, `lower_bound` and the patch
+  coordinates have one entry per axis. `solve_poisson` stays 2D (use `CellOperator`), as
+  do the r–z geometry and `CellOperator.curl`.
 
 ## [0.2.0] - 2026-10-22
 
