@@ -350,8 +350,8 @@ class AMRHierarchy:
         self._cells_on_rank = [0.0] * self.comm.Get_size()
         # halo exchanges and restrictions, by kind and field; rebuilt after add_patch
         self._schedules: dict[tuple[str, str], Any] = {}
-        # which patch owns each cell of a level, rebuilt after add_patch (see locate)
-        self._locators: dict[int, tuple[tuple[int, ...], Any]] = {}
+        # which patch owns each cell of every level, rebuilt after add_patch (locate)
+        self._locators: tuple[Any, ...] | None = None
         self._field_specs: dict[str, dict[str, Any]] = {}
         whole = tuple((0, n) for n in self.base_shape)
         boxes = (
@@ -609,7 +609,7 @@ class AMRHierarchy:
             )
         patch = self._new_patch(level, normalized, ranks)
         self._schedules.clear()
-        self._locators.clear()
+        self._locators = None
         if patch.is_local:
             for name, spec in self._field_specs.items():
                 patch._fields[name] = self._zeros(patch, spec)
@@ -875,40 +875,71 @@ class AMRHierarchy:
             total += float(weighted[leaf].sum())
         return float(self.comm.allreduce(total, op=MPI.SUM))
 
-    def _locator(self, level: int) -> tuple[tuple[int, ...], Any]:
-        """Which patch holds each cell of ``level``: the corner of the table and the table.
+    def _locator(self) -> tuple[Any, ...]:
+        """The tables of :meth:`locate`: which patch holds each cell, level by level.
 
-        The table covers the bounding box of the level's patches and holds the index
-        into :attr:`patches` of the patch over each cell, -1 where there is none.
+        Every level's table covers the bounding box of its patches and holds the
+        index into :attr:`patches` of the patch over each cell, -1 where there is
+        none. Returns the arguments of the ``locate_points`` kernel that describe
+        the hierarchy, always for two axes (a 1D hierarchy gets one cell along
+        ``y``): the domain's bounds and periodic axes, the spacing and cell count
+        of the finest level, the span of a cell of each level on the finest one,
+        each table's lower corner and shape, where it starts in the flat array of
+        all tables, and that array. Built at the first call, kept until a patch is
+        added.
         """
         import numpy as np
 
-        if level not in self._locators:
-            members = [
-                (number, patch)
-                for number, patch in enumerate(self.patches)
-                if patch.level == level
-            ]
-            low = tuple(
-                min(patch.box[axis][0] for _, patch in members)
-                for axis in range(self.ndim)
+        if self._locators is None:
+            pad = 2 - self.ndim
+            finest = self.max_level
+            corners, shapes, flat = [], [], []
+            for level in range(finest + 1):
+                members = [
+                    (number, patch)
+                    for number, patch in enumerate(self.patches)
+                    if patch.level == level
+                ]
+                low = [
+                    min(patch.box[axis][0] for _, patch in members)
+                    for axis in range(self.ndim)
+                ]
+                high = [
+                    max(patch.box[axis][1] for _, patch in members)
+                    for axis in range(self.ndim)
+                ]
+                table = np.full(
+                    [b - a for a, b in zip(low, high, strict=True)], -1, dtype=np.int32
+                )
+                for number, patch in members:
+                    table[
+                        tuple(
+                            slice(lo - first, hi - first)
+                            for (lo, hi), first in zip(patch.box, low, strict=True)
+                        )
+                    ] = number
+                corners.append(low + [0] * pad)
+                shapes.append(list(table.shape) + [1] * pad)
+                flat.append(table.reshape(-1))
+            offsets = np.zeros(len(flat) + 1, dtype=np.int64)
+            np.cumsum([table.size for table in flat], out=offsets[1:])
+            ratio = self.refinement_ratio
+            self._locators = (
+                np.asarray(list(self.lower_bound) + [0.0] * pad, dtype=float),
+                np.asarray(list(self.upper_bound) + [1.0] * pad, dtype=float),
+                np.asarray(list(self.periodic) + [False] * pad, dtype=np.int64),
+                np.asarray(list(self.spacing(finest)) + [1.0] * pad, dtype=float),
+                np.asarray(list(self.level_shape(finest)) + [1] * pad, dtype=np.int64),
+                np.asarray(
+                    [ratio ** (finest - level) for level in range(finest + 1)],
+                    dtype=np.int64,
+                ),
+                np.asarray(corners, dtype=np.int64),
+                np.asarray(shapes, dtype=np.int64),
+                offsets,
+                np.concatenate(flat),
             )
-            high = tuple(
-                max(patch.box[axis][1] for _, patch in members)
-                for axis in range(self.ndim)
-            )
-            table = np.full(
-                [b - a for a, b in zip(low, high, strict=True)], -1, dtype=np.intp
-            )
-            for number, patch in members:
-                table[
-                    tuple(
-                        slice(lo - first, hi - first)
-                        for (lo, hi), first in zip(patch.box, low, strict=True)
-                    )
-                ] = number
-            self._locators[level] = (low, table)
-        return self._locators[level]
+        return self._locators
 
     def _cells(self, coordinates: Sequence[Any]) -> tuple[Any, tuple[Any, ...], tuple]:
         """Where flat arrays of points are: patch, cell and wrapped coordinates.
@@ -917,44 +948,22 @@ class AMRHierarchy:
         the index of the finest patch that holds it (-1 outside the domain),
         its cell on the level of that patch (level indices, one array per
         axis), and the coordinates wrapped into the domain on periodic axes.
+        One pass of the compiled ``locate_points`` kernel.
         """
         import numpy as np
 
+        from patchwork.kernels.locate_points import kernel as locate_points
+
         size = coordinates[0].size
-        wrapped = []
-        inside = np.ones(size, dtype=bool)
+        points = np.zeros((2, size))
         for axis, values in enumerate(coordinates):
-            low, high = self.bounds[axis]
-            if self.periodic[axis]:
-                values = low + np.mod(values - low, high - low)
-            inside &= (values >= low) & (values <= high)  # False for NaN
-            wrapped.append(values)
-        found = np.full(size, -1, dtype=np.intp)
-        cell = [np.zeros(size, dtype=np.intp) for _ in range(self.ndim)]
-        for level in range(self.max_level, -1, -1):
-            pending = np.flatnonzero(inside & (found < 0))
-            if pending.size == 0:
-                break
-            corner, table = self._locator(level)
-            cells = []
-            within = np.ones(pending.size, dtype=bool)
-            for axis in range(self.ndim):
-                low = self.bounds[axis][0]
-                spacing = self.spacing(level)[axis]
-                count = self.level_shape(level)[axis]
-                index = np.floor((wrapped[axis][pending] - low) / spacing)
-                cells.append(np.minimum(index.astype(np.intp), count - 1))
-                offset = cells[axis] - corner[axis]
-                within &= (offset >= 0) & (offset < table.shape[axis])
-            owner = np.full(pending.size, -1, dtype=np.intp)
-            owner[within] = table[
-                tuple(c[within] - first for c, first in zip(cells, corner, strict=True))
-            ]
-            hit = owner >= 0
-            found[pending[hit]] = owner[hit]
-            for axis in range(self.ndim):
-                cell[axis][pending[hit]] = cells[axis][hit]
-        return found, tuple(cell), tuple(wrapped)
+            points[axis] = values
+        found = np.empty(size, dtype=np.int64)
+        cell = np.empty((2, size), dtype=np.int64)
+        wrapped = np.empty((2, size), dtype=float)
+        if size:  # the compiled kernel takes no empty arrays
+            locate_points(points, *self._locator(), found, cell, wrapped)
+        return found, tuple(cell[: self.ndim]), tuple(wrapped[: self.ndim])
 
     def _points(self, coordinates: Sequence[Any]) -> tuple[tuple, tuple[int, ...]]:
         """Flat float arrays of the coordinates of points, and their common shape."""

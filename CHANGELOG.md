@@ -47,6 +47,21 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `locate` (and `owner`, `migrate`, `deposit`) runs a compiled kernel (Pyccel, the new
+  `pyccel` extra, also in `test`; its NumPy version runs without it): one pass over the
+  points, one division per axis and a lookup per level, instead of NumPy passes per level.
+  A point's cell is now its cell on the finest lattice divided down to its patch's level,
+  the leaf cell `CompositeNodes` puts it in. 25,000 markers on five patches: 4.6 to 0.9 ms;
+  200,000 on 338 patches: 45 to 16 ms (one thread, a loaded machine).
+- `CompositeNodes.deposit` in 2D runs a compiled kernel (one pass, no matrix): 2.9 to
+  1.0 ms and 38 to 20 ms in the same two cases.
+- `CompositeNodes` keeps `patch_nodes` (read-only now) and which patch `from_patches`
+  reads every node from, found at the first call on a mesh; on one rank `from_patches`
+  reads the patch arrays in place: 1.1 to 0.18 ms and 31 to 3 ms (the first call on a
+  mesh costs about one and a half calls of before).
+- `accumulate_halos` on one rank skips the transport and adds the copies along paths
+  found at the first call: 0.41 to 0.12 ms and 49 to 5.5 ms.
+- cunumpy is a direct dependency (the kernel dispatch and the Pyccel build cache).
 - `AMRHierarchy`'s `bounds` and `periodic` default to `None`: the unit interval or square,
   and no periodic axis. `IndexBox`, `spacing`, `level_shape`, `lower_bound` and the patch
   coordinates have one entry per axis. `solve_poisson` stays 2D (use `CellOperator`), as

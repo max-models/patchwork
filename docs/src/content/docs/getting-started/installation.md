@@ -36,7 +36,8 @@ patchwork
 | ------ | ------------------------------------------------------- |
 | `mpi`  | mpi4py, for runs under `mpiexec`                         |
 | `petsc` | petsc4py, for `NodalPoisson(backend="petsc")`: the solve distributed over the ranks |
-| `test` | `pytest` and `coverage`                                 |
+| `pyccel` | Pyccel, which compiles the kernels (`locate`) on their first call; without it their NumPy versions run |
+| `test` | `pytest`, `coverage` and the `pyccel` extra            |
 | `docs` | the notebook runner and griffe for the API reference    |
 | `dev`  | formatters and linters, plus the `test` and `docs` extras |
 

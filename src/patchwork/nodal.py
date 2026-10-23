@@ -222,6 +222,8 @@ class CompositeNodes:
         )
         self._find_hanging_nodes()
         self._leaf_map: np.ndarray | None = None
+        self._patch_nodes: dict[tuple, np.ndarray] = {}
+        self._reads: list | None = None
         self._outside: dict[int, np.ndarray | None] = {}
         self._find_boundary()
 
@@ -317,15 +319,55 @@ class CompositeNodes:
 
     # Patches -------------------------------------------------------------------#
     def patch_nodes(self, patch: Patch) -> np.ndarray:
-        """Node numbers of the nodes of ``patch``, in its node shape."""
-        span = self.hierarchy.refinement_ratio ** (self._finest - patch.level)
-        index = np.meshgrid(
-            *(np.arange(lo, hi + 1) * span for lo, hi in patch.box), indexing="ij"
-        )
-        nodes = self._lookup(*index)
-        if (nodes < 0).any():
-            raise RuntimeError("a patch node is not a node of the composite mesh")
+        """Node numbers of the nodes of ``patch``, in its node shape (read-only).
+
+        Found at the first call for a patch and kept: a patch's nodes are the same
+        as long as the hierarchy is.
+        """
+        key = (patch.level, patch.box)
+        nodes = self._patch_nodes.get(key)
+        if nodes is None:
+            span = self.hierarchy.refinement_ratio ** (self._finest - patch.level)
+            index = np.meshgrid(
+                *(np.arange(lo, hi + 1) * span for lo, hi in patch.box), indexing="ij"
+            )
+            nodes = self._lookup(*index)
+            if (nodes < 0).any():
+                raise RuntimeError("a patch node is not a node of the composite mesh")
+            nodes.flags.writeable = False
+            self._patch_nodes[key] = nodes
         return nodes
+
+    def _patch_reads(self) -> list[tuple[np.ndarray, tuple[np.ndarray, ...]]]:
+        """For every patch, the nodes whose value :meth:`from_patches` takes from it.
+
+        One entry per patch of :attr:`AMRHierarchy.patches`: the node numbers and
+        where those nodes are in the patch's node array (one index array per axis).
+        A node shared by several patches is read from the finest, the last of that
+        level in the order of the patches; a node on a periodic seam that a patch
+        holds twice, from the upper copy. Built at the first call.
+        """
+        if self._reads is None:
+            patches = self.hierarchy.patches
+            nodes = [self.patch_nodes(patch).reshape(-1) for patch in patches]
+            sizes = np.array([part.size for part in nodes])
+            every = np.concatenate(nodes)  # coarse to fine, C order in a patch
+            # the last copy of every node: the finest patch's, the upper on a seam
+            last = every.size - 1 - np.unique(every[::-1], return_index=True)[1]
+            if last.size != self.num_nodes:
+                raise RuntimeError("a node of the composite mesh is in no patch")
+            starts = np.concatenate(([0], np.cumsum(sizes)))
+            holder = np.searchsorted(starts, last, side="right") - 1
+            order = np.argsort(holder, kind="stable")
+            bounds = np.searchsorted(holder[order], np.arange(len(patches) + 1))
+            self._reads = []
+            for number, box in enumerate(patch.box for patch in patches):
+                chosen = last[order[bounds[number] : bounds[number + 1]]]
+                shape = tuple(hi - lo + 1 for lo, hi in box)
+                self._reads.append(
+                    (every[chosen], np.unravel_index(chosen - starts[number], shape))
+                )
+        return self._reads
 
     def to_patches(self, values: np.ndarray, name: str) -> None:
         """Write node values ``(n,)`` into the node-centered field ``name``."""
@@ -338,11 +380,19 @@ class CompositeNodes:
         """Node values ``(n,)`` of the node-centered field ``name``.
 
         Where patches share a node the finest one's value is taken. Collective:
-        every patch array is gathered.
+        every patch array is gathered (on one rank, read in place). Which nodes come from which patch is found at the first call.
         """
-        values = np.zeros(self.num_nodes)
-        for patch in self.hierarchy.patches:  # coarse to fine: the finest wins
-            values[self.patch_nodes(patch)] = self.hierarchy.gather(patch, name)
+        values = np.empty(self.num_nodes)
+        hierarchy = self.hierarchy
+        serial = hierarchy.comm.Get_size() == 1
+        for patch, (nodes, index) in zip(
+            hierarchy.patches, self._patch_reads(), strict=True
+        ):
+            if serial:
+                data = patch.field(name).local  # the whole patch, without halos
+            else:
+                data = hierarchy.gather(patch, name)
+            values[nodes] = data[index]
         return values
 
     # The boundary ----------------------------------------------------------------#
@@ -541,12 +591,32 @@ class CompositeNodes:
         itself through the coupling. Hanging nodes receive charge like any
         other; :meth:`NodalPoisson.solve` with ``charge=`` hands it to the
         nodes they hang from with the transposed interpolation, so the total
-        charge is kept. Points outside the domain deposit nothing.
+        charge is kept. Points outside the domain deposit nothing. In 2D a compiled
+        kernel (``deposit_nodes``) makes one pass over the points.
         """
         points = np.asarray(points, dtype=float)
         charges = np.asarray(charges, dtype=float).reshape(-1)
         if charges.shape[0] != points.shape[1]:
             raise ValueError(f"{points.shape[1]} points but {charges.shape[0]} charges")
+        if self.ndim == 2 and points.shape[1]:
+            # one pass of the compiled kernel, the same cells and weights
+            from patchwork.kernels.deposit_nodes import kernel as deposit_nodes
+
+            charge = np.zeros(self.num_nodes)
+            deposit_nodes(
+                np.ascontiguousarray(points),
+                np.ascontiguousarray(charges),
+                self._origin,
+                self._spacing,
+                self._cells,
+                np.asarray(self._periodic, dtype=np.int64),
+                self._leaf_cells(),
+                self.cell_corners,
+                self.cell_lower,
+                self.cell_span,
+                charge,
+            )
+            return charge
         corners, weights = self.cell_weights(points)
         return np.bincount(
             corners.reshape(-1),
