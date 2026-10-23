@@ -20,6 +20,14 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `exchange_halos(name, level=, below=)`: the halos of one level only, interpolated from
   another field of the level below (the coarse values at the time of a subcycled step);
   `restrict(name, level=)`: onto one level only.
+- `NodalPoisson(backend="petsc")`: a distributed solve. Every rank assembles only the rows
+  of the unknowns it owns (`CompositeNodes.node_ranks`, from the ranks of the patches), from
+  the leaf cells around them, and PETSc solves them together: conjugate gradients (GMRES
+  with embedded bodies) and BoomerAMG, or GAMG without hypre, to `rtol`, with GMRES and
+  block Jacobi as a fallback. The potential agrees with the SuperLU solve (still the
+  default) to the solver tolerance on any number of ranks, on lines and planes.
+  `PetscSystem`, the `petsc` extra (petsc4py), `CompositeNodes.cell_ranks` and
+  `examples/distributed_scaling.py`.
 - 1D hierarchies: `AMRHierarchy(base_shape=(nx,))` is a line (a uniform 1D grid is a
   hierarchy of one level), with `bounds=((x0, x1),)` and `periodic=(flag,)`; `ndim` gives
   the number of dimensions. The 2D code paths are now written for either: patches and

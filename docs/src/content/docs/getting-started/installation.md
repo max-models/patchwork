@@ -34,6 +34,8 @@ patchwork
 
 | Extra  | Installs                                                |
 | ------ | ------------------------------------------------------- |
+| `mpi`  | mpi4py, for runs under `mpiexec`                         |
+| `petsc` | petsc4py, for `NodalPoisson(backend="petsc")`: the solve distributed over the ranks |
 | `test` | `pytest` and `coverage`                                 |
 | `docs` | the notebook runner and griffe for the API reference    |
 | `dev`  | formatters and linters, plus the `test` and `docs` extras |

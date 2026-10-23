@@ -32,6 +32,8 @@ dependencies = [
 
 [project.optional-dependencies]
 mpi = [ "mpiarray[mpi]>=0.2.1" ]
+# NodalPoisson(backend="petsc"): the solve distributed by rows over the ranks
+petsc = [ "petsc4py" ]
 plot = [ "matplotlib" ]
 dev = [
   "jupyterlab",
