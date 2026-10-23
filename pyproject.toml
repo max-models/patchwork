@@ -23,6 +23,8 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
+  # the kernel dispatch and the Pyccel build cache (cunumpy.kernels)
+  "cunumpy>=0.7.0",
   "maybempi>=0.1.2",
   "mpiarray>=0.2.1",
   "numpy",
@@ -35,6 +37,8 @@ mpi = [ "mpiarray[mpi]>=0.2.1" ]
 # NodalPoisson(backend="petsc"): the solve distributed by rows over the ranks
 petsc = [ "petsc4py" ]
 plot = [ "matplotlib" ]
+# the compiled kernels (locate); without it their NumPy versions run
+pyccel = [ "pyccel>2.0" ]
 dev = [
   "jupyterlab",
   "pre-commit",
@@ -50,7 +54,7 @@ docs = [
   "nbclient>=0.11.0",
   "nbformat>=5.11.1",
 ]
-test = [ "pytest", "pytest-cov" ]
+test = [ "pytest", "pytest-cov", "patchwork-amr[pyccel]" ]
 
 [project.urls]
 Source = "https://github.com/max-models/patchwork"
@@ -79,7 +83,8 @@ per-file-ignores."*.ipynb" = [ "D" ]
 
 [tool.pyright]
 include = [ "src" ]
-exclude = [ "**/tests" ]
+# the Pyccel kernels annotate in Pyccel's array dialect ("float[:]")
+exclude = [ "**/tests", "src/patchwork/kernels/*/*_pyccel.py" ]
 pythonVersion = "3.10"
 typeCheckingMode = "standard"
 
@@ -98,6 +103,7 @@ show_missing = true
 # PRs to devel test against the devel branches of the max-models packages (pinned in
 # uv.lock); PRs to main and the release use PyPI only (CI sets UV_NO_SOURCES).
 [tool.uv.sources]
+cunumpy = { git = "https://github.com/max-models/cunumpy", branch = "devel" }
 maybempi = { git = "https://github.com/max-models/maybempi", branch = "devel" }
 mpiarray = { git = "https://github.com/max-models/mpiarray", branch = "devel" }
 scope-profiler = { git = "https://github.com/max-models/scope-profiler", branch = "devel" }

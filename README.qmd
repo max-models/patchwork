@@ -55,7 +55,8 @@ field's change across a cell, a function of the position, or by hand), and it
 covers them with properly nested patches (Berger-Rigoutsos clustering) and moves
 the fields over.
 
-Markers live on the patches too: `locate` finds the finest patch of each point,
+Markers live on the patches too: `locate` finds the finest patch of each point
+(a compiled kernel with the `pyccel` extra),
 `owner` and `migrate` put each marker on the rank that holds its cell, and
 `deposit` spreads the charge of the markers over the nodes (cloud-in-cell) patch
 by patch. `accumulate_halos` then brings it to the composite nodes: the halos of
