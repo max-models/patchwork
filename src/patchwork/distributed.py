@@ -26,7 +26,7 @@ from typing import Any
 import numpy as np
 import scipy.sparse as sparse
 import scope_profiler as sp
-from maybempi import is_serial
+from maybempi import petsc_comm
 
 from patchwork._profiling import PROFILE_TAGS
 
@@ -90,8 +90,8 @@ class PetscSystem:
     ) -> None:
         """Build the matrix and the solver; the preconditioner is set up here too."""
         PETSc = petsc()  # noqa: N806 - PETSc's own name
-        size = 1 if is_serial(comm) else comm.Get_size()
-        self.comm = PETSc.COMM_SELF if size == 1 else PETSc.Comm(comm)
+        self.comm = petsc_comm(comm)  # COMM_SELF for maybempi's serial stand-in
+        size = self.comm.getSize()
         rows = sparse.csr_matrix(rows)
         rows.sum_duplicates()
         rows.sort_indices()

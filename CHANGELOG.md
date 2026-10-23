@@ -66,6 +66,8 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and no periodic axis. `IndexBox`, `spacing`, `level_shape`, `lower_bound` and the patch
   coordinates have one entry per axis. `solve_poisson` stays 2D (use `CellOperator`), as
   do the r–z geometry and `CellOperator.curl`.
+- `PetscSystem` gets its PETSc communicator from `maybempi.petsc_comm` (maybempi devel)
+  instead of converting it by hand.
 
 ### Fixed
 

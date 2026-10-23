@@ -2173,7 +2173,7 @@ wheels = [
 [[package]]
 name = "maybempi"
 version = "0.1.2"
-source = { git = "https://github.com/max-models/maybempi?branch=devel#0146f000137c58b84381c176e03ffd2b3e191ce7" }
+source = { git = "https://github.com/max-models/maybempi?branch=devel#88df00e524607089fc5120a00ce98b7990696f72" }
 
 [[package]]
 name = "meson"
