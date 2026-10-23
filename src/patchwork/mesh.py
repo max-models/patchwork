@@ -441,27 +441,32 @@ class AMRHierarchy:
         """Areas of the faces of ``level`` normal to ``axis``, by first index ``i``.
 
         For ``axis=0``, ``i`` numbers the faces along the first axis (face ``i``
-        is the lower face of cell ``i``); for ``axis=1``, it is the first index
-        of the cells the faces belong to. ``dy`` or ``dx`` in the Cartesian
-        plane (per unit length out of it); in r–z, ``2 pi r dz`` for a radial
-        face at ``r`` and ``2 pi r dr`` for an axial face of a cell of
-        mid-radius ``r``, so that the faces of a cell close it
+        is the lower face of cell ``i``); for another axis, it is the first index
+        of the cells the faces belong to. ``1`` on a line (per unit area), ``dy``
+        or ``dx`` in the Cartesian plane (per unit length out of it); in r–z,
+        ``2 pi r dz`` for a radial face at ``r`` and ``2 pi r dr`` for an axial
+        face of a cell of mid-radius ``r``, so that the faces of a cell close it
         (:meth:`cell_volumes`) and the faces of the fine cells over a coarse
-        face add up to it. The area does not depend on the second index.
+        face add up to it. The area does not depend on the other indices.
         """
         import numpy as np
 
-        if axis not in (0, 1):
-            raise ValueError(f"axis must be 0 or 1, got {axis!r}")
-        dx, dy = self.spacing(level)
+        if axis not in range(self.ndim):
+            raise ValueError(
+                f"axis must be in range({self.ndim}) for a {self.ndim}D hierarchy, "
+                f"got {axis!r}"
+            )
+        spacing = self.spacing(level)
         i = np.asarray(i, dtype=float)
         if not self.cylindrical:
-            return np.full(i.shape, dy if axis == 0 else dx)
+            others = [h for a, h in enumerate(spacing) if a != axis]
+            return np.full(i.shape, float(np.prod(others)))
+        dx, dy = spacing
         if axis == 0:
             return 2.0 * np.pi * (self.bounds[0][0] + i * dx) * dy
         return 2.0 * np.pi * (self.bounds[0][0] + (i + 0.5) * dx) * dx
 
-    def level_shape(self, level: int) -> tuple[int, int]:
+    def level_shape(self, level: int) -> tuple[int, ...]:
         """Number of cells in the full domain at a refinement level."""
         scale = self.refinement_ratio**level
         return tuple(n * scale for n in self.base_shape)
@@ -845,9 +850,6 @@ class AMRHierarchy:
             # a replicated field (split=None): every rank of the patch holds it all
             if not array.layout.split and patch.comm.Get_rank() != 0:
                 continue
-            (b0, b1), (c0, c1) = array.layout.index_bounds
-            (i0, _), (j0, _) = patch.box
-            leaf = np.ones((b1 - b0, c1 - c0), dtype=bool)
             # this rank's block, in the patch's level indices
             block = tuple(
                 (lo + b0, lo + b1)

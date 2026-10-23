@@ -67,10 +67,11 @@ if TYPE_CHECKING:
     from patchwork.mesh import AMRHierarchy, Patch
 
 #: Face fluxes of a patch: ``fluxes(patch)`` returns the flux densities through
-#: the faces normal to each axis of this rank's block of the patch, ``(fx, fy)``
-#: of shapes ``(nx + 1, ny)`` and ``(nx, ny + 1)`` for a block of ``(nx, ny)``
-#: cells, positive along the axis.
-Fluxes = Callable[["Patch"], tuple[Any, Any]]
+#: the faces normal to each axis of this rank's block of the patch, positive
+#: along the axis: in 2D ``(fx, fy)`` of shapes ``(nx + 1, ny)`` and
+#: ``(nx, ny + 1)`` for a block of ``(nx, ny)`` cells; on a line ``(fx,)`` of
+#: shape ``(nx + 1,)``.
+Fluxes = Callable[["Patch"], tuple[Any, ...]]
 
 
 class FluxRegister:
@@ -96,8 +97,10 @@ class FluxRegister:
         """Find the coarse–fine faces of ``hierarchy`` (``cells``: its leaf cells)."""
         self.hierarchy = hierarchy
         cells = CompositeCells(hierarchy) if cells is None else cells
+        # a key per coarse face: (coarse cell, axis, side of the cell)
+        per_cell = 2 * hierarchy.ndim
         keys, fine_cells, fine_axes, fine_sides = [], [], [], []
-        for axis in (0, 1):
+        for axis in range(hierarchy.ndim):
             faces = cells.faces(axis)
             low, high = faces["low"], faces["high"]
             mixed = cells.span[low] != cells.span[high]
@@ -106,20 +109,24 @@ class FluxRegister:
             coarse = np.where(fine_low, high, low)
             # the side of the cell the face is on: 1 above it, 0 below
             coarse_side = (~fine_low).astype(np.int64)
-            keys.append(coarse * 4 + axis * 2 + coarse_side)
+            keys.append(coarse * per_cell + axis * 2 + coarse_side)
             fine_cells.append(np.where(fine_low, low, high))
             fine_axes.append(np.full(low.size, axis, dtype=np.int64))
             fine_sides.append(fine_low.astype(np.int64))
         unique, entry = np.unique(np.concatenate(keys), return_inverse=True)
-        coarse_cells = unique // 4
+        coarse_cells = unique // per_cell
         self.num_faces = int(unique.size)
         patches = hierarchy.patches
         levels = np.array([patch.level for patch in patches], dtype=np.int64)
         self._coarse_level = levels[cells.patch[coarse_cells]]
-        # per patch: (entries, local i, local j, axis, side) of its coarse faces
-        # and of its fine faces
+        # per patch: (entries, local indices (n, ndim), axis, side) of its coarse
+        # faces and of its fine faces
         self._coarse = self._by_patch(
-            cells, coarse_cells, np.arange(unique.size), (unique // 2) % 2, unique % 2
+            cells,
+            coarse_cells,
+            np.arange(unique.size),
+            (unique % per_cell) // 2,
+            unique % 2,
         )
         self._fine = self._by_patch(
             cells,
@@ -143,11 +150,10 @@ class FluxRegister:
         boxes = [patch.box for patch in cells.hierarchy.patches]
         for number in np.unique(cells.patch[leaf]):
             chosen = cells.patch[leaf] == number
-            (i0, _), (j0, _) = boxes[number]
+            origin = np.array([lo for lo, _ in boxes[number]], dtype=np.int64)
             result[int(number)] = (
                 entry[chosen],
-                cells.index[leaf[chosen], 0] - i0,
-                cells.index[leaf[chosen], 1] - j0,
+                cells.index[leaf[chosen]] - origin,
                 axis[chosen],
                 side[chosen],
             )
@@ -187,44 +193,51 @@ class FluxRegister:
             raise ValueError(f"field {name!r} is not cell-centered")
         records = self._record(name)
         weight = dt if scale is None else scale
+        ndim = hierarchy.ndim
+        column = (-1,) + (1,) * (ndim - 1)
         for number, patch in enumerate(hierarchy.patches):
             if not patch.is_local or (level is not None and patch.level != level):
                 continue
             array = patch.field(name)
-            (b0, b1), (c0, c1) = array.layout.index_bounds
-            fx, fy = (np.asarray(flux) for flux in fluxes(patch))
-            shapes = ((b1 - b0 + 1, c1 - c0), (b1 - b0, c1 - c0 + 1))
-            if (fx.shape, fy.shape) != shapes:
+            bounds = array.layout.index_bounds
+            low = np.array([lo for lo, _ in bounds], dtype=np.int64)
+            high = np.array([hi for _, hi in bounds], dtype=np.int64)
+            block = tuple(int(n) for n in high - low)
+            flux = tuple(np.asarray(f) for f in fluxes(patch))
+            shapes = tuple(
+                tuple(n + (a == axis) for a, n in enumerate(block))
+                for axis in range(ndim)
+            )
+            if tuple(f.shape for f in flux) != shapes:
                 raise ValueError(
-                    f"the fluxes of a block of {(b1 - b0, c1 - c0)} cells have the "
-                    f"shapes {shapes}, got {fx.shape} and {fy.shape}"
+                    f"the fluxes of a block of {block} cells have the shapes "
+                    f"{shapes}, got {tuple(f.shape for f in flux)}"
                 )
             i0 = patch.box[0][0]
-            area_x = hierarchy.face_areas(patch.level, 0, i0 + np.arange(b0, b1 + 1))
-            area_y = hierarchy.face_areas(patch.level, 1, i0 + np.arange(b0, b1))
+            (b0, b1) = bounds[0]
+            through = []
+            for axis in range(ndim):
+                faces_i = i0 + np.arange(b0, b1 + (axis == 0))
+                area = hierarchy.face_areas(patch.level, axis, faces_i)
+                through.append(flux[axis] * area.reshape(column))
+            net = sum(np.diff(t, axis=axis) for axis, t in enumerate(through))
             volume = hierarchy.cell_volumes(patch.level, i0 + np.arange(b0, b1))
-            through = (fx * area_x[:, None], fy * area_y[:, None])
-            net = (
-                through[0][1:]
-                - through[0][:-1]
-                + through[1][:, 1:]
-                - through[1][:, :-1]
-            )
-            array.local[...] -= dt * net / volume[:, None]
+            array.local[...] -= dt * net / volume.reshape(column)
             # a patch on several ranks that all hold all of it records once
             if not array.layout.split and patch.comm.Get_rank() != 0:
                 continue
             for faces, sign in ((self._coarse, -1.0), (self._fine, 1.0)):
                 if number not in faces:
                     continue
-                entry, i, j, axis, side = faces[number]
-                mine = (i >= b0) & (i < b1) & (j >= c0) & (j < c1)
-                a, b = i[mine] - b0, j[mine] - c0
-                normal, side = axis[mine] == 0, side[mine]
-                value = np.empty(a.size, dtype=records.dtype)
-                value[normal] = through[0][a[normal] + side[normal], b[normal]]
-                across = ~normal
-                value[across] = through[1][a[across], b[across] + side[across]]
+                entry, index, axis, side = faces[number]
+                mine = np.all((index >= low) & (index < high), axis=1)
+                local, axis, side = index[mine] - low, axis[mine], side[mine]
+                value = np.empty(local.shape[0], dtype=records.dtype)
+                for normal in range(ndim):
+                    on = axis == normal
+                    at = local[on].copy()
+                    at[:, normal] += side[on]
+                    value[on] = through[normal][tuple(at.T)]
                 np.add.at(records, entry[mine], sign * weight * value)
 
     @sp.profile("patchwork.reflux", tags=PROFILE_TAGS)
@@ -255,14 +268,16 @@ class FluxRegister:
             if level is not None and patch.level != level:
                 continue
             array = patch.field(name)
-            (b0, b1), (c0, c1) = array.layout.index_bounds
-            entry, i, j, axis, side = self._coarse[number]
-            mine = (i >= b0) & (i < b1) & (j >= c0) & (j < c1)
-            entry, i, side = entry[mine], i[mine], side[mine]
-            volume = hierarchy.cell_volumes(patch.level, patch.box[0][0] + i)
+            bounds = array.layout.index_bounds
+            low = np.array([lo for lo, _ in bounds], dtype=np.int64)
+            high = np.array([hi for _, hi in bounds], dtype=np.int64)
+            entry, index, _, side = self._coarse[number]
+            mine = np.all((index >= low) & (index < high), axis=1)
+            entry, index, side = entry[mine], index[mine], side[mine]
+            volume = hierarchy.cell_volumes(patch.level, patch.box[0][0] + index[:, 0])
             # the face above the cell carries the flux out of it, the one below in
             change = np.where(side == 1, -1.0, 1.0) * total[entry] / volume
-            np.add.at(array.local, (i - b0, j[mine] - c0), change)
+            np.add.at(array.local, tuple((index - low).T), change)
         hierarchy.restrict(name, level=level)
 
     def reset(self, name: str | None = None) -> None:

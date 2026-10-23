@@ -322,3 +322,85 @@ def test_fluxes_of_the_wrong_shape_are_refused() -> None:
     register = FluxRegister(mesh)
     with pytest.raises(ValueError, match="shapes"):
         register.update("u", lambda patch: (np.zeros((1, 1)), np.zeros((1, 1))), 0.1)
+
+
+def line_mesh(n, split=0, levels=2, periodic=True):
+    """A unit line of ``n`` cells, refined in the middle (twice with ``levels=2``)."""
+    mesh = AMRHierarchy((n,), periodic=(periodic,), comm=WORLD)
+    mesh.add_patch(1, ((n // 2, 3 * n // 2),), ranks=SIZE - 1)
+    if levels > 1:
+        mesh.add_patch(2, ((5 * n // 4, 9 * n // 4),), ranks=None)
+    mesh.allocate_field("u", halo=1, split=split)
+    return mesh
+
+
+def line_upwind(name, velocity):
+    def fluxes(patch):
+        u, h, layout = _storage(patch, name)
+        (nb,) = layout.local_shape
+        rows = u[h - 1 : h + nb + 1]
+        return (velocity * (rows[:-1] if velocity > 0 else rows[1:]),)
+
+    return fluxes
+
+
+def line_diffusive(mesh, name, a=1.0):
+    def fluxes(patch):
+        u, h, layout = _storage(patch, name)
+        (nb,) = layout.local_shape
+        ((b0, b1),) = layout.index_bounds
+        (dx,) = mesh.spacing(patch.level)
+        rows = u[h - 1 : h + nb + 1]
+        fx = -a * (rows[1:] - rows[:-1]) / dx
+        i = patch.box[0][0] + np.arange(b0, b1 + 1)
+        if not mesh.periodic[0]:
+            fx[(i == 0) | (i == mesh.level_shape(patch.level)[0])] = 0.0
+        return (fx,)
+
+    return fluxes
+
+
+def test_the_faces_of_a_line_are_points() -> None:
+    mesh = line_mesh(8)
+    # each finer level has a coarse face on either side
+    assert FluxRegister(mesh).num_faces == 4
+    np.testing.assert_array_equal(mesh.face_areas(1, 0, np.arange(3)), 1.0)
+    with pytest.raises(ValueError, match="axis"):
+        mesh.face_areas(0, 1, np.arange(3))
+
+
+@pytest.mark.parametrize("split", [0, None])
+def test_refluxing_on_a_line_is_conservative(split) -> None:
+    def bump(x):
+        return 1.0 + np.exp(-((x - 0.3) ** 2) / 0.01)
+
+    errors = {}
+    for reflux in (True, False):
+        mesh = line_mesh(16, split=split)
+        for patch in mesh.local_patches:
+            (x,) = patch.local_cell_centers(mesh, "u")
+            patch.field("u").local[...] = bump(x)
+        mesh.restrict("u")
+        before = mesh.integral("u")
+        run(mesh, line_upwind("u", 1.0), 0.4 * mesh.spacing(2)[0], 40, reflux=reflux)
+        errors[reflux] = abs(mesh.integral("u") - before) / before
+    assert errors[True] < 1e-14
+    assert errors[False] > 1e-4
+
+
+def test_subcycling_on_a_line_with_walls_is_conservative() -> None:
+    mesh = line_mesh(16, periodic=False)
+    for name in ("u_before", "u_between"):
+        mesh.allocate_field(name, halo=1)
+    for patch in mesh.local_patches:
+        (x,) = patch.local_cell_centers(mesh, "u")
+        patch.field("u").local[...] = np.cos(np.pi * x) + 2.0
+    mesh.restrict("u")
+    before = mesh.integral("u")
+    register = FluxRegister(mesh)
+    dt = 0.2 * mesh.spacing(2)[0] ** 2
+    for _ in range(10):
+        subcycle(mesh, register, line_diffusive(mesh, "u"), 4 * dt)
+    assert abs(mesh.integral("u") - before) < 1e-14 * before
+    with pytest.raises(ValueError, match="shapes"):
+        register.update("u", lambda patch: (np.zeros(1),), 0.1)
