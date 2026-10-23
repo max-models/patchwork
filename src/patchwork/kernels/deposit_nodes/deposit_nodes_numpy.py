@@ -24,7 +24,9 @@ def deposit_nodes(
         index = np.floor(np.where(valid, position[axis], 0.0)).astype(np.int64)
         if periodic[axis]:
             index = index % cells[axis]
-            wrapped = position[axis] - cells[axis] * np.floor(position[axis] / cells[axis])
+            wrapped = position[axis] - cells[axis] * np.floor(
+                position[axis] / cells[axis]
+            )
         else:
             valid &= (position[axis] >= 0.0) & (position[axis] <= cells[axis])
             index = np.clip(index, 0, cells[axis] - 1)
