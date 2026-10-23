@@ -437,6 +437,35 @@ class AMRHierarchy:
         radius = self.bounds[0][0] + (i + 0.5) * dx
         return 2.0 * np.pi * radius * dx * dy
 
+    def face_areas(self, level: int, axis: int, i: Any) -> Any:
+        """Areas of the faces of ``level`` normal to ``axis``, by first index ``i``.
+
+        For ``axis=0``, ``i`` numbers the faces along the first axis (face ``i``
+        is the lower face of cell ``i``); for another axis, it is the first index
+        of the cells the faces belong to. ``1`` on a line (per unit area), ``dy``
+        or ``dx`` in the Cartesian plane (per unit length out of it); in r–z,
+        ``2 pi r dz`` for a radial face at ``r`` and ``2 pi r dr`` for an axial
+        face of a cell of mid-radius ``r``, so that the faces of a cell close it
+        (:meth:`cell_volumes`) and the faces of the fine cells over a coarse
+        face add up to it. The area does not depend on the other indices.
+        """
+        import numpy as np
+
+        if axis not in range(self.ndim):
+            raise ValueError(
+                f"axis must be in range({self.ndim}) for a {self.ndim}D hierarchy, "
+                f"got {axis!r}"
+            )
+        spacing = self.spacing(level)
+        i = np.asarray(i, dtype=float)
+        if not self.cylindrical:
+            others = [h for a, h in enumerate(spacing) if a != axis]
+            return np.full(i.shape, float(np.prod(others)))
+        dx, dy = spacing
+        if axis == 0:
+            return 2.0 * np.pi * (self.bounds[0][0] + i * dx) * dy
+        return 2.0 * np.pi * (self.bounds[0][0] + (i + 0.5) * dx) * dx
+
     def level_shape(self, level: int) -> tuple[int, ...]:
         """Number of cells in the full domain at a refinement level."""
         scale = self.refinement_ratio**level
@@ -650,7 +679,9 @@ class AMRHierarchy:
                 patch._fields[name] = arrays[id(patch)]
 
     @sp.profile("patchwork.exchange_halos", tags=PROFILE_TAGS)
-    def exchange_halos(self, name: str) -> None:
+    def exchange_halos(
+        self, name: str, *, level: int | None = None, below: str | None = None
+    ) -> None:
         """Fill the halo of every patch of field ``name`` from the rest of the hierarchy.
 
         From the patches of the same level the halo overlaps (across periodic
@@ -659,23 +690,43 @@ class AMRHierarchy:
         left for the boundary conditions. Collective over ``comm``; the
         schedule is built at the first call and kept until a patch is added.
         See :class:`~patchwork.halos.HaloExchange`.
+
+        With ``level``, only the halos of the patches of that level are filled.
+        With ``below``, the values interpolated from the level below are those
+        of field ``below`` (of the same centering) instead: for a level that
+        takes several time steps for one of the level below (subcycling), a
+        field that holds the level below at the time in between.
         """
         from patchwork.halos import HaloExchange
 
-        self._schedule("halo", name, HaloExchange).execute()
+        if level is None and below is None:
+            self._schedule("halo", name, HaloExchange).execute()
+            return
+        if below is not None and self.centering(below) != self.centering(name):
+            raise ValueError(
+                f"field {below!r} is {self.centering(below)}-centered, "
+                f"{name!r} is {self.centering(name)}-centered"
+            )
+
+        def build(hierarchy: AMRHierarchy, field: str) -> HaloExchange:
+            return HaloExchange(hierarchy, field, level=level, below=below)
+
+        self._schedule(f"halo/{level}/{below}", name, build).execute()
 
     @sp.profile("patchwork.restrict", tags=PROFILE_TAGS)
-    def restrict(self, name: str) -> None:
+    def restrict(self, name: str, *, level: int | None = None) -> None:
         """Give the points of field ``name`` under finer patches the fine values.
 
         The mean of the fine cells (cell-centered) or the coinciding fine node
-        (node-centered), finest level first. Collective over ``comm``; call
-        :meth:`exchange_halos` after it for the halos. See
+        (node-centered), finest level first. With ``level``, only the points
+        of that level under the next finer one (a level that has caught up
+        with the finer ones when they subcycle). Collective over ``comm``;
+        call :meth:`exchange_halos` after it for the halos. See
         :class:`~patchwork.halos.Restriction`.
         """
         from patchwork.halos import Restriction
 
-        self._schedule("restrict", name, Restriction).execute()
+        self._schedule("restrict", name, Restriction).execute(level=level)
 
     @sp.profile("patchwork.regrid", tags=PROFILE_TAGS)
     def regrid(
@@ -796,6 +847,9 @@ class AMRHierarchy:
         total = 0.0
         for patch in self.local_patches:
             array = patch.field(name)
+            # a replicated field (split=None): every rank of the patch holds it all
+            if not array.layout.split and patch.comm.Get_rank() != 0:
+                continue
             # this rank's block, in the patch's level indices
             block = tuple(
                 (lo + b0, lo + b1)

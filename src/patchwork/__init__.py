@@ -15,6 +15,7 @@ from patchwork.nodal import (
 )
 from patchwork.plotting import plot_patches
 from patchwork.poisson import solve_poisson
+from patchwork.reflux import FluxRegister
 from patchwork.regrid import cluster, function_tags, gradient_tags
 
 # patchwork's profiling regions are off unless an application enables the tag
@@ -30,6 +31,7 @@ __all__ = [
     "Dirichlet",
     "EmbeddedDirichlet",
     "EmbeddedFloating",
+    "FluxRegister",
     "IndexBox",
     "Neumann",
     "NodalPoisson",
