@@ -61,6 +61,14 @@ def has_petsc() -> bool:
     return True
 
 
+def _has_package(PETSc: Any, name: str) -> bool:  # noqa: N803
+    """Whether PETSc was built with an external package (e.g. ``"hypre"``)."""
+    try:
+        return bool(PETSc.Sys.hasExternalPackage(name))
+    except AttributeError:  # an older petsc4py
+        return False
+
+
 class PetscSystem:
     """Rows of a square sparse system on every rank, solved together with PETSc.
 
@@ -76,6 +84,27 @@ class PetscSystem:
         iterations: The Krylov iterations of the last solve.
         fell_back: Whether the last solve needed the fallback solver.
     """
+
+    def _solver(self, defaults: dict[str, Any], options: dict[str, Any]) -> Any:
+        """A KSP from the defaults, the options database and ``options``, set up."""
+        PETSc = petsc()  # noqa: N806
+        database = PETSc.Options()
+        added = []
+        for key, value in {**defaults, **options}.items():
+            name = self._prefix + key
+            # the command line overrides the defaults, `options` override both
+            if key in options or not database.hasName(name):
+                database.setValue(name, value)
+                added.append(name)
+        ksp = PETSc.KSP().create(comm=self.comm)
+        ksp.setOptionsPrefix(self._prefix)
+        ksp.setOperators(self.matrix)
+        ksp.setFromOptions()
+        for name in added:
+            database.delValue(name)
+        ksp.setInitialGuessNonzero(True)
+        ksp.setUp()
+        return ksp
 
     @sp.profile("patchwork.petsc_setup", tags=PROFILE_TAGS)
     def __init__(
@@ -134,27 +163,6 @@ class PetscSystem:
         self.iterations = 0
         self.fell_back = False
 
-    def _solver(self, defaults: dict[str, Any], options: dict[str, Any]) -> Any:
-        """A KSP from the defaults, the options database and ``options``, set up."""
-        PETSc = petsc()  # noqa: N806
-        database = PETSc.Options()
-        added = []
-        for key, value in {**defaults, **options}.items():
-            name = self._prefix + key
-            # the command line overrides the defaults, `options` override both
-            if key in options or not database.hasName(name):
-                database.setValue(name, value)
-                added.append(name)
-        ksp = PETSc.KSP().create(comm=self.comm)
-        ksp.setOptionsPrefix(self._prefix)
-        ksp.setOperators(self.matrix)
-        ksp.setFromOptions()
-        for name in added:
-            database.delValue(name)
-        ksp.setInitialGuessNonzero(True)
-        ksp.setUp()
-        return ksp
-
     def reset(self) -> None:
         """Start the next solve from zero instead of the previous solution."""
         self._x.set(0.0)
@@ -185,11 +193,3 @@ class PetscSystem:
             self.iterations = self.ksp.getIterationNumber()
         self._gather.scatter(self._x, self._everywhere)
         return self._everywhere.getArray().copy()
-
-
-def _has_package(PETSc: Any, name: str) -> bool:  # noqa: N803
-    """Whether PETSc was built with an external package (e.g. ``"hypre"``)."""
-    try:
-        return bool(PETSc.Sys.hasExternalPackage(name))
-    except AttributeError:  # an older petsc4py
-        return False

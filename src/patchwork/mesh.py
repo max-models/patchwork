@@ -274,6 +274,59 @@ class AMRHierarchy:
     unit area of the planes normal to ``x``. The r–z plane is 2D only.
     """
 
+    def _communicator(self, ranks: tuple[int, ...]) -> Any:
+        """The communicator of a group of ranks; ``None`` on a rank outside it.
+
+        Collective for a group that is neither one rank nor all of them (a
+        split of the hierarchy's communicator), the first time the group is used.
+        """
+        if len(ranks) == self.comm.Get_size():
+            return self.comm
+        if ranks not in self._communicators:
+            rank = self.comm.Get_rank()
+            if len(ranks) == 1:
+                group = MPI.COMM_SELF if rank == ranks[0] else None
+            else:
+                member = rank in ranks
+                group = self.comm.Split(color=0 if member else MPI.UNDEFINED, key=rank)
+                if not member:
+                    group = None
+            self._communicators[ranks] = group
+        return self._communicators[ranks]
+
+    def _new_patch(
+        self, level: int, box: IndexBox, ranks: int | Sequence[int] | None
+    ) -> Patch:
+        """A patch on ``ranks`` (or where ``placement`` puts it), with its communicator."""
+        size = self.comm.Get_size()
+        cells = _shared_cells(box, box)
+        if ranks is None and callable(self.placement):
+            ranks = self.placement(level, box)
+        if ranks is None:
+            if self.placement == "all":
+                chosen = tuple(range(size))
+            else:
+                limit = self.max_cells_per_rank
+                wanted = 1 if limit is None else min(size, max(1, -(-cells // limit)))
+                least_loaded = sorted(
+                    range(size), key=lambda r: (self._cells_on_rank[r], r)
+                )
+                chosen = tuple(sorted(least_loaded[:wanted]))
+        else:
+            listed = [ranks] if isinstance(ranks, int) else list(ranks)
+            chosen = tuple(sorted({int(rank) for rank in listed}))
+            if not chosen or len(chosen) != len(listed):
+                raise ValueError(f"ranks must be distinct and not empty, got {ranks!r}")
+            if chosen[0] < 0 or chosen[-1] >= size:
+                raise ValueError(
+                    f"ranks {chosen} are not all ranks of a communicator of {size}"
+                )
+        for rank in chosen:
+            self._cells_on_rank[rank] += cells / len(chosen)
+        return Patch(
+            level=level, box=box, ranks=chosen, comm=self._communicator(chosen)
+        )
+
     def __init__(
         self,
         base_shape: tuple[int, ...],
@@ -475,59 +528,6 @@ class AMRHierarchy:
         """Patches on one level."""
         return tuple(p for p in self.patches if p.level == level)
 
-    def _new_patch(
-        self, level: int, box: IndexBox, ranks: int | Sequence[int] | None
-    ) -> Patch:
-        """A patch on ``ranks`` (or where ``placement`` puts it), with its communicator."""
-        size = self.comm.Get_size()
-        cells = _shared_cells(box, box)
-        if ranks is None and callable(self.placement):
-            ranks = self.placement(level, box)
-        if ranks is None:
-            if self.placement == "all":
-                chosen = tuple(range(size))
-            else:
-                limit = self.max_cells_per_rank
-                wanted = 1 if limit is None else min(size, max(1, -(-cells // limit)))
-                least_loaded = sorted(
-                    range(size), key=lambda r: (self._cells_on_rank[r], r)
-                )
-                chosen = tuple(sorted(least_loaded[:wanted]))
-        else:
-            listed = [ranks] if isinstance(ranks, int) else list(ranks)
-            chosen = tuple(sorted({int(rank) for rank in listed}))
-            if not chosen or len(chosen) != len(listed):
-                raise ValueError(f"ranks must be distinct and not empty, got {ranks!r}")
-            if chosen[0] < 0 or chosen[-1] >= size:
-                raise ValueError(
-                    f"ranks {chosen} are not all ranks of a communicator of {size}"
-                )
-        for rank in chosen:
-            self._cells_on_rank[rank] += cells / len(chosen)
-        return Patch(
-            level=level, box=box, ranks=chosen, comm=self._communicator(chosen)
-        )
-
-    def _communicator(self, ranks: tuple[int, ...]) -> Any:
-        """The communicator of a group of ranks; ``None`` on a rank outside it.
-
-        Collective for a group that is neither one rank nor all of them (a
-        split of the hierarchy's communicator), the first time the group is used.
-        """
-        if len(ranks) == self.comm.Get_size():
-            return self.comm
-        if ranks not in self._communicators:
-            rank = self.comm.Get_rank()
-            if len(ranks) == 1:
-                group = MPI.COMM_SELF if rank == ranks[0] else None
-            else:
-                member = rank in ranks
-                group = self.comm.Split(color=0 if member else MPI.UNDEFINED, key=rank)
-                if not member:
-                    group = None
-            self._communicators[ranks] = group
-        return self._communicators[ranks]
-
     @property
     def local_patches(self) -> tuple[Patch, ...]:
         """The patches this rank holds a part of, ordered as :attr:`patches`."""
@@ -561,6 +561,17 @@ class AMRHierarchy:
         if rank == root:
             return self.comm.recv(source=holder, tag=_GATHER_TAG)
         return None
+
+    def _zeros(self, patch: Patch, spec: dict[str, Any]) -> DistributedArray:
+        """A zero array for one patch of a field with allocation ``spec``."""
+        shape = patch.node_shape if spec["centering"] == "node" else patch.shape
+        return mpa.zeros(
+            shape,
+            dtype=spec["dtype"],
+            split=spec["split"],
+            halo=spec["halo"],
+            comm=patch.comm,
+        )
 
     def add_patch(
         self,
@@ -616,17 +627,6 @@ class AMRHierarchy:
         self._patches.append(patch)
         return patch
 
-    def _zeros(self, patch: Patch, spec: dict[str, Any]) -> DistributedArray:
-        """A zero array for one patch of a field with allocation ``spec``."""
-        shape = patch.node_shape if spec["centering"] == "node" else patch.shape
-        return mpa.zeros(
-            shape,
-            dtype=spec["dtype"],
-            split=spec["split"],
-            halo=spec["halo"],
-            comm=patch.comm,
-        )
-
     def centering(self, name: str) -> str:
         """``"cell"`` or ``"node"``: where the values of field ``name`` sit."""
         try:
@@ -677,6 +677,15 @@ class AMRHierarchy:
         for patch in self._patches:
             if patch.is_local:
                 patch._fields[name] = arrays[id(patch)]
+
+    def _schedule(self, kind: str, name: str, build: Any) -> Any:
+        if name not in self._field_specs:
+            raise KeyError(f"hierarchy has no field {name!r}")
+        key = (kind, name)
+        if key not in self._schedules:
+            with sp.region("patchwork.build_schedule", tags=PROFILE_TAGS):
+                self._schedules[key] = build(self, name)
+        return self._schedules[key]
 
     @sp.profile("patchwork.exchange_halos", tags=PROFILE_TAGS)
     def exchange_halos(
@@ -1225,15 +1234,6 @@ class AMRHierarchy:
         from patchwork.accumulate import Accumulation
 
         self._schedule("accumulate", name, Accumulation).execute()
-
-    def _schedule(self, kind: str, name: str, build: Any) -> Any:
-        if name not in self._field_specs:
-            raise KeyError(f"hierarchy has no field {name!r}")
-        key = (kind, name)
-        if key not in self._schedules:
-            with sp.region("patchwork.build_schedule", tags=PROFILE_TAGS):
-                self._schedules[key] = build(self, name)
-        return self._schedules[key]
 
     def __iter__(self) -> Iterator[Patch]:
         """Iterate through patches in level order."""

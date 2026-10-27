@@ -166,6 +166,65 @@ class Accumulation:
                 self._local[number] = (array, offset)
         self._serial: tuple[list, list, list] | None = None
 
+    def _serial_plan(self) -> tuple[list, list, list]:
+        """The halo frames, the copies that move and their owners, for one rank."""
+        halos = []
+        for patch in self._hierarchy.local_patches:
+            array = patch.field(self._name)
+            storage = array.local_with_halos
+            halo = array.layout.halo
+            frame = []
+            for axis, width in enumerate(halo):
+                if width:
+                    before = (slice(None),) * axis
+                    frame.append((*before, slice(0, width)))
+                    frame.append((*before, slice(storage.shape[axis] - width, None)))
+            halos.append((array, frame))
+        moves, owners, nodes = [], [], []
+        for move in self._moves:
+            moves.append((move["array"], move["storage"]))
+            owners.append(move["owner"])
+            nodes.append(move["node"])
+        targets = []
+        if moves:
+            owner = np.concatenate(owners)
+            node = [
+                np.concatenate([at[axis] for at in nodes])
+                for axis in range(self._hierarchy.ndim)
+            ]
+            for held in np.unique(owner):
+                array, offset = self._local[int(held)]
+                chosen = np.flatnonzero(owner == held)
+                where = tuple(
+                    values[chosen] + o for values, o in zip(node, offset, strict=True)
+                )
+                targets.append((array, where, chosen))
+        return halos, moves, targets
+
+    def _execute_serial(self) -> None:
+        """:meth:`execute` on one rank: every patch is one block, nothing to send.
+
+        The halos of a block that is a whole patch are dropped (as mpiarray's
+        ``accumulate_halos`` does at the edges of a patch), and the charge of the
+        copies goes straight into the owner copies, along paths found at the first
+        call.
+        """
+        if self._serial is None:
+            self._serial = self._serial_plan()
+        halos, moves, targets = self._serial
+        for array, frame in halos:
+            storage = array.local_with_halos
+            for part in frame:
+                storage[part] = 0.0
+        charges = []
+        for array, where in moves:
+            storage = array.local_with_halos
+            charges.append(storage[where])
+            storage[where] = 0.0  # the copy is emptied before the sum is made
+        charge = np.concatenate(charges) if charges else np.empty(0)
+        for array, where, chosen in targets:
+            np.add.at(array.local_with_halos, where, charge[chosen])
+
     def execute(self) -> None:
         """Add the halos and move the charge. Collective over the hierarchy's communicator."""
         if self._hierarchy.comm.Get_size() == 1:
@@ -207,62 +266,3 @@ class Accumulation:
                 ),
                 values[chosen],
             )
-
-    def _execute_serial(self) -> None:
-        """:meth:`execute` on one rank: every patch is one block, nothing to send.
-
-        The halos of a block that is a whole patch are dropped (as mpiarray's
-        ``accumulate_halos`` does at the edges of a patch), and the charge of the
-        copies goes straight into the owner copies, along paths found at the first
-        call.
-        """
-        if self._serial is None:
-            self._serial = self._serial_plan()
-        halos, moves, targets = self._serial
-        for array, frame in halos:
-            storage = array.local_with_halos
-            for part in frame:
-                storage[part] = 0.0
-        charges = []
-        for array, where in moves:
-            storage = array.local_with_halos
-            charges.append(storage[where])
-            storage[where] = 0.0  # the copy is emptied before the sum is made
-        charge = np.concatenate(charges) if charges else np.empty(0)
-        for array, where, chosen in targets:
-            np.add.at(array.local_with_halos, where, charge[chosen])
-
-    def _serial_plan(self) -> tuple[list, list, list]:
-        """The halo frames, the copies that move and their owners, for one rank."""
-        halos = []
-        for patch in self._hierarchy.local_patches:
-            array = patch.field(self._name)
-            storage = array.local_with_halos
-            halo = array.layout.halo
-            frame = []
-            for axis, width in enumerate(halo):
-                if width:
-                    before = (slice(None),) * axis
-                    frame.append((*before, slice(0, width)))
-                    frame.append((*before, slice(storage.shape[axis] - width, None)))
-            halos.append((array, frame))
-        moves, owners, nodes = [], [], []
-        for move in self._moves:
-            moves.append((move["array"], move["storage"]))
-            owners.append(move["owner"])
-            nodes.append(move["node"])
-        targets = []
-        if moves:
-            owner = np.concatenate(owners)
-            node = [
-                np.concatenate([at[axis] for at in nodes])
-                for axis in range(self._hierarchy.ndim)
-            ]
-            for held in np.unique(owner):
-                array, offset = self._local[int(held)]
-                chosen = np.flatnonzero(owner == held)
-                where = tuple(
-                    values[chosen] + o for values, o in zip(node, offset, strict=True)
-                )
-                targets.append((array, where, chosen))
-        return halos, moves, targets

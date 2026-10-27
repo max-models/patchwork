@@ -140,93 +140,6 @@ class CompositeNodes:
             ``u`` from the others (which it leaves unchanged).
     """
 
-    @sp.profile("patchwork.composite_nodes", tags=PROFILE_TAGS)
-    def __init__(self, hierarchy: AMRHierarchy) -> None:
-        """Number the nodes of ``hierarchy`` and find its leaf cells and hanging nodes."""
-        self.hierarchy = hierarchy
-        ratio = hierarchy.refinement_ratio
-        finest = hierarchy.max_level
-        self.ndim = ndim = hierarchy.ndim
-        self._finest = finest
-        self._cells = np.asarray(hierarchy.level_shape(finest), dtype=np.int64)
-        self._periodic = tuple(hierarchy.periodic)
-        self._spacing = np.asarray(hierarchy.spacing(finest), dtype=float)
-        self._origin = np.asarray(hierarchy.lower_bound, dtype=float)
-
-        lowers, spans, owners = [], [], []
-        for patch in hierarchy.patches:
-            span = ratio ** (finest - patch.level)
-            covered = np.zeros(patch.shape, dtype=bool)
-            for child in hierarchy.patches_at_level(patch.level + 1):
-                # a finer patch may lie over several patches of this level
-                covered[
-                    tuple(
-                        slice(
-                            max(c0 // ratio, i0) - i0, max(min(c1 // ratio, i1) - i0, 0)
-                        )
-                        for (c0, c1), (i0, i1) in zip(child.box, patch.box, strict=True)
-                    )
-                ] = True
-            index = np.nonzero(~covered)
-            lowers.append(
-                np.column_stack(
-                    [
-                        (values + i0) * span
-                        for values, (i0, _) in zip(index, patch.box, strict=True)
-                    ]
-                )
-            )
-            spans.append(np.full(index[0].size, span, dtype=np.int64))
-            # a patch on several ranks: its rows of cells split over them as
-            # its arrays are (near-even, along the first axis)
-            chunks = np.array_split(np.arange(patch.shape[0]), len(patch.ranks))
-            row_rank = np.concatenate(
-                [
-                    np.full(chunk.size, rank, dtype=np.int64)
-                    for chunk, rank in zip(chunks, patch.ranks, strict=True)
-                ]
-            )
-            owners.append(row_rank[index[0]])
-        self.cell_lower = np.concatenate(lowers)
-        self.cell_span = np.concatenate(spans)
-        self.cell_ranks = np.concatenate(owners)
-
-        offsets = _corner_offsets(ndim)
-        corners = (
-            self.cell_lower[:, None, :] + self.cell_span[:, None, None] * offsets
-        )  # (m, 2**ndim, ndim)
-        keys = self._key(*(corners[..., axis] for axis in range(ndim)))
-        self._keys, self.cell_corners = np.unique(keys, return_inverse=True)
-        self.cell_corners = self.cell_corners.reshape(keys.shape)
-        self.num_nodes = int(self._keys.size)
-        self.lattice = np.column_stack(
-            np.unravel_index(self._keys, tuple(int(n) + 1 for n in self._cells))
-        )
-        self.coordinates = self._origin + self.lattice * self._spacing
-
-        size = (
-            self.cell_span[:, None] * self._spacing
-        )  # (m, ndim) physical edge lengths
-        self.cell_size = size
-        self.node_ranks = np.full(self.num_nodes, np.iinfo(np.int64).max)
-        np.minimum.at(
-            self.node_ranks,
-            self.cell_corners.reshape(-1),
-            np.repeat(self.cell_ranks, 2**ndim),
-        )
-        self.volumes = np.zeros(self.num_nodes)
-        np.add.at(
-            self.volumes,
-            self.cell_corners.reshape(-1),
-            np.repeat(np.prod(size, axis=1) / 2**ndim, 2**ndim),
-        )
-        self._find_hanging_nodes()
-        self._leaf_map: np.ndarray | None = None
-        self._patch_nodes: dict[tuple, np.ndarray] = {}
-        self._reads: list | None = None
-        self._outside: dict[int, np.ndarray | None] = {}
-        self._find_boundary()
-
     # Construction -------------------------------------------------------------#
     def _key(self, *index: np.ndarray) -> np.ndarray:
         """One integer per finest-lattice point, the same for periodic images.
@@ -317,6 +230,162 @@ class CompositeNodes:
             raise RuntimeError("the hanging-node constraints do not close")
         self.reduction = reduction
 
+    def _leaf_cells(self) -> np.ndarray:
+        """The leaf cell that covers every cell of the finest lattice."""
+        if self._leaf_map is None:
+            ndim = self.ndim
+            leaf = np.full(tuple(self._cells), -1, dtype=np.int64)
+            for span in np.unique(self.cell_span):
+                cells = np.nonzero(self.cell_span == span)[0]
+                offsets = np.arange(int(span))
+                index = []
+                for axis in range(ndim):
+                    # the cells along the first axis, the span along each axis after
+                    shape = [1] * (ndim + 1)
+                    shape[axis + 1] = int(span)
+                    index.append(
+                        self.cell_lower[cells, axis].reshape(-1, *[1] * ndim)
+                        + offsets.reshape(shape)
+                    )
+                leaf[tuple(index)] = cells.reshape(-1, *[1] * ndim)
+            self._leaf_map = leaf
+        return self._leaf_map
+
+    # The boundary ----------------------------------------------------------------#
+    def _find_boundary(self) -> None:
+        """Find the cell edges on the boundary of the domain and name their face.
+
+        An edge of a leaf cell is on the boundary if there is no cell beyond
+        it: on a face of the bounding rectangle (``"x_lower"``, ...), or inside
+        the rectangle where the domain does not fill it (``"inner"``). In 1D
+        the "edge" is the cell's end node, of measure 1 (per unit area).
+        """
+        leaf = self._leaf_cells()
+        faces = faces_of(self.ndim)
+        edges = {face: ([], [], [], []) for face in (*faces, INNER)}
+        offsets = _corner_offsets(self.ndim)
+        centre = self.cell_lower + 0.5 * self.cell_span[:, None]
+        for face, (axis, side) in faces.items():
+            beyond = self.cell_lower[:, axis] + (self.cell_span if side else -1)
+            at_rectangle = (beyond < 0) | (beyond >= self._cells[axis])
+            if self._periodic[axis]:
+                beyond = beyond % self._cells[axis]
+                at_rectangle[:] = False
+            where = [self.cell_lower[:, a] for a in range(self.ndim)]
+            where[axis] = np.clip(beyond, 0, self._cells[axis] - 1)
+            outside = at_rectangle | (leaf[tuple(where)] < 0)
+            midpoint = centre.copy()
+            midpoint[:, axis] += (0.5 if side else -0.5) * self.cell_span
+            # the corners on that side of a cell: its two ends (lower-left
+            # first), one node twice in 1D
+            on_side = np.flatnonzero(offsets[:, axis] == side)
+            first, second = on_side[0], on_side[-1]
+            measure = np.prod(np.delete(self.cell_size, axis, axis=1), axis=1)
+            for name, cells in (
+                (face, np.nonzero(outside & at_rectangle)[0]),
+                (INNER, np.nonzero(outside & ~at_rectangle)[0]),
+            ):
+                edges[name][0].append(self.cell_corners[cells, first])
+                edges[name][1].append(self.cell_corners[cells, second])
+                edges[name][2].append(measure[cells])
+                edges[name][3].append(self._origin + midpoint[cells] * self._spacing)
+        self._boundary = {
+            face: (
+                np.concatenate(first),
+                np.concatenate(second),
+                np.concatenate(length),
+                np.concatenate(midpoint),
+            )
+            for face, (first, second, length, midpoint) in edges.items()
+        }
+
+    @sp.profile("patchwork.composite_nodes", tags=PROFILE_TAGS)
+    def __init__(self, hierarchy: AMRHierarchy) -> None:
+        """Number the nodes of ``hierarchy`` and find its leaf cells and hanging nodes."""
+        self.hierarchy = hierarchy
+        ratio = hierarchy.refinement_ratio
+        finest = hierarchy.max_level
+        self.ndim = ndim = hierarchy.ndim
+        self._finest = finest
+        self._cells = np.asarray(hierarchy.level_shape(finest), dtype=np.int64)
+        self._periodic = tuple(hierarchy.periodic)
+        self._spacing = np.asarray(hierarchy.spacing(finest), dtype=float)
+        self._origin = np.asarray(hierarchy.lower_bound, dtype=float)
+
+        lowers, spans, owners = [], [], []
+        for patch in hierarchy.patches:
+            span = ratio ** (finest - patch.level)
+            covered = np.zeros(patch.shape, dtype=bool)
+            for child in hierarchy.patches_at_level(patch.level + 1):
+                # a finer patch may lie over several patches of this level
+                covered[
+                    tuple(
+                        slice(
+                            max(c0 // ratio, i0) - i0, max(min(c1 // ratio, i1) - i0, 0)
+                        )
+                        for (c0, c1), (i0, i1) in zip(child.box, patch.box, strict=True)
+                    )
+                ] = True
+            index = np.nonzero(~covered)
+            lowers.append(
+                np.column_stack(
+                    [
+                        (values + i0) * span
+                        for values, (i0, _) in zip(index, patch.box, strict=True)
+                    ]
+                )
+            )
+            spans.append(np.full(index[0].size, span, dtype=np.int64))
+            # a patch on several ranks: its rows of cells split over them as
+            # its arrays are (near-even, along the first axis)
+            chunks = np.array_split(np.arange(patch.shape[0]), len(patch.ranks))
+            row_rank = np.concatenate(
+                [
+                    np.full(chunk.size, rank, dtype=np.int64)
+                    for chunk, rank in zip(chunks, patch.ranks, strict=True)
+                ]
+            )
+            owners.append(row_rank[index[0]])
+        self.cell_lower = np.concatenate(lowers)
+        self.cell_span = np.concatenate(spans)
+        self.cell_ranks = np.concatenate(owners)
+
+        offsets = _corner_offsets(ndim)
+        corners = (
+            self.cell_lower[:, None, :] + self.cell_span[:, None, None] * offsets
+        )  # (m, 2**ndim, ndim)
+        keys = self._key(*(corners[..., axis] for axis in range(ndim)))
+        self._keys, self.cell_corners = np.unique(keys, return_inverse=True)
+        self.cell_corners = self.cell_corners.reshape(keys.shape)
+        self.num_nodes = int(self._keys.size)
+        self.lattice = np.column_stack(
+            np.unravel_index(self._keys, tuple(int(n) + 1 for n in self._cells))
+        )
+        self.coordinates = self._origin + self.lattice * self._spacing
+
+        size = (
+            self.cell_span[:, None] * self._spacing
+        )  # (m, ndim) physical edge lengths
+        self.cell_size = size
+        self.node_ranks = np.full(self.num_nodes, np.iinfo(np.int64).max)
+        np.minimum.at(
+            self.node_ranks,
+            self.cell_corners.reshape(-1),
+            np.repeat(self.cell_ranks, 2**ndim),
+        )
+        self.volumes = np.zeros(self.num_nodes)
+        np.add.at(
+            self.volumes,
+            self.cell_corners.reshape(-1),
+            np.repeat(np.prod(size, axis=1) / 2**ndim, 2**ndim),
+        )
+        self._find_hanging_nodes()
+        self._leaf_map: np.ndarray | None = None
+        self._patch_nodes: dict[tuple, np.ndarray] = {}
+        self._reads: list | None = None
+        self._outside: dict[int, np.ndarray | None] = {}
+        self._find_boundary()
+
     # Patches -------------------------------------------------------------------#
     def patch_nodes(self, patch: Patch) -> np.ndarray:
         """Node numbers of the nodes of ``patch``, in its node shape (read-only).
@@ -394,54 +463,6 @@ class CompositeNodes:
                 data = hierarchy.gather(patch, name)
             values[nodes] = data[index]
         return values
-
-    # The boundary ----------------------------------------------------------------#
-    def _find_boundary(self) -> None:
-        """Find the cell edges on the boundary of the domain and name their face.
-
-        An edge of a leaf cell is on the boundary if there is no cell beyond
-        it: on a face of the bounding rectangle (``"x_lower"``, ...), or inside
-        the rectangle where the domain does not fill it (``"inner"``). In 1D
-        the "edge" is the cell's end node, of measure 1 (per unit area).
-        """
-        leaf = self._leaf_cells()
-        faces = faces_of(self.ndim)
-        edges = {face: ([], [], [], []) for face in (*faces, INNER)}
-        offsets = _corner_offsets(self.ndim)
-        centre = self.cell_lower + 0.5 * self.cell_span[:, None]
-        for face, (axis, side) in faces.items():
-            beyond = self.cell_lower[:, axis] + (self.cell_span if side else -1)
-            at_rectangle = (beyond < 0) | (beyond >= self._cells[axis])
-            if self._periodic[axis]:
-                beyond = beyond % self._cells[axis]
-                at_rectangle[:] = False
-            where = [self.cell_lower[:, a] for a in range(self.ndim)]
-            where[axis] = np.clip(beyond, 0, self._cells[axis] - 1)
-            outside = at_rectangle | (leaf[tuple(where)] < 0)
-            midpoint = centre.copy()
-            midpoint[:, axis] += (0.5 if side else -0.5) * self.cell_span
-            # the corners on that side of a cell: its two ends (lower-left
-            # first), one node twice in 1D
-            on_side = np.flatnonzero(offsets[:, axis] == side)
-            first, second = on_side[0], on_side[-1]
-            measure = np.prod(np.delete(self.cell_size, axis, axis=1), axis=1)
-            for name, cells in (
-                (face, np.nonzero(outside & at_rectangle)[0]),
-                (INNER, np.nonzero(outside & ~at_rectangle)[0]),
-            ):
-                edges[name][0].append(self.cell_corners[cells, first])
-                edges[name][1].append(self.cell_corners[cells, second])
-                edges[name][2].append(measure[cells])
-                edges[name][3].append(self._origin + midpoint[cells] * self._spacing)
-        self._boundary = {
-            face: (
-                np.concatenate(first),
-                np.concatenate(second),
-                np.concatenate(length),
-                np.concatenate(midpoint),
-            )
-            for face, (first, second, length, midpoint) in edges.items()
-        }
 
     def face_edges(
         self, face: str
@@ -538,27 +559,6 @@ class CompositeNodes:
         )
         matrix.eliminate_zeros()
         return matrix
-
-    def _leaf_cells(self) -> np.ndarray:
-        """The leaf cell that covers every cell of the finest lattice."""
-        if self._leaf_map is None:
-            ndim = self.ndim
-            leaf = np.full(tuple(self._cells), -1, dtype=np.int64)
-            for span in np.unique(self.cell_span):
-                cells = np.nonzero(self.cell_span == span)[0]
-                offsets = np.arange(int(span))
-                index = []
-                for axis in range(ndim):
-                    # the cells along the first axis, the span along each axis after
-                    shape = [1] * (ndim + 1)
-                    shape[axis + 1] = int(span)
-                    index.append(
-                        self.cell_lower[cells, axis].reshape(-1, *[1] * ndim)
-                        + offsets.reshape(shape)
-                    )
-                leaf[tuple(index)] = cells.reshape(-1, *[1] * ndim)
-            self._leaf_map = leaf
-        return self._leaf_map
 
     def evaluation(self, points: np.ndarray) -> sparse.csr_matrix:
         """The composite interpolant at ``points`` ``(ndim, k)``: a ``(k, n)`` matrix.
@@ -710,95 +710,6 @@ class CompositeNodes:
         )
         return self.evaluation(points)
 
-    def sample_patches(
-        self,
-        arrays: Sequence[np.ndarray],
-        level: int | None = None,
-        out: np.ndarray | None = None,
-    ) -> np.ndarray:
-        """Patch-wise node fields on a level's lattice over the whole domain.
-
-        For fields that are computed patch by patch and are not one composite
-        function, such as a gradient. ``arrays`` holds one array per patch, in
-        the order of ``hierarchy.patches``, each of the patch's ``node_shape``
-        (further axes, e.g. vector components, are carried along). Every node
-        of the lattice of ``level`` (the finest by default) takes its value from
-        the finest patch whose nodes surround it, a patch's own boundary nodes
-        included: by bilinear interpolation between the nodes of a coarser
-        patch, and directly from the coinciding node of a finer one. Nodes
-        outside a domain that does not fill its rectangle are zero.
-
-        Returns an array of :meth:`level_shape` plus the further axes, ``out``
-        if given.
-        """
-        level = self._finest if level is None else level
-        ndim = self.ndim
-        patches = self.hierarchy.patches
-        if len(arrays) != len(patches):
-            raise ValueError(f"expected {len(patches)} patch arrays, got {len(arrays)}")
-        arrays = [np.asarray(array) for array in arrays]
-        for patch, array in zip(patches, arrays, strict=True):
-            if array.shape[:ndim] != patch.node_shape:
-                raise ValueError(
-                    f"a level-{patch.level} patch needs an array of "
-                    f"{patch.node_shape} nodes, got {array.shape[:ndim]}"
-                )
-        extra = arrays[0].shape[ndim:]
-        if out is None:
-            out = np.empty((*self.level_shape(level), *extra), dtype=arrays[0].dtype)
-        if not extra:
-            out[...] = self._sample_scalar(arrays, level)
-            return out
-        # one component at a time: loops over a short last axis are slow
-        components = out.reshape(*out.shape[:ndim], -1)
-        for number in range(components.shape[-1]):
-            components[..., number] = self._sample_scalar(
-                [
-                    array.reshape(*array.shape[:ndim], -1)[..., number]
-                    for array in arrays
-                ],
-                level,
-            )
-        return out
-
-    def _sample_scalar(self, arrays: Sequence[np.ndarray], level: int) -> np.ndarray:
-        """:meth:`sample_patches` of one value per node."""
-        ratio = self.hierarchy.refinement_ratio
-        patches = self.hierarchy.patches
-        # zero where the domain does not fill its rectangle
-        current = np.zeros(self.level_shape(0), dtype=arrays[0].dtype)
-        for depth in range(level + 1):
-            if depth:
-                for axis in range(self.ndim):
-                    current = self._refine(current, axis, ratio)
-            for patch, array in zip(patches, arrays, strict=True):
-                if patch.level != depth:
-                    continue
-                where, source = [], []
-                for axis, (lo, hi) in enumerate(patch.box):
-                    # on a periodic axis the lattice has no copy of its first node
-                    stop = min(hi + 1, current.shape[axis])
-                    where.append(slice(lo, stop))
-                    source.append(slice(0, stop - lo))
-                current[tuple(where)] = array[tuple(source)]
-        for patch, array in zip(patches, arrays, strict=True):
-            if patch.level <= level:
-                continue
-            # a finer patch: its nodes that are nodes of this lattice too
-            stride = ratio ** (patch.level - level)
-            where, source = [], []
-            for axis, (lo, hi) in enumerate(patch.box):
-                first = (-lo) % stride
-                start = (lo + first) // stride
-                stop = min(hi // stride + 1, current.shape[axis])
-                where.append(slice(start, stop))
-                source.append(slice(first, first + (stop - start) * stride, stride))
-            current[tuple(where)] = array[tuple(source)]
-        outside = self._nodes_outside(level)
-        if outside is not None:
-            current[outside] = 0
-        return current
-
     def _nodes_outside(self, level: int) -> np.ndarray | None:
         """The nodes of a level's lattice outside the domain; None if there are none."""
         if level not in self._outside:
@@ -867,6 +778,95 @@ class CompositeNodes:
                 ] + weight * array[along(0)]
         return fine
 
+    def _sample_scalar(self, arrays: Sequence[np.ndarray], level: int) -> np.ndarray:
+        """:meth:`sample_patches` of one value per node."""
+        ratio = self.hierarchy.refinement_ratio
+        patches = self.hierarchy.patches
+        # zero where the domain does not fill its rectangle
+        current = np.zeros(self.level_shape(0), dtype=arrays[0].dtype)
+        for depth in range(level + 1):
+            if depth:
+                for axis in range(self.ndim):
+                    current = self._refine(current, axis, ratio)
+            for patch, array in zip(patches, arrays, strict=True):
+                if patch.level != depth:
+                    continue
+                where, source = [], []
+                for axis, (lo, hi) in enumerate(patch.box):
+                    # on a periodic axis the lattice has no copy of its first node
+                    stop = min(hi + 1, current.shape[axis])
+                    where.append(slice(lo, stop))
+                    source.append(slice(0, stop - lo))
+                current[tuple(where)] = array[tuple(source)]
+        for patch, array in zip(patches, arrays, strict=True):
+            if patch.level <= level:
+                continue
+            # a finer patch: its nodes that are nodes of this lattice too
+            stride = ratio ** (patch.level - level)
+            where, source = [], []
+            for axis, (lo, hi) in enumerate(patch.box):
+                first = (-lo) % stride
+                start = (lo + first) // stride
+                stop = min(hi // stride + 1, current.shape[axis])
+                where.append(slice(start, stop))
+                source.append(slice(first, first + (stop - start) * stride, stride))
+            current[tuple(where)] = array[tuple(source)]
+        outside = self._nodes_outside(level)
+        if outside is not None:
+            current[outside] = 0
+        return current
+
+    def sample_patches(
+        self,
+        arrays: Sequence[np.ndarray],
+        level: int | None = None,
+        out: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Patch-wise node fields on a level's lattice over the whole domain.
+
+        For fields that are computed patch by patch and are not one composite
+        function, such as a gradient. ``arrays`` holds one array per patch, in
+        the order of ``hierarchy.patches``, each of the patch's ``node_shape``
+        (further axes, e.g. vector components, are carried along). Every node
+        of the lattice of ``level`` (the finest by default) takes its value from
+        the finest patch whose nodes surround it, a patch's own boundary nodes
+        included: by bilinear interpolation between the nodes of a coarser
+        patch, and directly from the coinciding node of a finer one. Nodes
+        outside a domain that does not fill its rectangle are zero.
+
+        Returns an array of :meth:`level_shape` plus the further axes, ``out``
+        if given.
+        """
+        level = self._finest if level is None else level
+        ndim = self.ndim
+        patches = self.hierarchy.patches
+        if len(arrays) != len(patches):
+            raise ValueError(f"expected {len(patches)} patch arrays, got {len(arrays)}")
+        arrays = [np.asarray(array) for array in arrays]
+        for patch, array in zip(patches, arrays, strict=True):
+            if array.shape[:ndim] != patch.node_shape:
+                raise ValueError(
+                    f"a level-{patch.level} patch needs an array of "
+                    f"{patch.node_shape} nodes, got {array.shape[:ndim]}"
+                )
+        extra = arrays[0].shape[ndim:]
+        if out is None:
+            out = np.empty((*self.level_shape(level), *extra), dtype=arrays[0].dtype)
+        if not extra:
+            out[...] = self._sample_scalar(arrays, level)
+            return out
+        # one component at a time: loops over a short last axis are slow
+        components = out.reshape(*out.shape[:ndim], -1)
+        for number in range(components.shape[-1]):
+            components[..., number] = self._sample_scalar(
+                [
+                    array.reshape(*array.shape[:ndim], -1)[..., number]
+                    for array in arrays
+                ],
+                level,
+            )
+        return out
+
 
 class NodalPoisson:
     r"""Solve :math:`-\nabla^2\phi = f` on the nodes of a patch hierarchy.
@@ -903,53 +903,6 @@ class NodalPoisson:
             order with PETSc).
         system: The :class:`PetscSystem` (PETSc backend), else ``None``.
     """
-
-    @sp.profile("patchwork.nodal_poisson_setup", tags=PROFILE_TAGS)
-    def __init__(
-        self,
-        hierarchy: AMRHierarchy,
-        *,
-        faces: Mapping[str, Dirichlet | Neumann] | None = None,
-        embedded: Sequence[EmbeddedDirichlet] = (),
-        min_fraction: float = 1.0e-3,
-        nodes: CompositeNodes | None = None,
-        backend: str = "superlu",
-        rtol: float = 1.0e-10,
-        petsc_options: Mapping[str, Any] | None = None,
-    ) -> None:
-        """Assemble and factorize the operator.
-
-        ``min_fraction`` is the smallest fraction of an edge between a node and
-        an embedded surface: a surface closer than that (through the node, up to
-        round-off) is moved there, which bounds the size of that node's row.
-        """
-        if backend not in ("superlu", "petsc"):
-            raise ValueError(f"backend must be 'superlu' or 'petsc', got {backend!r}")
-        self.backend = backend
-        self._rtol = float(rtol)
-        self._petsc_options = dict(petsc_options or {})
-        self.nodes = CompositeNodes(hierarchy) if nodes is None else nodes
-        self._embedded = tuple(embedded)
-        self._min_fraction = float(min_fraction)
-        known = faces_of(hierarchy.ndim)
-        unknown = set(faces or ()) - set(known) - {INNER}
-        if unknown:
-            raise ValueError(
-                f"unknown faces {sorted(unknown)}; expected {[*known, INNER]}"
-            )
-        self._faces: dict[str, Dirichlet | Neumann] = {}
-        for face, (axis, _) in known.items():
-            if hierarchy.periodic[axis]:
-                if faces and face in faces:
-                    raise ValueError(
-                        f"{face} is on a periodic axis: it takes no condition"
-                    )
-                continue
-            self._faces[face] = (faces or {}).get(face, Dirichlet(0.0))
-        # after the faces of the rectangle, which decide the nodes they share
-        self._faces[INNER] = (faces or {}).get(INNER, Dirichlet(0.0))
-        self._assemble()
-        self._update_values()
 
     # Assembly ------------------------------------------------------------------#
     def _wrapped(self, points: np.ndarray) -> np.ndarray:
@@ -1002,156 +955,6 @@ class NodalPoisson:
                 fraction = high
             result[mine] = np.maximum(fraction, self._min_fraction)
         return result
-
-    def _assemble(self) -> None:
-        """Build this rank's rows of the operator, the solver and the right-hand-side maps."""
-        nodes = self.nodes
-        n = nodes.num_nodes
-        self._classify_bodies()
-        solid = self._owner >= 0
-
-        self.fixed = np.zeros(n, dtype=bool)
-        for face, condition in self._faces.items():
-            if isinstance(condition, Dirichlet):
-                self.fixed[nodes.face_nodes(face)] = True
-        self.fixed |= solid
-        self.fixed &= ~nodes.hanging
-        self.free = np.nonzero(~self.fixed & ~nodes.hanging)[0]
-        if not self.fixed.any():
-            raise ValueError(
-                "the Poisson operator is singular: without a Dirichlet face or "
-                "an embedded body the potential is only known up to a constant"
-            )
-        fixed = np.nonzero(self.fixed)[0]
-        self._fixed_nodes = fixed
-
-        reduction = nodes.reduction
-        if self.backend == "petsc":
-            # the unknowns by owner: every rank's rows are contiguous
-            comm = nodes.hierarchy.comm
-            owner = nodes.node_ranks[self.free]
-            self._unknowns = self.free[np.argsort(owner, kind="stable")]
-            self.rows = self.free[owner == comm.Get_rank()]
-            # the rows of the reduced operator of these unknowns take the rows
-            # of the nodes that hang from them too, which need every leaf cell
-            # around those nodes
-            support = np.zeros(n, dtype=bool)
-            support[sparse.csc_matrix(reduction[:, self.rows]).indices] = True
-            cells = np.nonzero(support[nodes.cell_corners].any(axis=1))[0]
-        else:
-            self._unknowns = self.free
-            self.rows = self.free
-            cells = None
-        operator, wall = self._operator(cells)
-
-        # rows of T^T A T for the unknowns this rank holds
-        pick = sparse.csr_matrix(reduction[:, self.rows].T)
-        reduced = sparse.csr_matrix(pick @ operator @ reduction)
-        self._wall = sparse.csr_matrix(pick @ wall)
-        self._load = sparse.csr_matrix(pick @ sparse.diags(nodes.volumes))
-        # a source already integrated over the control volumes (a deposited charge)
-        self._integral_load = pick
-        self._lift = reduced[:, fixed].tocsr()
-        self._reduction_rows = reduction[np.nonzero(nodes.hanging)[0]].tocsr()
-        self._factorization = None
-        self.system = None
-        if self.backend == "petsc":
-            from patchwork.distributed import PetscSystem
-
-            self.matrix = reduced[:, self._unknowns].tocsr()
-            if self.free.size:
-                self.system = PetscSystem(
-                    self.matrix,
-                    nodes.hierarchy.comm,
-                    symmetric=not self._embedded,
-                    options=self._petsc_options,
-                    prefix="patchwork_nodal_",
-                    rtol=self._rtol,
-                )
-            return
-        matrix = reduced[:, self.free].tocsc()
-        self.matrix = matrix
-        if self.free.size:
-            # minimum degree on the pattern of A + A^T: the mesh's own graph,
-            # about half the fill of the default column ordering
-            self._factorization = scipy.sparse.linalg.splu(
-                matrix, permc_spec="MMD_AT_PLUS_A"
-            )
-
-    def _operator(
-        self, cells: np.ndarray | None
-    ) -> tuple[sparse.csr_matrix, sparse.csr_matrix]:
-        """The operator on all nodes and the surface couplings, from some leaf cells.
-
-        The rows of nodes all of whose cells are among ``cells`` (all cells if
-        ``None``) are complete; the others are not, and are left out by the caller.
-        """
-        nodes = self.nodes
-        n = nodes.num_nodes
-        solid = self._owner >= 0
-
-        # Every leaf cell's edges (four in 2D, itself in 1D), each with its share
-        # of the stencil's conductance: half in 2D, the whole in 1D.
-        ndim = nodes.ndim
-        corners = nodes.cell_corners if cells is None else nodes.cell_corners[cells]
-        size = nodes.cell_size if cells is None else nodes.cell_size[cells]
-        firsts, seconds, conductances, lengths = [], [], [], []
-        for axis in range(ndim):
-            cross = np.prod(np.delete(size, axis, axis=1), axis=1) / 2 ** (ndim - 1)
-            for k in range(2**ndim):
-                if (k >> axis) & 1:
-                    continue
-                firsts.append(corners[:, k])
-                seconds.append(corners[:, k | (1 << axis)])
-                conductances.append(cross / size[:, axis])
-                lengths.append(size[:, axis])
-        first = np.concatenate(firsts)
-        second = np.concatenate(seconds)
-        conductance = np.concatenate(conductances)
-        length = np.concatenate(lengths)
-        # A periodic axis one cell wide joins a node to itself: no coupling.
-        keep = first != second
-        first, second = first[keep], second[keep]
-        conductance, length = conductance[keep], length[keep]
-
-        # An edge that enters a body: the node outside sees the surface, at the
-        # body's potential, instead of the node inside.
-        cut_a = ~solid[first] & solid[second]
-        cut_b = solid[first] & ~solid[second]
-        outside = np.concatenate((first[cut_a], second[cut_b]))
-        inside = np.concatenate((second[cut_a], first[cut_b]))
-        cut_conductance = np.concatenate((conductance[cut_a], conductance[cut_b]))
-        cut_length = np.concatenate((length[cut_a], length[cut_b]))
-        fraction = self._fractions(outside, inside)
-        plain = ~(cut_a | cut_b)
-        first, second, conductance = first[plain], second[plain], conductance[plain]
-
-        rows = np.concatenate((first, second, first, second, outside))
-        columns = np.concatenate((first, second, second, first, outside))
-        entries = np.concatenate(
-            (
-                conductance,
-                conductance,
-                -conductance,
-                -conductance,
-                cut_conductance / fraction,
-            )
-        )
-        num_bodies = len(self._embedded)
-        # the surface values' share of the right-hand side, per body
-        wall = sparse.csr_matrix(
-            sparse.coo_matrix(
-                (cut_conductance / fraction, (outside, self._owner[inside])),
-                shape=(n, max(num_bodies, 1)),
-            )
-        )
-        operator = sparse.csr_matrix(
-            sparse.coo_matrix((entries, (rows, columns)), shape=(n, n))
-        )
-
-        return self._shortley_weller(
-            operator, wall, outside, inside, fraction * cut_length
-        )
 
     def _shortley_weller(
         self,
@@ -1242,6 +1045,156 @@ class NodalPoisson:
         )
         return sparse.csr_matrix(operator), sparse.csr_matrix(wall)
 
+    def _operator(
+        self, cells: np.ndarray | None
+    ) -> tuple[sparse.csr_matrix, sparse.csr_matrix]:
+        """The operator on all nodes and the surface couplings, from some leaf cells.
+
+        The rows of nodes all of whose cells are among ``cells`` (all cells if
+        ``None``) are complete; the others are not, and are left out by the caller.
+        """
+        nodes = self.nodes
+        n = nodes.num_nodes
+        solid = self._owner >= 0
+
+        # Every leaf cell's edges (four in 2D, itself in 1D), each with its share
+        # of the stencil's conductance: half in 2D, the whole in 1D.
+        ndim = nodes.ndim
+        corners = nodes.cell_corners if cells is None else nodes.cell_corners[cells]
+        size = nodes.cell_size if cells is None else nodes.cell_size[cells]
+        firsts, seconds, conductances, lengths = [], [], [], []
+        for axis in range(ndim):
+            cross = np.prod(np.delete(size, axis, axis=1), axis=1) / 2 ** (ndim - 1)
+            for k in range(2**ndim):
+                if (k >> axis) & 1:
+                    continue
+                firsts.append(corners[:, k])
+                seconds.append(corners[:, k | (1 << axis)])
+                conductances.append(cross / size[:, axis])
+                lengths.append(size[:, axis])
+        first = np.concatenate(firsts)
+        second = np.concatenate(seconds)
+        conductance = np.concatenate(conductances)
+        length = np.concatenate(lengths)
+        # A periodic axis one cell wide joins a node to itself: no coupling.
+        keep = first != second
+        first, second = first[keep], second[keep]
+        conductance, length = conductance[keep], length[keep]
+
+        # An edge that enters a body: the node outside sees the surface, at the
+        # body's potential, instead of the node inside.
+        cut_a = ~solid[first] & solid[second]
+        cut_b = solid[first] & ~solid[second]
+        outside = np.concatenate((first[cut_a], second[cut_b]))
+        inside = np.concatenate((second[cut_a], first[cut_b]))
+        cut_conductance = np.concatenate((conductance[cut_a], conductance[cut_b]))
+        cut_length = np.concatenate((length[cut_a], length[cut_b]))
+        fraction = self._fractions(outside, inside)
+        plain = ~(cut_a | cut_b)
+        first, second, conductance = first[plain], second[plain], conductance[plain]
+
+        rows = np.concatenate((first, second, first, second, outside))
+        columns = np.concatenate((first, second, second, first, outside))
+        entries = np.concatenate(
+            (
+                conductance,
+                conductance,
+                -conductance,
+                -conductance,
+                cut_conductance / fraction,
+            )
+        )
+        num_bodies = len(self._embedded)
+        # the surface values' share of the right-hand side, per body
+        wall = sparse.csr_matrix(
+            sparse.coo_matrix(
+                (cut_conductance / fraction, (outside, self._owner[inside])),
+                shape=(n, max(num_bodies, 1)),
+            )
+        )
+        operator = sparse.csr_matrix(
+            sparse.coo_matrix((entries, (rows, columns)), shape=(n, n))
+        )
+
+        return self._shortley_weller(
+            operator, wall, outside, inside, fraction * cut_length
+        )
+
+    def _assemble(self) -> None:
+        """Build this rank's rows of the operator, the solver and the right-hand-side maps."""
+        nodes = self.nodes
+        n = nodes.num_nodes
+        self._classify_bodies()
+        solid = self._owner >= 0
+
+        self.fixed = np.zeros(n, dtype=bool)
+        for face, condition in self._faces.items():
+            if isinstance(condition, Dirichlet):
+                self.fixed[nodes.face_nodes(face)] = True
+        self.fixed |= solid
+        self.fixed &= ~nodes.hanging
+        self.free = np.nonzero(~self.fixed & ~nodes.hanging)[0]
+        if not self.fixed.any():
+            raise ValueError(
+                "the Poisson operator is singular: without a Dirichlet face or "
+                "an embedded body the potential is only known up to a constant"
+            )
+        fixed = np.nonzero(self.fixed)[0]
+        self._fixed_nodes = fixed
+
+        reduction = nodes.reduction
+        if self.backend == "petsc":
+            # the unknowns by owner: every rank's rows are contiguous
+            comm = nodes.hierarchy.comm
+            owner = nodes.node_ranks[self.free]
+            self._unknowns = self.free[np.argsort(owner, kind="stable")]
+            self.rows = self.free[owner == comm.Get_rank()]
+            # the rows of the reduced operator of these unknowns take the rows
+            # of the nodes that hang from them too, which need every leaf cell
+            # around those nodes
+            support = np.zeros(n, dtype=bool)
+            support[sparse.csc_matrix(reduction[:, self.rows]).indices] = True
+            cells = np.nonzero(support[nodes.cell_corners].any(axis=1))[0]
+        else:
+            self._unknowns = self.free
+            self.rows = self.free
+            cells = None
+        operator, wall = self._operator(cells)
+
+        # rows of T^T A T for the unknowns this rank holds
+        pick = sparse.csr_matrix(reduction[:, self.rows].T)
+        reduced = sparse.csr_matrix(pick @ operator @ reduction)
+        self._wall = sparse.csr_matrix(pick @ wall)
+        self._load = sparse.csr_matrix(pick @ sparse.diags(nodes.volumes))
+        # a source already integrated over the control volumes (a deposited charge)
+        self._integral_load = pick
+        self._lift = reduced[:, fixed].tocsr()
+        self._reduction_rows = reduction[np.nonzero(nodes.hanging)[0]].tocsr()
+        self._factorization = None
+        self.system = None
+        if self.backend == "petsc":
+            from patchwork.distributed import PetscSystem
+
+            self.matrix = reduced[:, self._unknowns].tocsr()
+            if self.free.size:
+                self.system = PetscSystem(
+                    self.matrix,
+                    nodes.hierarchy.comm,
+                    symmetric=not self._embedded,
+                    options=self._petsc_options,
+                    prefix="patchwork_nodal_",
+                    rtol=self._rtol,
+                )
+            return
+        matrix = reduced[:, self.free].tocsc()
+        self.matrix = matrix
+        if self.free.size:
+            # minimum degree on the pattern of A + A^T: the mesh's own graph,
+            # about half the fill of the default column ordering
+            self._factorization = scipy.sparse.linalg.splu(
+                matrix, permc_spec="MMD_AT_PLUS_A"
+            )
+
     # Boundary values ---------------------------------------------------------------#
     def _update_values(self) -> None:
         """Evaluate the prescribed values and their share of the right-hand side."""
@@ -1272,6 +1225,53 @@ class NodalPoisson:
         constant += self._integral_load @ flux
         constant -= self._lift @ values[self._fixed_nodes]
         self._constant = constant
+
+    @sp.profile("patchwork.nodal_poisson_setup", tags=PROFILE_TAGS)
+    def __init__(
+        self,
+        hierarchy: AMRHierarchy,
+        *,
+        faces: Mapping[str, Dirichlet | Neumann] | None = None,
+        embedded: Sequence[EmbeddedDirichlet] = (),
+        min_fraction: float = 1.0e-3,
+        nodes: CompositeNodes | None = None,
+        backend: str = "superlu",
+        rtol: float = 1.0e-10,
+        petsc_options: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Assemble and factorize the operator.
+
+        ``min_fraction`` is the smallest fraction of an edge between a node and
+        an embedded surface: a surface closer than that (through the node, up to
+        round-off) is moved there, which bounds the size of that node's row.
+        """
+        if backend not in ("superlu", "petsc"):
+            raise ValueError(f"backend must be 'superlu' or 'petsc', got {backend!r}")
+        self.backend = backend
+        self._rtol = float(rtol)
+        self._petsc_options = dict(petsc_options or {})
+        self.nodes = CompositeNodes(hierarchy) if nodes is None else nodes
+        self._embedded = tuple(embedded)
+        self._min_fraction = float(min_fraction)
+        known = faces_of(hierarchy.ndim)
+        unknown = set(faces or ()) - set(known) - {INNER}
+        if unknown:
+            raise ValueError(
+                f"unknown faces {sorted(unknown)}; expected {[*known, INNER]}"
+            )
+        self._faces: dict[str, Dirichlet | Neumann] = {}
+        for face, (axis, _) in known.items():
+            if hierarchy.periodic[axis]:
+                if faces and face in faces:
+                    raise ValueError(
+                        f"{face} is on a periodic axis: it takes no condition"
+                    )
+                continue
+            self._faces[face] = (faces or {}).get(face, Dirichlet(0.0))
+        # after the faces of the rectangle, which decide the nodes they share
+        self._faces[INNER] = (faces or {}).get(INNER, Dirichlet(0.0))
+        self._assemble()
+        self._update_values()
 
     def set_conditions(
         self,

@@ -17,9 +17,10 @@ install:  ## uv sync with the dev extra, and the pre-commit hooks
 test:  ## pytest with coverage
 	uv run pytest --cov .
 
-lint:  ## ruff and pyright
+lint:  ## ruff, ssort and pyright
 	uv run ruff check .
 	uv run ruff format --check .
+	uvx ssort --check --diff .
 	uv run pyright src/
 
 readme:  ## render README.md from README.qmd with quarto
