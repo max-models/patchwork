@@ -7,6 +7,11 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `AMRHierarchy.interpolate(x, y, name)`: a node-centered field at markers, each read in the
+  finest patch that holds it (the transpose of `deposit`), for fields computed patch by patch
+  such as an electric field that jumps at a coarse-fine edge. The markers are on their
+  owners (`migrate`) and the halos filled (`exchange_halos`).
+
 - `FluxRegister`: conservative explicit steps of a cell-centered field on the patches
   (Berger–Colella refluxing). `update` advances every patch by the divergence of the face
   fluxes a model computes from its halos and records the fluxes through coarse–fine faces;
@@ -46,6 +51,12 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the nodes, on refined lines too).
 
 ### Changed
+
+- `AMRHierarchy.deposit` runs mpifield's compiled linear weighting
+  (`mpifield.LINEAR.scatter_block`) on each patch block instead of a NumPy `bincount`; the
+  result is unchanged to round-off. New dependency: `mpifield`.
+- The kernels are built with cunumpy's `KernelPackage` (`patchwork.kernels.KERNEL_PACKAGE`):
+  `kernels/_build.py` is gone, the build cache is still `PATCHWORK_KERNEL_CACHE`.
 
 - `locate` (and `owner`, `migrate`, `deposit`) runs a compiled kernel (Pyccel, the new
   `pyccel` extra, also in `test`; its NumPy version runs without it): one pass over the
