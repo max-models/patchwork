@@ -64,6 +64,15 @@ def _centres(hierarchy: AMRHierarchy, level: int) -> list[np.ndarray]:
     return list(np.meshgrid(*axes, indexing="ij"))
 
 
+def _domain_cells(hierarchy: AMRHierarchy, level: int) -> np.ndarray:
+    """Which cells of a level are in the domain."""
+    scale = hierarchy.refinement_ratio**level
+    cells = np.zeros(hierarchy.level_shape(level), dtype=bool)
+    for patch in hierarchy.patches_at_level(0):
+        cells[tuple(slice(lo * scale, hi * scale) for lo, hi in patch.box)] = True
+    return cells
+
+
 def function_tags(
     hierarchy: AMRHierarchy, function: Callable[..., Any], levels: int
 ) -> dict[int, np.ndarray]:
@@ -172,15 +181,6 @@ def gradient_tags(
     return tags
 
 
-def _domain_cells(hierarchy: AMRHierarchy, level: int) -> np.ndarray:
-    """Which cells of a level are in the domain."""
-    scale = hierarchy.refinement_ratio**level
-    cells = np.zeros(hierarchy.level_shape(level), dtype=bool)
-    for patch in hierarchy.patches_at_level(0):
-        cells[tuple(slice(lo * scale, hi * scale) for lo, hi in patch.box)] = True
-    return cells
-
-
 def _coarsen(mask: np.ndarray, ratio: int) -> np.ndarray:
     """Which coarse cells hold a true fine cell: ``mask`` over blocks of ``ratio``."""
     blocks = [part for n in mask.shape for part in (n // ratio, ratio)]
@@ -221,81 +221,6 @@ def _grow(
 def _shrink(mask: np.ndarray, width: int, periodic: tuple[bool, ...]) -> np.ndarray:
     """Erode a mask by ``width`` cells; beyond non-periodic edges counts as inside."""
     return ~_grow(~mask, width, periodic, outside=False)
-
-
-# Clustering ----------------------------------------------------------------------------- #
-
-
-def cluster(
-    tags: np.ndarray,
-    efficiency: float = 0.7,
-    max_size: int | None = None,
-    allowed: np.ndarray | None = None,
-    min_size: int = 1,
-) -> list[IndexBox]:
-    """Cover the tagged cells with boxes (the Berger-Rigoutsos algorithm).
-
-    A box is kept when at least ``efficiency`` of its cells are tagged, it
-    holds no cell that ``allowed`` forbids, and it is at most ``max_size`` cells
-    long on each axis. Otherwise it is cut: at a gap in the tagged cells (a
-    row or column without tags; a cell in 1D), else where the number of tagged
-    cells per row or column bends most (a zero crossing of its second
-    difference), else in the middle of its longest side. Each part shrinks to
-    the tagged cells in it. In 1D the boxes are intervals.
-
-    Args:
-        tags: Booleans, one per cell: a 1D or 2D array.
-        efficiency: The smallest fraction of tagged cells in a box, in (0, 1].
-        max_size: The longest side of a box, in cells; default: no limit.
-        allowed: Booleans of the shape of ``tags``: where boxes may go.
-            Tagged cells that are not allowed are dropped.
-        min_size: The shortest side a box should have, in cells. A shorter box
-            is widened, one row or column at a time, into cells that are
-            allowed and that no other box has, as far as there is room: it
-            stays shorter where there is none (the shape of ``tags`` or the
-            allowed region is narrower).
-
-    Returns:
-        Half-open boxes ``((i0, i1),)`` or ``((i0, i1), (j0, j1))`` that do not
-        overlap and cover every allowed tagged cell.
-    """
-    tags = np.asarray(tags, dtype=bool)
-    if tags.ndim not in (1, 2):
-        raise ValueError("tags must be a 1D or 2D array")
-    if not 0.0 < efficiency <= 1.0:
-        raise ValueError(f"efficiency must be in (0, 1], got {efficiency}")
-    if max_size is not None and max_size < 1:
-        raise ValueError(f"max_size must be at least 1, got {max_size}")
-    if min_size < 1:
-        raise ValueError(f"min_size must be at least 1, got {min_size}")
-    if max_size is not None and min_size > max_size:
-        raise ValueError(f"min_size {min_size} exceeds max_size {max_size}")
-    if allowed is not None:
-        allowed = np.asarray(allowed, dtype=bool)
-        if allowed.shape != tags.shape:
-            raise ValueError("allowed must have the shape of tags")
-        tags = tags & allowed
-    boxes: list[IndexBox] = []
-    pending: list[Box] = [tuple((0, n) for n in tags.shape)]
-    while pending:
-        box = _shrink_to_tags(tags, pending.pop())
-        if box is None:
-            continue
-        where = tuple(slice(lo, hi) for lo, hi in box)
-        inside = tags[where]
-        fits = allowed is None or bool(allowed[where].all())
-        if inside.mean() >= efficiency and fits:
-            boxes.extend(_chop(box, max_size))
-            continue
-        axis, cut = _cut(inside)
-        lo, hi = box[axis]
-        first, second = list(box), list(box)
-        first[axis] = (lo, lo + cut)
-        second[axis] = (lo + cut, hi)
-        pending.extend([tuple(second), tuple(first)])  # type: ignore[arg-type]
-    if min_size > 1:
-        boxes = _widen(boxes, tags.shape, allowed, min_size)
-    return sorted(boxes)
 
 
 def _widen(
@@ -402,6 +327,81 @@ def _chop(box: Box, max_size: int | None) -> list[Box]:
         edges = [lo + (hi - lo) * k // parts for k in range(parts + 1)]
         ranges.append(list(zip(edges[:-1], edges[1:], strict=True)))
     return [tuple(parts) for parts in itertools.product(*ranges)]
+
+
+# Clustering ----------------------------------------------------------------------------- #
+
+
+def cluster(
+    tags: np.ndarray,
+    efficiency: float = 0.7,
+    max_size: int | None = None,
+    allowed: np.ndarray | None = None,
+    min_size: int = 1,
+) -> list[IndexBox]:
+    """Cover the tagged cells with boxes (the Berger-Rigoutsos algorithm).
+
+    A box is kept when at least ``efficiency`` of its cells are tagged, it
+    holds no cell that ``allowed`` forbids, and it is at most ``max_size`` cells
+    long on each axis. Otherwise it is cut: at a gap in the tagged cells (a
+    row or column without tags; a cell in 1D), else where the number of tagged
+    cells per row or column bends most (a zero crossing of its second
+    difference), else in the middle of its longest side. Each part shrinks to
+    the tagged cells in it. In 1D the boxes are intervals.
+
+    Args:
+        tags: Booleans, one per cell: a 1D or 2D array.
+        efficiency: The smallest fraction of tagged cells in a box, in (0, 1].
+        max_size: The longest side of a box, in cells; default: no limit.
+        allowed: Booleans of the shape of ``tags``: where boxes may go.
+            Tagged cells that are not allowed are dropped.
+        min_size: The shortest side a box should have, in cells. A shorter box
+            is widened, one row or column at a time, into cells that are
+            allowed and that no other box has, as far as there is room: it
+            stays shorter where there is none (the shape of ``tags`` or the
+            allowed region is narrower).
+
+    Returns:
+        Half-open boxes ``((i0, i1),)`` or ``((i0, i1), (j0, j1))`` that do not
+        overlap and cover every allowed tagged cell.
+    """
+    tags = np.asarray(tags, dtype=bool)
+    if tags.ndim not in (1, 2):
+        raise ValueError("tags must be a 1D or 2D array")
+    if not 0.0 < efficiency <= 1.0:
+        raise ValueError(f"efficiency must be in (0, 1], got {efficiency}")
+    if max_size is not None and max_size < 1:
+        raise ValueError(f"max_size must be at least 1, got {max_size}")
+    if min_size < 1:
+        raise ValueError(f"min_size must be at least 1, got {min_size}")
+    if max_size is not None and min_size > max_size:
+        raise ValueError(f"min_size {min_size} exceeds max_size {max_size}")
+    if allowed is not None:
+        allowed = np.asarray(allowed, dtype=bool)
+        if allowed.shape != tags.shape:
+            raise ValueError("allowed must have the shape of tags")
+        tags = tags & allowed
+    boxes: list[IndexBox] = []
+    pending: list[Box] = [tuple((0, n) for n in tags.shape)]
+    while pending:
+        box = _shrink_to_tags(tags, pending.pop())
+        if box is None:
+            continue
+        where = tuple(slice(lo, hi) for lo, hi in box)
+        inside = tags[where]
+        fits = allowed is None or bool(allowed[where].all())
+        if inside.mean() >= efficiency and fits:
+            boxes.extend(_chop(box, max_size))
+            continue
+        axis, cut = _cut(inside)
+        lo, hi = box[axis]
+        first, second = list(box), list(box)
+        first[axis] = (lo, lo + cut)
+        second[axis] = (lo + cut, hi)
+        pending.extend([tuple(second), tuple(first)])  # type: ignore[arg-type]
+    if min_size > 1:
+        boxes = _widen(boxes, tags.shape, allowed, min_size)
+    return sorted(boxes)
 
 
 # The new hierarchy ---------------------------------------------------------------------- #

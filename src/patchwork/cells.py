@@ -116,6 +116,17 @@ class EmbeddedFloating:
 Body = EmbeddedDirichlet | EmbeddedFloating
 
 
+def _wrapped(hierarchy: AMRHierarchy, points: np.ndarray) -> np.ndarray:
+    """``points`` ``(ndim, k)`` moved into the domain along its periodic axes."""
+    if not any(hierarchy.periodic):
+        return points
+    points = points.copy()
+    for axis, (lower, upper) in enumerate(hierarchy.bounds):
+        if hierarchy.periodic[axis]:
+            points[axis] = lower + (points[axis] - lower) % (upper - lower)
+    return points
+
+
 class CompositeCells:
     """The leaf cells of a hierarchy, their faces and the maps to its patches.
 
@@ -221,6 +232,42 @@ class CompositeCells:
         result = np.asarray(value, dtype=dtype)
         return np.broadcast_to(result, (self.num_cells,)).copy()
 
+    def _segments(self, axis: int):
+        """Runs of lattice faces with one pair of cells: low, high, plane, start, count."""
+        # the cells along ``axis`` first, the other axis (if any) flattened after it
+        n = self.owner.shape[axis]
+        own = np.moveaxis(self.owner, axis, 0).reshape(n, -1)
+        m = own.shape[1]
+        outside = np.full((1, m), -1, dtype=np.int64)
+        # the planes between lattice cells k - 1 and k: inside, then the ends
+        lows, highs, planes = [own[:-1]], [own[1:]], [np.arange(1, n)]
+        if self.hierarchy.periodic[axis]:
+            lows.append(own[-1:])
+            highs.append(own[:1])
+            planes.append(np.array([n]))
+        else:
+            lows += [outside, own[-1:]]
+            highs += [own[:1], outside]
+            planes += [np.array([0]), np.array([n])]
+        low = np.concatenate([a.reshape(-1) for a in lows])
+        high = np.concatenate([a.reshape(-1) for a in highs])
+        plane = np.concatenate([np.repeat(p.astype(np.int64), m) for p in planes])
+        tick = np.tile(np.arange(m, dtype=np.int64), plane.size // m)
+        keep = (low != high) & ((low >= 0) | (high >= 0))
+        low, high, plane, tick = low[keep], high[keep], plane[keep], tick[keep]
+        order = np.lexsort((tick, high, low, plane))
+        low, high, plane, tick = low[order], high[order], plane[order], tick[order]
+        new = np.ones(low.size, dtype=bool)
+        new[1:] = (
+            (plane[1:] != plane[:-1])
+            | (low[1:] != low[:-1])
+            | (high[1:] != high[:-1])
+            | (tick[1:] != tick[:-1] + 1)
+        )
+        first = np.nonzero(new)[0]
+        count = np.diff(np.append(first, low.size))
+        return low[first], high[first], plane[first], tick[first], count
+
     # Faces ---------------------------------------------------------------------#
     def faces(self, axis: int) -> dict[str, np.ndarray]:
         """The faces normal to ``axis`` between two leaf cells.
@@ -263,42 +310,6 @@ class CompositeCells:
             "count": count[outside],
             "rectangle": (plane == 0) | (plane == size),
         }
-
-    def _segments(self, axis: int):
-        """Runs of lattice faces with one pair of cells: low, high, plane, start, count."""
-        # the cells along ``axis`` first, the other axis (if any) flattened after it
-        n = self.owner.shape[axis]
-        own = np.moveaxis(self.owner, axis, 0).reshape(n, -1)
-        m = own.shape[1]
-        outside = np.full((1, m), -1, dtype=np.int64)
-        # the planes between lattice cells k - 1 and k: inside, then the ends
-        lows, highs, planes = [own[:-1]], [own[1:]], [np.arange(1, n)]
-        if self.hierarchy.periodic[axis]:
-            lows.append(own[-1:])
-            highs.append(own[:1])
-            planes.append(np.array([n]))
-        else:
-            lows += [outside, own[-1:]]
-            highs += [own[:1], outside]
-            planes += [np.array([0]), np.array([n])]
-        low = np.concatenate([a.reshape(-1) for a in lows])
-        high = np.concatenate([a.reshape(-1) for a in highs])
-        plane = np.concatenate([np.repeat(p.astype(np.int64), m) for p in planes])
-        tick = np.tile(np.arange(m, dtype=np.int64), plane.size // m)
-        keep = (low != high) & ((low >= 0) | (high >= 0))
-        low, high, plane, tick = low[keep], high[keep], plane[keep], tick[keep]
-        order = np.lexsort((tick, high, low, plane))
-        low, high, plane, tick = low[order], high[order], plane[order], tick[order]
-        new = np.ones(low.size, dtype=bool)
-        new[1:] = (
-            (plane[1:] != plane[:-1])
-            | (low[1:] != low[:-1])
-            | (high[1:] != high[:-1])
-            | (tick[1:] != tick[:-1] + 1)
-        )
-        first = np.nonzero(new)[0]
-        count = np.diff(np.append(first, low.size))
-        return low[first], high[first], plane[first], tick[first], count
 
     def face_metric(
         self, axis: int, plane: np.ndarray, start: np.ndarray, count: np.ndarray
@@ -370,6 +381,33 @@ class CompositeCells:
         hierarchy.restrict(name)
 
 
+def _face_points(
+    ndim: int, axis: int, position: np.ndarray, middle: np.ndarray
+) -> tuple[np.ndarray, ...]:
+    """The middle of faces normal to ``axis``, one array per axis: ``(x,)`` or ``(x, y)``."""
+    if ndim == 1:
+        return (position,)
+    return (position, middle) if axis == 0 else (middle, position)
+
+
+def _evaluate_complex(value: Any, *coordinates: np.ndarray) -> np.ndarray:
+    """A face value at points (one array per axis), complex allowed."""
+    result: Any = value(*coordinates) if callable(value) else value
+    dtype = complex if np.iscomplexobj(result) else float
+    return np.broadcast_to(np.asarray(result, dtype=dtype), coordinates[0].shape).copy()
+
+
+def _solve(
+    factorization: Any, right_hand_side: np.ndarray, complex_matrix: bool
+) -> np.ndarray:
+    """Solve with a real or complex LU for a real or complex right-hand side."""
+    if not complex_matrix and np.iscomplexobj(right_hand_side):
+        real = factorization.solve(np.ascontiguousarray(np.real(right_hand_side)))
+        imag = factorization.solve(np.ascontiguousarray(np.imag(right_hand_side)))
+        return real + 1j * imag
+    return factorization.solve(right_hand_side)
+
+
 class CellOperator:
     r"""Solve :math:`-\nabla\cdot(a\nabla u) + c\,u = f` on the leaf cells of a hierarchy.
 
@@ -418,54 +456,6 @@ class CellOperator:
             ``matrix @ u`` is ``V (-div(a grad u) + c u)`` on the free cells, and
             the net flux into each floating body.
     """
-
-    @sp.profile("patchwork.cell_operator_setup", tags=PROFILE_TAGS)
-    def __init__(
-        self,
-        hierarchy: AMRHierarchy,
-        *,
-        diffusion: CellValue = 1.0,
-        reaction: CellValue = 0.0,
-        component: str = "scalar",
-        faces: Mapping[str, Dirichlet | Neumann] | None = None,
-        embedded: Sequence[Body] = (),
-        mean: str = "harmonic",
-        coarse_fine: str = "symmetric",
-        min_fraction: float = 1.0e-3,
-        cells: CompositeCells | None = None,
-        factorize: bool = True,
-    ) -> None:
-        """Assemble and factorize the operator."""
-        if coarse_fine not in ("symmetric", "conservative"):
-            raise ValueError(
-                f"coarse_fine must be 'symmetric' or 'conservative', got {coarse_fine!r}"
-            )
-        self.coarse_fine = coarse_fine
-        if component not in COMPONENTS:
-            raise ValueError(
-                f"component must be one of {COMPONENTS}, got {component!r}"
-            )
-        if component == "azimuthal" and not hierarchy.cylindrical:
-            raise ValueError(
-                "an azimuthal component needs a cylindrical hierarchy; in the "
-                "Cartesian plane the curl-curl of a normal component is the scalar"
-            )
-        if mean not in ("harmonic", "arithmetic"):
-            raise ValueError(f"mean must be 'harmonic' or 'arithmetic', got {mean!r}")
-        self.cells = CompositeCells(hierarchy) if cells is None else cells
-        self.component = component
-        self._azimuthal = component == "azimuthal"
-        self._mean = mean
-        self._min_fraction = float(min_fraction)
-        self._factorize = bool(factorize)
-        self._embedded: tuple[Body, ...] = tuple(embedded)
-        self._faces = self._face_conditions(hierarchy, faces)
-        self.diffusion = self.cells.evaluate(diffusion)
-        if np.any(self.diffusion < 0.0):
-            raise ValueError("the diffusion coefficient must not be negative")
-        self._classify_bodies()
-        self._assemble()
-        self.set_reaction(reaction)
 
     # Conditions ----------------------------------------------------------------#
     @staticmethod
@@ -546,186 +536,98 @@ class CellOperator:
             return area / (position * radius * distance)
         return area / distance
 
-    # Assembly ------------------------------------------------------------------#
-    def _assemble(self) -> None:
-        """The face energy (real, symmetric) and the boundary couplings."""
-        cells = self.cells
-        n = cells.num_cells
-        stencil_cells: list[np.ndarray] = []
-        stencil_weights: list[np.ndarray] = []
-        strengths: list[np.ndarray] = []
-        diagonal = np.zeros(n)
-        # boundary couplings: diagonal terms and the right-hand side they lift,
-        # per prescribed value (filled by _update_values)
-        self._wall_cells: list[np.ndarray] = []
-        self._wall_strength: list[np.ndarray] = []
-        self._wall_weight: list[np.ndarray] = []
-        self._wall_value: list[Callable[[], np.ndarray]] = []
-        self._flux_cells: list[np.ndarray] = []
-        self._flux: list[Callable[[], np.ndarray]] = []
-        # floating surfaces: the free cells, s w w_s, s w_s^2 and the body's column
-        self._float_cells: list[np.ndarray] = []
-        self._float_cross: list[np.ndarray] = []
-        self._float_self: list[np.ndarray] = []
-        self._float_body: list[np.ndarray] = []
-        # conservative coarse-fine fluxes: rows, columns and values
-        self._unsymmetric: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
-        for axis in range(cells.hierarchy.ndim):
-            self._interior(axis, stencil_cells, stencil_weights, strengths, diagonal)
-            self._domain_boundary(axis, diagonal)
-        if stencil_cells:
-            index = np.concatenate(stencil_cells)
-            weight = np.concatenate(stencil_weights)
-            strength = np.concatenate(strengths)
-            rows = np.concatenate([index[:, p] for p in range(4) for _ in range(4)])
-            cols = np.concatenate([index[:, q] for _ in range(4) for q in range(4)])
-            vals = np.concatenate(
-                [
-                    strength * weight[:, p] * weight[:, q]
-                    for p in range(4)
-                    for q in range(4)
-                ]
-            )
-            faces = sparse.coo_matrix((vals, (rows, cols)), shape=(n, n))
-        else:
-            faces = sparse.coo_matrix((n, n))
-        for rows, cols, vals in self._unsymmetric:
-            faces = faces + sparse.coo_matrix((vals, (rows, cols)), shape=(n, n))
-        self.stiffness = sparse.csr_matrix(faces + sparse.diags(diagonal))
-        self.free = np.nonzero(~self.solid)[0]
-        self._stiffness_free = self.stiffness[self.free][:, self.free].tocsc()
-        self._volumes_free = cells.volumes[self.free]
-        self._position = np.full(n, -1, dtype=np.int64)
-        self._position[self.free] = np.arange(self.free.size)
-        count = len(self._floating)
-        if self._float_cells:
-            rows = self._position[np.concatenate(self._float_cells)]
-            cols = np.concatenate(self._float_body)
-            cross = -np.concatenate(self._float_cross)
-            own = np.bincount(
-                cols, weights=np.concatenate(self._float_self), minlength=count
-            )
-        else:
-            rows = cols = np.zeros(0, dtype=np.int64)
-            cross, own = np.zeros(0), np.zeros(count)
-        if count and np.any(own <= 0.0):
-            lonely = [self._floating[k] for k in np.flatnonzero(own <= 0.0)]
-            raise ValueError(f"floating bodies {lonely} touch no free cell")
-        self.floating_coupling = sparse.csr_matrix(
-            (cross, (rows, cols)), shape=(self.free.size, count)
-        )
-        self._floating_self = sparse.diags(own) if count else sparse.csr_matrix((0, 0))
+    def _mirror(self, axis: int, side: int) -> float:
+        """The sign of the mirror image across the domain's face ``side`` of ``axis``.
 
-    def _interior(
-        self,
-        axis: int,
-        stencil_cells: list[np.ndarray],
-        stencil_weights: list[np.ndarray],
-        strengths: list[np.ndarray],
-        diagonal: np.ndarray,
-    ) -> None:
-        """The faces normal to ``axis`` between two cells: stencils, or surfaces."""
-        cells = self.cells
-        faces = cells.faces(axis)
-        low, high = faces["low"], faces["high"]
-        area, position, _ = cells.face_metric(
-            axis, faces["plane"], faces["start"], faces["count"]
-        )
-        distance = 0.5 * (cells.sizes[low, axis] + cells.sizes[high, axis])
-        kappa = self._face_mean(self.diffusion[low], self.diffusion[high])
-        middle = 0.5 * (cells.centers[low, axis] + cells.centers[high, axis])
-        strength = kappa * self._conductance(axis, area, position, distance, middle)
+        ``+1`` across a face with no gradient (an azimuthal component's radial
+        faces excepted, whose natural condition is no axial field) and across
+        the axis for a scalar, ``-1`` across the axis for an azimuthal
+        component; 0 where there is no image (a value or a gradient on the
+        face).
+        """
+        hierarchy = self.cells.hierarchy
+        if axis == 0 and side == 0 and hierarchy.on_axis:
+            return -1.0 if self._azimuthal else 1.0
+        name = next(face for face, (a, s) in FACES.items() if a == axis and s == side)
+        condition = self._faces.get(name)
+        if not isinstance(condition, Neumann) or callable(condition.gradient):
+            return 0.0
+        if condition.gradient != 0.0 or (self._azimuthal and axis == 0):
+            return 0.0
+        return 1.0
 
-        solid_low, solid_high = self.solid[low], self.solid[high]
-        regular = ~solid_low & ~solid_high
-        cut = solid_low ^ solid_high
-        if cut.any():
-            self._surfaces(axis, faces, cut, area, position, distance, diagonal)
+    def _interpolation(
+        self, axis: int, coarse: np.ndarray, start: np.ndarray, count: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Cells and weights interpolating coarse values to the middle of fine faces.
 
-        strength_all = strength
-        low, high = low[regular], high[regular]
-        strength = strength_all[regular]
-        start, count = faces["start"][regular], faces["count"][regular]
-        index = np.zeros((low.size, 4), dtype=np.int64)
-        weight = np.zeros((low.size, 4))
-        span_low, span_high = cells.span[low], cells.span[high]
-        index[:, 0] = high
-        weight[:, 0] = self._weight(axis, high)
-        same = span_low == span_high
-        index[same, 1] = low[same]
-        weight[same, 1] = -self._weight(axis, low[same])
-        fine_coarse = ~same
-        if fine_coarse.any() and self.coarse_fine == "conservative":
-            low_fine = span_low < span_high
-            self._conservative_fluxes(
-                axis,
-                np.where(low_fine, low, high)[fine_coarse],
-                np.where(low_fine, high, low)[fine_coarse],
-                low_fine[fine_coarse],
-                start[fine_coarse],
-                count[fine_coarse],
-                (strength * distance[regular])[fine_coarse],
-                position[regular][fine_coarse],
-            )
-            keep = same
-            index, weight, strength = index[keep], weight[keep], strength[keep]
-        elif fine_coarse.any():
-            # the finer cell's value against the coarse one interpolated to the
-            # middle of the face, along it
-            low_fine = span_low < span_high
-            fine = np.where(low_fine, low, high)[fine_coarse]
-            coarse = np.where(low_fine, high, low)[fine_coarse]
-            coarse_cells, coarse_weights = self._interpolation(
-                axis, coarse, start[fine_coarse], count[fine_coarse]
-            )
-            index[fine_coarse, 0] = fine
-            weight[fine_coarse, 0] = self._weight(axis, fine)
-            index[fine_coarse, 1:] = coarse_cells
-            weight[fine_coarse, 1:] = -coarse_weights * self._weight(
-                axis, coarse_cells.reshape(-1)
-            ).reshape(coarse_cells.shape)
-        stencil_cells.append(index)
-        stencil_weights.append(weight)
-        strengths.append(strength)
-
-    def _conservative_fluxes(
-        self,
-        axis: int,
-        fine: np.ndarray,
-        coarse: np.ndarray,
-        fine_below: np.ndarray,
-        start: np.ndarray,
-        count: np.ndarray,
-        strength_times_distance: np.ndarray,
-        face_position: np.ndarray,
-    ) -> None:
-        """Coarse–fine faces as one flux, into the fine cell and out of the coarse one.
-
-        A ghost value half a fine cell beyond the face, quadratic through the
-        next fine cell, the fine cell and the coarse value interpolated along
-        the face (linear without the next fine cell); the flux is its
-        difference with the fine value over a fine cell.
+        Along the face (the other axis): quadratic through the coarse cell and
+        its two neighbours of the same size, linear where one is missing (a
+        finer patch, a body, a wall with a value or a gradient), the coarse
+        value where both are. Across a face of the domain with no gradient
+        (``Neumann(0.0)``), and across the axis of an r–z domain, the missing
+        neighbour is the coarse cell's mirror image (its own value; minus it
+        for an azimuthal component on the axis, which vanishes there), so a
+        field symmetric about the wall, such as one that does not vary along
+        it, is interpolated exactly up to the wall. In 1D the face is a point:
+        the coarse cell's own value, with weight 1 (the two others are 0).
         """
         cells = self.cells
-        h_fine = cells.sizes[fine, axis]
-        columns, coefficients = self._ghost(
-            axis, fine, coarse, fine_below, start, count
-        )
-        # the face's strength with the distance of a fine cell, between the fine
-        # centre and the ghost, whose mean radius is the face's own
-        strength = strength_times_distance / h_fine
-        if self._azimuthal and axis == 0:
-            centres = 0.5 * (cells.centers[fine, 0] + cells.centers[coarse, 0])
-            strength = strength * centres / face_position
-        rows, cols, vals = [], [], []
-        for row, sign in ((fine, -1.0), (coarse, 1.0)):
-            factor = sign * strength * self._weight(axis, row)
-            for k in range(columns.shape[1]):
-                rows.append(row)
-                cols.append(columns[:, k])
-                vals.append(factor * coefficients[:, k])
-        self._unsymmetric.append(
-            (np.concatenate(rows), np.concatenate(cols), np.concatenate(vals))
+        if cells.hierarchy.ndim == 1:
+            ones, zeros = np.ones(coarse.size), np.zeros(coarse.size)
+            return (
+                np.stack([coarse, coarse, coarse], axis=1),
+                np.stack([ones, zeros, zeros], axis=1),
+            )
+        other = 1 - axis
+        span = cells.span[coarse]
+        lattice = cells.lattice[coarse]
+        middle = start + 0.5 * count
+        centre = lattice[:, other] + 0.5 * span
+        delta = (middle - centre) / span
+        neighbours = []
+        for side, sign in enumerate((-1, 1)):
+            spot = lattice.copy()
+            spot[:, other] += sign * span
+            size = cells.owner.shape[other]
+            mirror = 0.0
+            if self.cells.hierarchy.periodic[other]:
+                spot[:, other] %= size
+                inside = np.ones(coarse.size, dtype=bool)
+            else:
+                inside = (spot[:, other] >= 0) & (spot[:, other] < size)
+                mirror = self._mirror(other, side)
+            found = np.full(coarse.size, -1, dtype=np.int64)
+            found[inside] = cells.owner[tuple(spot[inside].T)]
+            valid = found >= 0
+            valid[valid] &= (cells.span[found[valid]] == span[valid]) & np.all(
+                cells.lattice[found[valid]] == spot[valid], axis=1
+            )
+            valid[valid] &= ~self.solid[found[valid]]
+            # beyond a symmetric face of the domain: the mirror image
+            factor = np.ones(coarse.size)
+            if mirror:
+                beyond = ~inside
+                valid |= beyond
+                factor[beyond] = mirror
+            neighbours.append((np.where(valid & inside, found, coarse), valid, factor))
+        (below, has_below, f_below), (above, has_above, f_above) = neighbours
+        both = has_below & has_above
+        only_below = has_below & ~has_above
+        only_above = has_above & ~has_below
+        w_centre = np.ones(coarse.size)
+        w_below = np.zeros(coarse.size)
+        w_above = np.zeros(coarse.size)
+        w_below[both] = 0.5 * delta[both] * (delta[both] - 1.0)
+        w_centre[both] = 1.0 - delta[both] ** 2
+        w_above[both] = 0.5 * delta[both] * (delta[both] + 1.0)
+        w_centre[only_below] = 1.0 + delta[only_below]
+        w_below[only_below] = -delta[only_below]
+        w_centre[only_above] = 1.0 - delta[only_above]
+        w_above[only_above] = delta[only_above]
+        return (
+            np.stack([coarse, below, above], axis=1),
+            np.stack([w_centre, f_below * w_below, f_above * w_above], axis=1),
         )
 
     def _ghost(
@@ -807,99 +709,76 @@ class CellOperator:
         )
         return columns, coefficients
 
-    def _interpolation(
-        self, axis: int, coarse: np.ndarray, start: np.ndarray, count: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Cells and weights interpolating coarse values to the middle of fine faces.
+    def _conservative_fluxes(
+        self,
+        axis: int,
+        fine: np.ndarray,
+        coarse: np.ndarray,
+        fine_below: np.ndarray,
+        start: np.ndarray,
+        count: np.ndarray,
+        strength_times_distance: np.ndarray,
+        face_position: np.ndarray,
+    ) -> None:
+        """Coarse–fine faces as one flux, into the fine cell and out of the coarse one.
 
-        Along the face (the other axis): quadratic through the coarse cell and
-        its two neighbours of the same size, linear where one is missing (a
-        finer patch, a body, a wall with a value or a gradient), the coarse
-        value where both are. Across a face of the domain with no gradient
-        (``Neumann(0.0)``), and across the axis of an r–z domain, the missing
-        neighbour is the coarse cell's mirror image (its own value; minus it
-        for an azimuthal component on the axis, which vanishes there), so a
-        field symmetric about the wall, such as one that does not vary along
-        it, is interpolated exactly up to the wall. In 1D the face is a point:
-        the coarse cell's own value, with weight 1 (the two others are 0).
+        A ghost value half a fine cell beyond the face, quadratic through the
+        next fine cell, the fine cell and the coarse value interpolated along
+        the face (linear without the next fine cell); the flux is its
+        difference with the fine value over a fine cell.
         """
         cells = self.cells
-        if cells.hierarchy.ndim == 1:
-            ones, zeros = np.ones(coarse.size), np.zeros(coarse.size)
-            return (
-                np.stack([coarse, coarse, coarse], axis=1),
-                np.stack([ones, zeros, zeros], axis=1),
-            )
-        other = 1 - axis
-        span = cells.span[coarse]
-        lattice = cells.lattice[coarse]
-        middle = start + 0.5 * count
-        centre = lattice[:, other] + 0.5 * span
-        delta = (middle - centre) / span
-        neighbours = []
-        for side, sign in enumerate((-1, 1)):
-            spot = lattice.copy()
-            spot[:, other] += sign * span
-            size = cells.owner.shape[other]
-            mirror = 0.0
-            if self.cells.hierarchy.periodic[other]:
-                spot[:, other] %= size
-                inside = np.ones(coarse.size, dtype=bool)
-            else:
-                inside = (spot[:, other] >= 0) & (spot[:, other] < size)
-                mirror = self._mirror(other, side)
-            found = np.full(coarse.size, -1, dtype=np.int64)
-            found[inside] = cells.owner[tuple(spot[inside].T)]
-            valid = found >= 0
-            valid[valid] &= (cells.span[found[valid]] == span[valid]) & np.all(
-                cells.lattice[found[valid]] == spot[valid], axis=1
-            )
-            valid[valid] &= ~self.solid[found[valid]]
-            # beyond a symmetric face of the domain: the mirror image
-            factor = np.ones(coarse.size)
-            if mirror:
-                beyond = ~inside
-                valid |= beyond
-                factor[beyond] = mirror
-            neighbours.append((np.where(valid & inside, found, coarse), valid, factor))
-        (below, has_below, f_below), (above, has_above, f_above) = neighbours
-        both = has_below & has_above
-        only_below = has_below & ~has_above
-        only_above = has_above & ~has_below
-        w_centre = np.ones(coarse.size)
-        w_below = np.zeros(coarse.size)
-        w_above = np.zeros(coarse.size)
-        w_below[both] = 0.5 * delta[both] * (delta[both] - 1.0)
-        w_centre[both] = 1.0 - delta[both] ** 2
-        w_above[both] = 0.5 * delta[both] * (delta[both] + 1.0)
-        w_centre[only_below] = 1.0 + delta[only_below]
-        w_below[only_below] = -delta[only_below]
-        w_centre[only_above] = 1.0 - delta[only_above]
-        w_above[only_above] = delta[only_above]
-        return (
-            np.stack([coarse, below, above], axis=1),
-            np.stack([w_centre, f_below * w_below, f_above * w_above], axis=1),
+        h_fine = cells.sizes[fine, axis]
+        columns, coefficients = self._ghost(
+            axis, fine, coarse, fine_below, start, count
+        )
+        # the face's strength with the distance of a fine cell, between the fine
+        # centre and the ghost, whose mean radius is the face's own
+        strength = strength_times_distance / h_fine
+        if self._azimuthal and axis == 0:
+            centres = 0.5 * (cells.centers[fine, 0] + cells.centers[coarse, 0])
+            strength = strength * centres / face_position
+        rows, cols, vals = [], [], []
+        for row, sign in ((fine, -1.0), (coarse, 1.0)):
+            factor = sign * strength * self._weight(axis, row)
+            for k in range(columns.shape[1]):
+                rows.append(row)
+                cols.append(columns[:, k])
+                vals.append(factor * coefficients[:, k])
+        self._unsymmetric.append(
+            (np.concatenate(rows), np.concatenate(cols), np.concatenate(vals))
         )
 
-    def _mirror(self, axis: int, side: int) -> float:
-        """The sign of the mirror image across the domain's face ``side`` of ``axis``.
-
-        ``+1`` across a face with no gradient (an azimuthal component's radial
-        faces excepted, whose natural condition is no axial field) and across
-        the axis for a scalar, ``-1`` across the axis for an azimuthal
-        component; 0 where there is no image (a value or a gradient on the
-        face).
-        """
-        hierarchy = self.cells.hierarchy
-        if axis == 0 and side == 0 and hierarchy.on_axis:
-            return -1.0 if self._azimuthal else 1.0
-        name = next(face for face, (a, s) in FACES.items() if a == axis and s == side)
-        condition = self._faces.get(name)
-        if not isinstance(condition, Neumann) or callable(condition.gradient):
-            return 0.0
-        if condition.gradient != 0.0 or (self._azimuthal and axis == 0):
-            return 0.0
-        return 1.0
+    def _fractions(self, outside: np.ndarray, inside: np.ndarray) -> np.ndarray:
+        """Fraction of each centre line from an outside cell at which a body starts."""
+        cells = self.cells
+        hierarchy = cells.hierarchy
+        result = np.ones(outside.size)
+        for number, body in enumerate(self._embedded):
+            mine = self._owner[inside] == number
+            if not mine.any():
+                continue
+            start = cells.centers[outside[mine]].T
+            step = cells.centers[inside[mine]].T - start
+            for axis, (lower, upper) in enumerate(hierarchy.bounds):
+                if hierarchy.periodic[axis]:
+                    period = upper - lower
+                    step[axis] -= period * np.round(step[axis] / period)
+            if body.fraction is not None:
+                fraction = np.asarray(body.fraction(start, start + step), dtype=float)
+            else:
+                lo = np.zeros(start.shape[1])
+                hi = np.ones(start.shape[1])
+                for _ in range(48):
+                    mid = 0.5 * (lo + hi)
+                    hit = np.asarray(
+                        body.inside(_wrapped(hierarchy, start + mid * step)), dtype=bool
+                    )
+                    hi = np.where(hit, mid, hi)
+                    lo = np.where(hit, lo, mid)
+                fraction = hi
+            result[mine] = np.maximum(fraction, self._min_fraction)
+        return result
 
     def _surfaces(
         self,
@@ -956,36 +835,86 @@ class CellOperator:
             self._float_self.append((strength * wall_weight**2)[floating])
             self._float_body.append(column[floating])
 
-    def _fractions(self, outside: np.ndarray, inside: np.ndarray) -> np.ndarray:
-        """Fraction of each centre line from an outside cell at which a body starts."""
+    def _interior(
+        self,
+        axis: int,
+        stencil_cells: list[np.ndarray],
+        stencil_weights: list[np.ndarray],
+        strengths: list[np.ndarray],
+        diagonal: np.ndarray,
+    ) -> None:
+        """The faces normal to ``axis`` between two cells: stencils, or surfaces."""
         cells = self.cells
-        hierarchy = cells.hierarchy
-        result = np.ones(outside.size)
-        for number, body in enumerate(self._embedded):
-            mine = self._owner[inside] == number
-            if not mine.any():
-                continue
-            start = cells.centers[outside[mine]].T
-            step = cells.centers[inside[mine]].T - start
-            for axis, (lower, upper) in enumerate(hierarchy.bounds):
-                if hierarchy.periodic[axis]:
-                    period = upper - lower
-                    step[axis] -= period * np.round(step[axis] / period)
-            if body.fraction is not None:
-                fraction = np.asarray(body.fraction(start, start + step), dtype=float)
-            else:
-                lo = np.zeros(start.shape[1])
-                hi = np.ones(start.shape[1])
-                for _ in range(48):
-                    mid = 0.5 * (lo + hi)
-                    hit = np.asarray(
-                        body.inside(_wrapped(hierarchy, start + mid * step)), dtype=bool
-                    )
-                    hi = np.where(hit, mid, hi)
-                    lo = np.where(hit, lo, mid)
-                fraction = hi
-            result[mine] = np.maximum(fraction, self._min_fraction)
-        return result
+        faces = cells.faces(axis)
+        low, high = faces["low"], faces["high"]
+        area, position, _ = cells.face_metric(
+            axis, faces["plane"], faces["start"], faces["count"]
+        )
+        distance = 0.5 * (cells.sizes[low, axis] + cells.sizes[high, axis])
+        kappa = self._face_mean(self.diffusion[low], self.diffusion[high])
+        middle = 0.5 * (cells.centers[low, axis] + cells.centers[high, axis])
+        strength = kappa * self._conductance(axis, area, position, distance, middle)
+
+        solid_low, solid_high = self.solid[low], self.solid[high]
+        regular = ~solid_low & ~solid_high
+        cut = solid_low ^ solid_high
+        if cut.any():
+            self._surfaces(axis, faces, cut, area, position, distance, diagonal)
+
+        strength_all = strength
+        low, high = low[regular], high[regular]
+        strength = strength_all[regular]
+        start, count = faces["start"][regular], faces["count"][regular]
+        index = np.zeros((low.size, 4), dtype=np.int64)
+        weight = np.zeros((low.size, 4))
+        span_low, span_high = cells.span[low], cells.span[high]
+        index[:, 0] = high
+        weight[:, 0] = self._weight(axis, high)
+        same = span_low == span_high
+        index[same, 1] = low[same]
+        weight[same, 1] = -self._weight(axis, low[same])
+        fine_coarse = ~same
+        if fine_coarse.any() and self.coarse_fine == "conservative":
+            low_fine = span_low < span_high
+            self._conservative_fluxes(
+                axis,
+                np.where(low_fine, low, high)[fine_coarse],
+                np.where(low_fine, high, low)[fine_coarse],
+                low_fine[fine_coarse],
+                start[fine_coarse],
+                count[fine_coarse],
+                (strength * distance[regular])[fine_coarse],
+                position[regular][fine_coarse],
+            )
+            keep = same
+            index, weight, strength = index[keep], weight[keep], strength[keep]
+        elif fine_coarse.any():
+            # the finer cell's value against the coarse one interpolated to the
+            # middle of the face, along it
+            low_fine = span_low < span_high
+            fine = np.where(low_fine, low, high)[fine_coarse]
+            coarse = np.where(low_fine, high, low)[fine_coarse]
+            coarse_cells, coarse_weights = self._interpolation(
+                axis, coarse, start[fine_coarse], count[fine_coarse]
+            )
+            index[fine_coarse, 0] = fine
+            weight[fine_coarse, 0] = self._weight(axis, fine)
+            index[fine_coarse, 1:] = coarse_cells
+            weight[fine_coarse, 1:] = -coarse_weights * self._weight(
+                axis, coarse_cells.reshape(-1)
+            ).reshape(coarse_cells.shape)
+        stencil_cells.append(index)
+        stencil_weights.append(weight)
+        strengths.append(strength)
+
+    @staticmethod
+    def _face_names(axis: int, boundary: dict[str, np.ndarray]) -> np.ndarray:
+        """The name of the part of the boundary every boundary face is on."""
+        names = np.full(boundary["cell"].size, INNER, dtype=object)
+        for face, (face_axis, side) in FACES.items():
+            if face_axis == axis:
+                names[boundary["rectangle"] & (boundary["side"] == side)] = face
+        return names
 
     def _domain_boundary(self, axis: int, diagonal: np.ndarray) -> None:
         """Dirichlet and Neumann faces of the domain, and the axis."""
@@ -1065,14 +994,123 @@ class CellOperator:
                     )
                 )
 
-    @staticmethod
-    def _face_names(axis: int, boundary: dict[str, np.ndarray]) -> np.ndarray:
-        """The name of the part of the boundary every boundary face is on."""
-        names = np.full(boundary["cell"].size, INNER, dtype=object)
-        for face, (face_axis, side) in FACES.items():
-            if face_axis == axis:
-                names[boundary["rectangle"] & (boundary["side"] == side)] = face
-        return names
+    # Assembly ------------------------------------------------------------------#
+    def _assemble(self) -> None:
+        """The face energy (real, symmetric) and the boundary couplings."""
+        cells = self.cells
+        n = cells.num_cells
+        stencil_cells: list[np.ndarray] = []
+        stencil_weights: list[np.ndarray] = []
+        strengths: list[np.ndarray] = []
+        diagonal = np.zeros(n)
+        # boundary couplings: diagonal terms and the right-hand side they lift,
+        # per prescribed value (filled by _update_values)
+        self._wall_cells: list[np.ndarray] = []
+        self._wall_strength: list[np.ndarray] = []
+        self._wall_weight: list[np.ndarray] = []
+        self._wall_value: list[Callable[[], np.ndarray]] = []
+        self._flux_cells: list[np.ndarray] = []
+        self._flux: list[Callable[[], np.ndarray]] = []
+        # floating surfaces: the free cells, s w w_s, s w_s^2 and the body's column
+        self._float_cells: list[np.ndarray] = []
+        self._float_cross: list[np.ndarray] = []
+        self._float_self: list[np.ndarray] = []
+        self._float_body: list[np.ndarray] = []
+        # conservative coarse-fine fluxes: rows, columns and values
+        self._unsymmetric: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+        for axis in range(cells.hierarchy.ndim):
+            self._interior(axis, stencil_cells, stencil_weights, strengths, diagonal)
+            self._domain_boundary(axis, diagonal)
+        if stencil_cells:
+            index = np.concatenate(stencil_cells)
+            weight = np.concatenate(stencil_weights)
+            strength = np.concatenate(strengths)
+            rows = np.concatenate([index[:, p] for p in range(4) for _ in range(4)])
+            cols = np.concatenate([index[:, q] for _ in range(4) for q in range(4)])
+            vals = np.concatenate(
+                [
+                    strength * weight[:, p] * weight[:, q]
+                    for p in range(4)
+                    for q in range(4)
+                ]
+            )
+            faces = sparse.coo_matrix((vals, (rows, cols)), shape=(n, n))
+        else:
+            faces = sparse.coo_matrix((n, n))
+        for rows, cols, vals in self._unsymmetric:
+            faces = faces + sparse.coo_matrix((vals, (rows, cols)), shape=(n, n))
+        self.stiffness = sparse.csr_matrix(faces + sparse.diags(diagonal))
+        self.free = np.nonzero(~self.solid)[0]
+        self._stiffness_free = self.stiffness[self.free][:, self.free].tocsc()
+        self._volumes_free = cells.volumes[self.free]
+        self._position = np.full(n, -1, dtype=np.int64)
+        self._position[self.free] = np.arange(self.free.size)
+        count = len(self._floating)
+        if self._float_cells:
+            rows = self._position[np.concatenate(self._float_cells)]
+            cols = np.concatenate(self._float_body)
+            cross = -np.concatenate(self._float_cross)
+            own = np.bincount(
+                cols, weights=np.concatenate(self._float_self), minlength=count
+            )
+        else:
+            rows = cols = np.zeros(0, dtype=np.int64)
+            cross, own = np.zeros(0), np.zeros(count)
+        if count and np.any(own <= 0.0):
+            lonely = [self._floating[k] for k in np.flatnonzero(own <= 0.0)]
+            raise ValueError(f"floating bodies {lonely} touch no free cell")
+        self.floating_coupling = sparse.csr_matrix(
+            (cross, (rows, cols)), shape=(self.free.size, count)
+        )
+        self._floating_self = sparse.diags(own) if count else sparse.csr_matrix((0, 0))
+
+    @sp.profile("patchwork.cell_operator_setup", tags=PROFILE_TAGS)
+    def __init__(
+        self,
+        hierarchy: AMRHierarchy,
+        *,
+        diffusion: CellValue = 1.0,
+        reaction: CellValue = 0.0,
+        component: str = "scalar",
+        faces: Mapping[str, Dirichlet | Neumann] | None = None,
+        embedded: Sequence[Body] = (),
+        mean: str = "harmonic",
+        coarse_fine: str = "symmetric",
+        min_fraction: float = 1.0e-3,
+        cells: CompositeCells | None = None,
+        factorize: bool = True,
+    ) -> None:
+        """Assemble and factorize the operator."""
+        if coarse_fine not in ("symmetric", "conservative"):
+            raise ValueError(
+                f"coarse_fine must be 'symmetric' or 'conservative', got {coarse_fine!r}"
+            )
+        self.coarse_fine = coarse_fine
+        if component not in COMPONENTS:
+            raise ValueError(
+                f"component must be one of {COMPONENTS}, got {component!r}"
+            )
+        if component == "azimuthal" and not hierarchy.cylindrical:
+            raise ValueError(
+                "an azimuthal component needs a cylindrical hierarchy; in the "
+                "Cartesian plane the curl-curl of a normal component is the scalar"
+            )
+        if mean not in ("harmonic", "arithmetic"):
+            raise ValueError(f"mean must be 'harmonic' or 'arithmetic', got {mean!r}")
+        self.cells = CompositeCells(hierarchy) if cells is None else cells
+        self.component = component
+        self._azimuthal = component == "azimuthal"
+        self._mean = mean
+        self._min_fraction = float(min_fraction)
+        self._factorize = bool(factorize)
+        self._embedded: tuple[Body, ...] = tuple(embedded)
+        self._faces = self._face_conditions(hierarchy, faces)
+        self.diffusion = self.cells.evaluate(diffusion)
+        if np.any(self.diffusion < 0.0):
+            raise ValueError("the diffusion coefficient must not be negative")
+        self._classify_bodies()
+        self._assemble()
+        self.set_reaction(reaction)
 
     # Values ---------------------------------------------------------------------#
     def _update_values(self) -> None:
@@ -1132,6 +1170,36 @@ class CellOperator:
             )
         self._update_values()
 
+    @property
+    def _num_unknowns(self) -> int:
+        return int(self.free.size + len(self._floating))
+
+    def _check_anchored(self, c: np.ndarray) -> None:
+        anchored = (
+            bool(self._wall_cells and any(cells.size for cells in self._wall_cells))
+            or bool(np.any(c[self.free] != 0.0))
+            or (self._azimuthal and self.cells.hierarchy.on_axis)
+        )
+        if not anchored:
+            raise ValueError(
+                "the operator is singular: without a Dirichlet face, a body or a "
+                "reaction the solution is only known up to a constant"
+            )
+        if self._num_unknowns:
+            empty = np.asarray(abs(self.matrix).sum(axis=1)).ravel() == 0.0
+            if empty.any():
+                raise ValueError(
+                    f"the operator is singular: {int(empty.sum())} unknowns have "
+                    "neither diffusion nor reaction"
+                )
+
+    def _factorize_matrix(self) -> None:
+        self._check_anchored(self.reaction)
+        if self._num_unknowns:
+            self._factorization = scipy.sparse.linalg.splu(
+                self.matrix, permc_spec="MMD_AT_PLUS_A"
+            )
+
     @sp.profile("patchwork.cell_operator_factorize", tags=PROFILE_TAGS)
     def set_reaction(self, reaction: CellValue) -> None:
         """Use a new reaction coefficient ``c``: refactorize, without assembling.
@@ -1158,36 +1226,6 @@ class CellOperator:
         self._factorization = None
         if self._factorize:
             self._factorize_matrix()
-
-    @property
-    def _num_unknowns(self) -> int:
-        return int(self.free.size + len(self._floating))
-
-    def _factorize_matrix(self) -> None:
-        self._check_anchored(self.reaction)
-        if self._num_unknowns:
-            self._factorization = scipy.sparse.linalg.splu(
-                self.matrix, permc_spec="MMD_AT_PLUS_A"
-            )
-
-    def _check_anchored(self, c: np.ndarray) -> None:
-        anchored = (
-            bool(self._wall_cells and any(cells.size for cells in self._wall_cells))
-            or bool(np.any(c[self.free] != 0.0))
-            or (self._azimuthal and self.cells.hierarchy.on_axis)
-        )
-        if not anchored:
-            raise ValueError(
-                "the operator is singular: without a Dirichlet face, a body or a "
-                "reaction the solution is only known up to a constant"
-            )
-        if self._num_unknowns:
-            empty = np.asarray(abs(self.matrix).sum(axis=1)).ravel() == 0.0
-            if empty.any():
-                raise ValueError(
-                    f"the operator is singular: {int(empty.sum())} unknowns have "
-                    "neither diffusion nor reaction"
-                )
 
     # Solving --------------------------------------------------------------------#
     @property
@@ -1268,6 +1306,66 @@ class CellOperator:
             [u[np.flatnonzero(self._owner == number)[0]] for number in self._floating],
             dtype=u.dtype,
         )
+
+    def _boundary_estimates(self, u, axis, add, radius) -> None:
+        """The estimates of the domain's faces: walls, gradients, the axis."""
+        cells = self.cells
+        hierarchy = cells.hierarchy
+        boundary = cells.boundary(axis)
+        keep = ~self.solid[boundary["cell"]]
+        boundary = {key: value[keep] for key, value in boundary.items()}
+        cell = boundary["cell"]
+        if not cell.size:
+            return
+        area, position, middle = cells.face_metric(
+            axis, boundary["plane"], boundary["start"], boundary["count"]
+        )
+        length = boundary["count"].astype(float)
+        names = self._face_names(axis, boundary)
+        # +1: the boundary is above the cell
+        sign = np.where(boundary["side"] == 1, 1.0, -1.0)
+        half = 0.5 * cells.sizes[cell, axis]
+        centre = cells.centers[cell, axis]
+        weighted = self._weight(axis, cell) * u[cell]
+        on_axis = np.zeros(cell.size, dtype=bool)
+        if hierarchy.on_axis and axis == 0:
+            on_axis = names == "x_lower"
+            if on_axis.any():
+                c = centre[on_axis]
+                if self._azimuthal:
+                    # u = 0 on the axis, linear to the first centre: (1/r) d(r u)/dr
+                    add(
+                        cell[on_axis],
+                        -0.5 * c,
+                        2.0 * u[cell[on_axis]] / c,
+                        length[on_axis],
+                    )
+                else:
+                    add(cell[on_axis], -c, np.zeros(c.shape), length[on_axis])
+        coordinates = _face_points(hierarchy.ndim, axis, position, middle)
+        for face, condition in self._faces.items():
+            mine = (names == face) & ~on_axis
+            if not mine.any():
+                continue
+            points = tuple(values[mine] for values in coordinates)
+            s, h = sign[mine], half[mine]
+            if isinstance(condition, Dirichlet):
+                wall = position[mine] if (self._azimuthal and axis == 0) else 1.0
+                value = (
+                    s
+                    * (
+                        wall * _evaluate_complex(condition.value, *points)
+                        - weighted[mine]
+                    )
+                    / (h * radius(0.5 * (centre[mine] + position[mine])))
+                )
+                add(cell[mine], 0.5 * s * h, value, length[mine])
+            elif self._azimuthal and axis == 0:
+                # the natural condition: no axial field on the face
+                add(cell[mine], s * h, np.zeros(h.shape), length[mine])
+            else:
+                gradient = _evaluate_complex(condition.gradient, *points)
+                add(cell[mine], s * h, s * gradient, length[mine])
 
     # Derivatives -----------------------------------------------------------------#
     def face_gradients(self, u: np.ndarray, axis: int) -> dict[str, np.ndarray]:
@@ -1389,66 +1487,6 @@ class CellOperator:
             for k, key in enumerate(("cell", "offset", "value", "length"))
         }
 
-    def _boundary_estimates(self, u, axis, add, radius) -> None:
-        """The estimates of the domain's faces: walls, gradients, the axis."""
-        cells = self.cells
-        hierarchy = cells.hierarchy
-        boundary = cells.boundary(axis)
-        keep = ~self.solid[boundary["cell"]]
-        boundary = {key: value[keep] for key, value in boundary.items()}
-        cell = boundary["cell"]
-        if not cell.size:
-            return
-        area, position, middle = cells.face_metric(
-            axis, boundary["plane"], boundary["start"], boundary["count"]
-        )
-        length = boundary["count"].astype(float)
-        names = self._face_names(axis, boundary)
-        # +1: the boundary is above the cell
-        sign = np.where(boundary["side"] == 1, 1.0, -1.0)
-        half = 0.5 * cells.sizes[cell, axis]
-        centre = cells.centers[cell, axis]
-        weighted = self._weight(axis, cell) * u[cell]
-        on_axis = np.zeros(cell.size, dtype=bool)
-        if hierarchy.on_axis and axis == 0:
-            on_axis = names == "x_lower"
-            if on_axis.any():
-                c = centre[on_axis]
-                if self._azimuthal:
-                    # u = 0 on the axis, linear to the first centre: (1/r) d(r u)/dr
-                    add(
-                        cell[on_axis],
-                        -0.5 * c,
-                        2.0 * u[cell[on_axis]] / c,
-                        length[on_axis],
-                    )
-                else:
-                    add(cell[on_axis], -c, np.zeros(c.shape), length[on_axis])
-        coordinates = _face_points(hierarchy.ndim, axis, position, middle)
-        for face, condition in self._faces.items():
-            mine = (names == face) & ~on_axis
-            if not mine.any():
-                continue
-            points = tuple(values[mine] for values in coordinates)
-            s, h = sign[mine], half[mine]
-            if isinstance(condition, Dirichlet):
-                wall = position[mine] if (self._azimuthal and axis == 0) else 1.0
-                value = (
-                    s
-                    * (
-                        wall * _evaluate_complex(condition.value, *points)
-                        - weighted[mine]
-                    )
-                    / (h * radius(0.5 * (centre[mine] + position[mine])))
-                )
-                add(cell[mine], 0.5 * s * h, value, length[mine])
-            elif self._azimuthal and axis == 0:
-                # the natural condition: no axial field on the face
-                add(cell[mine], s * h, np.zeros(h.shape), length[mine])
-            else:
-                gradient = _evaluate_complex(condition.gradient, *points)
-                add(cell[mine], s * h, s * gradient, length[mine])
-
     def _derivatives(self, u: np.ndarray) -> np.ndarray:
         """``(n, ndim)``: the estimates of :meth:`face_gradients` interpolated to the centres."""
         u = np.asarray(u)
@@ -1539,41 +1577,3 @@ def cell_body(
     if floating:
         return EmbeddedFloating(inside, value, fraction)
     return EmbeddedDirichlet(inside, value, fraction)  # type: ignore[arg-type]
-
-
-def _face_points(
-    ndim: int, axis: int, position: np.ndarray, middle: np.ndarray
-) -> tuple[np.ndarray, ...]:
-    """The middle of faces normal to ``axis``, one array per axis: ``(x,)`` or ``(x, y)``."""
-    if ndim == 1:
-        return (position,)
-    return (position, middle) if axis == 0 else (middle, position)
-
-
-def _wrapped(hierarchy: AMRHierarchy, points: np.ndarray) -> np.ndarray:
-    """``points`` ``(ndim, k)`` moved into the domain along its periodic axes."""
-    if not any(hierarchy.periodic):
-        return points
-    points = points.copy()
-    for axis, (lower, upper) in enumerate(hierarchy.bounds):
-        if hierarchy.periodic[axis]:
-            points[axis] = lower + (points[axis] - lower) % (upper - lower)
-    return points
-
-
-def _evaluate_complex(value: Any, *coordinates: np.ndarray) -> np.ndarray:
-    """A face value at points (one array per axis), complex allowed."""
-    result: Any = value(*coordinates) if callable(value) else value
-    dtype = complex if np.iscomplexobj(result) else float
-    return np.broadcast_to(np.asarray(result, dtype=dtype), coordinates[0].shape).copy()
-
-
-def _solve(
-    factorization: Any, right_hand_side: np.ndarray, complex_matrix: bool
-) -> np.ndarray:
-    """Solve with a real or complex LU for a real or complex right-hand side."""
-    if not complex_matrix and np.iscomplexobj(right_hand_side):
-        real = factorization.solve(np.ascontiguousarray(np.real(right_hand_side)))
-        imag = factorization.solve(np.ascontiguousarray(np.imag(right_hand_side)))
-        return real + 1j * imag
-    return factorization.solve(right_hand_side)

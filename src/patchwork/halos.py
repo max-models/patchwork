@@ -405,36 +405,6 @@ class HaloExchange:
     Collective over the hierarchy's communicator, as is :meth:`execute`.
     """
 
-    def __init__(
-        self,
-        hierarchy: AMRHierarchy,
-        name: str,
-        *,
-        level: int | None = None,
-        below: str | None = None,
-    ) -> None:
-        """Find where every halo point comes from (one ``allgather``).
-
-        With ``level``, only for the patches of that level; with ``below``,
-        interpolating field ``below`` of the level below instead of ``name``.
-        """
-        spec = hierarchy._field_specs[name]
-        self._hierarchy = hierarchy
-        self._name = name
-        self._below = name if below is None else below
-        self._level = level
-        self._width = int(spec["halo"])
-        points = _Points(hierarchy, spec["centering"] == "node")
-        copies: list[tuple] = []
-        self._interpolations: list[_Bilinear] = []
-        for patch in hierarchy.patches if self._width else ():
-            if level is not None and patch.level != level:
-                continue
-            covered = self._same_level(points, patch, copies)
-            if patch.level > 0:
-                self._coarse_fine(points, patch, covered, spec["dtype"], copies)
-        self._plan = mpa.CopyPlan(copies, comm=hierarchy.comm)
-
     def _field(self, patch: Patch) -> Any:
         return patch.field(self._name) if patch.is_local else None
 
@@ -504,6 +474,36 @@ class HaloExchange:
         if interpolation is not None:
             self._interpolations.append(interpolation)
 
+    def __init__(
+        self,
+        hierarchy: AMRHierarchy,
+        name: str,
+        *,
+        level: int | None = None,
+        below: str | None = None,
+    ) -> None:
+        """Find where every halo point comes from (one ``allgather``).
+
+        With ``level``, only for the patches of that level; with ``below``,
+        interpolating field ``below`` of the level below instead of ``name``.
+        """
+        spec = hierarchy._field_specs[name]
+        self._hierarchy = hierarchy
+        self._name = name
+        self._below = name if below is None else below
+        self._level = level
+        self._width = int(spec["halo"])
+        points = _Points(hierarchy, spec["centering"] == "node")
+        copies: list[tuple] = []
+        self._interpolations: list[_Bilinear] = []
+        for patch in hierarchy.patches if self._width else ():
+            if level is not None and patch.level != level:
+                continue
+            covered = self._same_level(points, patch, copies)
+            if patch.level > 0:
+                self._coarse_fine(points, patch, covered, spec["dtype"], copies)
+        self._plan = mpa.CopyPlan(copies, comm=hierarchy.comm)
+
     def execute(self) -> None:
         """Fill the halos. Collective over the hierarchy's communicator."""
         self._plan.execute()
@@ -523,27 +523,6 @@ class Restriction:
     rank's block are written; the halos follow with :class:`HaloExchange`.
     Collective over the hierarchy's communicator, as is :meth:`execute`.
     """
-
-    def __init__(self, hierarchy: AMRHierarchy, name: str) -> None:
-        """Find where every fine region goes (one ``allgather``)."""
-        spec = hierarchy._field_specs[name]
-        nodal = spec["centering"] == "node"
-        points = _Points(hierarchy, nodal)
-        ratio = hierarchy.refinement_ratio
-        self._name = name
-        self._nodal = nodal
-        self._ratio = ratio
-        self._hierarchy = hierarchy
-        # one plan per fine level, finest first: a level gets its finer values
-        # before it gives them to the one below
-        self._steps: list[tuple[int, Any, list[tuple]]] = []
-        for level in range(hierarchy.max_level, 0, -1):
-            copies: list[tuple] = []
-            writes: list[tuple] = []
-            for fine in hierarchy.patches_at_level(level):
-                self._add(hierarchy, points, fine, copies, writes)
-            plan = mpa.CopyPlan(copies, comm=hierarchy.comm)
-            self._steps.append((level, plan, writes))
 
     def _add(
         self,
@@ -593,15 +572,26 @@ class Restriction:
                     rows = (fine.level, region[0][0])
                     writes.append((coarse.field(name), target, buffer, rows))
 
-    def execute(self, level: int | None = None) -> None:
-        """Restrict onto every level, or onto ``level`` only from the next finer one.
-
-        Collective over the hierarchy's communicator.
-        """
-        for fine_level, plan, writes in self._steps:
-            if level is None or fine_level == level + 1:
-                plan.execute()
-                self._write(writes)
+    def __init__(self, hierarchy: AMRHierarchy, name: str) -> None:
+        """Find where every fine region goes (one ``allgather``)."""
+        spec = hierarchy._field_specs[name]
+        nodal = spec["centering"] == "node"
+        points = _Points(hierarchy, nodal)
+        ratio = hierarchy.refinement_ratio
+        self._name = name
+        self._nodal = nodal
+        self._ratio = ratio
+        self._hierarchy = hierarchy
+        # one plan per fine level, finest first: a level gets its finer values
+        # before it gives them to the one below
+        self._steps: list[tuple[int, Any, list[tuple]]] = []
+        for level in range(hierarchy.max_level, 0, -1):
+            copies: list[tuple] = []
+            writes: list[tuple] = []
+            for fine in hierarchy.patches_at_level(level):
+                self._add(hierarchy, points, fine, copies, writes)
+            plan = mpa.CopyPlan(copies, comm=hierarchy.comm)
+            self._steps.append((level, plan, writes))
 
     def _write(self, writes: list[tuple]) -> None:
         r = self._ratio
@@ -645,3 +635,13 @@ class Restriction:
                 )
             ]
             array.local_with_halos[storage] = values
+
+    def execute(self, level: int | None = None) -> None:
+        """Restrict onto every level, or onto ``level`` only from the next finer one.
+
+        Collective over the hierarchy's communicator.
+        """
+        for fine_level, plan, writes in self._steps:
+            if level is None or fine_level == level + 1:
+                plan.execute()
+                self._write(writes)

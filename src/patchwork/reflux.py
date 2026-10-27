@@ -93,6 +93,28 @@ class FluxRegister:
         num_faces: The number of coarse faces on the edges of finer levels.
     """
 
+    @staticmethod
+    def _by_patch(
+        cells: CompositeCells,
+        leaf: np.ndarray,
+        entry: np.ndarray,
+        axis: np.ndarray,
+        side: np.ndarray,
+    ) -> dict[int, tuple[np.ndarray, ...]]:
+        """Faces of leaf cells grouped by patch, in the patch's own cell indices."""
+        result = {}
+        boxes = [patch.box for patch in cells.hierarchy.patches]
+        for number in np.unique(cells.patch[leaf]):
+            chosen = cells.patch[leaf] == number
+            origin = np.array([lo for lo, _ in boxes[number]], dtype=np.int64)
+            result[int(number)] = (
+                entry[chosen],
+                cells.index[leaf[chosen]] - origin,
+                axis[chosen],
+                side[chosen],
+            )
+        return result
+
     def __init__(self, hierarchy: AMRHierarchy, cells: CompositeCells | None = None):
         """Find the coarse–fine faces of ``hierarchy`` (``cells``: its leaf cells)."""
         self.hierarchy = hierarchy
@@ -136,28 +158,6 @@ class FluxRegister:
             np.concatenate(fine_sides),
         )
         self._records: dict[str, np.ndarray] = {}
-
-    @staticmethod
-    def _by_patch(
-        cells: CompositeCells,
-        leaf: np.ndarray,
-        entry: np.ndarray,
-        axis: np.ndarray,
-        side: np.ndarray,
-    ) -> dict[int, tuple[np.ndarray, ...]]:
-        """Faces of leaf cells grouped by patch, in the patch's own cell indices."""
-        result = {}
-        boxes = [patch.box for patch in cells.hierarchy.patches]
-        for number in np.unique(cells.patch[leaf]):
-            chosen = cells.patch[leaf] == number
-            origin = np.array([lo for lo, _ in boxes[number]], dtype=np.int64)
-            result[int(number)] = (
-                entry[chosen],
-                cells.index[leaf[chosen]] - origin,
-                axis[chosen],
-                side[chosen],
-            )
-        return result
 
     def _record(self, name: str) -> np.ndarray:
         if name not in self._records:

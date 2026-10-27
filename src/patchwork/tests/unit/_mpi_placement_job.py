@@ -97,6 +97,19 @@ def same(found: list, expected: list, what: str) -> None:
         )
 
 
+def _copy(mesh: AMRHierarchy) -> AMRHierarchy:
+    """The same patches on this rank alone."""
+    copy = AMRHierarchy(
+        base_shape=mesh.base_shape,
+        base_boxes=[p.box for p in mesh.patches_at_level(0)],
+        comm=MPI.COMM_SELF,
+    )
+    for patch in mesh.patches:
+        if patch.level:
+            copy.add_patch(level=patch.level, box=patch.box)
+    return copy
+
+
 def main() -> None:
     check(SIZE >= 2, "the job needs at least two ranks")
 
@@ -235,19 +248,6 @@ def main() -> None:
 
     if RANK == 0:
         print("MPI_JOB_OK", flush=True)
-
-
-def _copy(mesh: AMRHierarchy) -> AMRHierarchy:
-    """The same patches on this rank alone."""
-    copy = AMRHierarchy(
-        base_shape=mesh.base_shape,
-        base_boxes=[p.box for p in mesh.patches_at_level(0)],
-        comm=MPI.COMM_SELF,
-    )
-    for patch in mesh.patches:
-        if patch.level:
-            copy.add_patch(level=patch.level, box=patch.box)
-    return copy
 
 
 if __name__ == "__main__":
