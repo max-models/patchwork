@@ -1121,6 +1121,26 @@ class AMRHierarchy:
         )
         return tuple(np.asarray(array) for array in received)
 
+    def _stored_block(self, patch: Patch, name: str) -> tuple[Any, Any]:
+        """This rank's block of field ``name`` on ``patch``, halo included, and its grid.
+
+        The grid is an :class:`mpifield.BlockGrid` of the stored nodes (the first one is
+        the first halo node), so mpifield's weightings run on the block as on a field's.
+        """
+        from mpifield import BlockGrid
+
+        array = patch.field(name)
+        layout = array.layout
+        spacing = self.spacing(patch.level)
+        storage = array.local_with_halos
+        first = [
+            self.lower_bound[axis]
+            + spacing[axis]
+            * (patch.box[axis][0] + layout.index_bounds[axis][0] - layout.halo[axis])
+            for axis in range(self.ndim)
+        ]
+        return storage, BlockGrid.from_geometry(first, spacing, storage.shape)
+
     @sp.profile("patchwork.deposit", tags=PROFILE_TAGS)
     def deposit(
         self, *arguments: Any, name: str | None = None, reset: bool = True
@@ -1132,7 +1152,8 @@ class AMRHierarchy:
         in 1D, four in 2D), in the finest patch that holds it, with linear or
         bilinear (cloud-in-cell) weights: the same weights as
         :meth:`CompositeNodes.deposit <patchwork.nodal.CompositeNodes.deposit>`,
-        whose transposed interpolation the field gather is. The values are
+        whose transposed interpolation the field gather is, and of
+        :meth:`interpolate`; mpifield's compiled kernels do the work. The values are
         charges, not a density. The markers must be on the ranks that
         :meth:`owner` gives (use :meth:`migrate`), so that the corners fall in
         the block or its halo, and the field needs a halo of at least one node.
@@ -1141,8 +1162,6 @@ class AMRHierarchy:
         :meth:`accumulate_halos`. With ``reset`` the field is zeroed first,
         halos included. Collective (the check of the owners).
         """
-        import itertools
-
         import numpy as np
 
         coordinates, (charge,), name = self._split(arguments, name, 1, "deposit")
@@ -1167,41 +1186,53 @@ class AMRHierarchy:
         if reset:
             for patch in self.local_patches:
                 patch.field(name).local_with_halos[...] = 0.0
+        from mpifield import LINEAR
+
         patches = self.patches
         for number in np.unique(found[found >= 0]):
-            patch = patches[number]
             chosen = np.flatnonzero(found == number)
-            array = patch.field(name)
-            layout = array.layout
-            spacing = self.spacing(patch.level)
-            storage = array.local_with_halos
-            # the lower corner in the storage, and the fraction of the cell, per axis
-            start, fraction = [], []
-            for axis in range(self.ndim):
-                c = cell[axis][chosen]
-                fraction.append(
-                    (wrapped[axis][chosen] - self.lower_bound[axis]) / spacing[axis] - c
-                )
-                start.append(
-                    c
-                    - patch.box[axis][0]
-                    - layout.index_bounds[axis][0]
-                    + layout.halo[axis]
-                )
-            flat_index, weights = [], []
-            for corner in itertools.product((0, 1), repeat=self.ndim):
-                weight = charge[chosen].copy()
-                for axis, upper in enumerate(corner):
-                    weight *= fraction[axis] if upper else 1.0 - fraction[axis]
-                at = tuple(s + d for s, d in zip(start, corner, strict=True))
-                flat_index.append(np.ravel_multi_index(at, storage.shape))
-                weights.append(weight)
-            added = np.bincount(
-                np.concatenate(flat_index),
-                weights=np.concatenate(weights),
-                minlength=storage.size,
+            storage, grid = self._stored_block(patches[number], name)
+            positions = np.array([w[chosen] for w in wrapped])
+            # the kernels take the nodes component-last: a view with one component
+            LINEAR.scatter_block(positions, charge[chosen], storage[..., None], grid)
+
+    @sp.profile("patchwork.interpolate", tags=PROFILE_TAGS)
+    def interpolate(self, *arguments: Any, name: str | None = None) -> Any:
+        """Interpolate the node-centered field ``name`` at markers, each in its own patch.
+
+        ``interpolate(x, name)`` in 1D, ``interpolate(x, y, name)`` in 2D. Each marker
+        reads the corners of its cell in the finest patch that holds it, with the
+        linear or bilinear weights of :meth:`deposit`, of which this is the transpose:
+        for a field computed patch by patch, such as an electric field that jumps at a
+        coarse-fine edge, every marker sees the field of its own patch. The markers
+        must be on the ranks that :meth:`owner` gives (use :meth:`migrate`) and the
+        halos filled (:meth:`exchange_halos`), since a cell's upper corners may be in
+        the halo. A marker outside the domain gets zero. Returns an array of the shape
+        of ``x``. Collective (the check of the owners).
+        """
+        import numpy as np
+        from mpifield import LINEAR
+
+        coordinates, _, name = self._split(arguments, name, 0, "interpolate")
+        if self.centering(name) != "node":
+            raise ValueError("interpolate is for node-centered fields")
+        flat, shape = self._points(coordinates)
+        found, cell, wrapped = self._cells(flat)
+        wrong = (found >= 0) & (self._owners(found, cell, name) != self.comm.Get_rank())
+        if self.comm.allreduce(int(wrong.sum()), op=MPI.SUM):
+            raise ValueError(
+                "markers must be on the rank that owns them (see owner and migrate)"
             )
-            storage += added.reshape(storage.shape)
+        values = np.zeros(flat[0].size)
+        patches = self.patches
+        for number in np.unique(found[found >= 0]):
+            chosen = np.flatnonzero(found == number)
+            storage, grid = self._stored_block(patches[number], name)
+            positions = np.array([w[chosen] for w in wrapped])
+            result = np.zeros((1, chosen.size))
+            LINEAR.gather_block(positions, storage[..., None], result, grid)
+            values[chosen] = result[0]
+        return values.reshape(shape)
 
     @sp.profile("patchwork.accumulate_halos", tags=PROFILE_TAGS)
     def accumulate_halos(self, name: str) -> None:

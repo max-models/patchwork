@@ -310,3 +310,64 @@ def test_the_owners_are_found_again_after_a_patch_is_added() -> None:
 
     assert after[0] == SIZE - 1
     assert before[0] in range(SIZE)
+
+
+@pytest.mark.parametrize(
+    ("halo", "placed"),
+    [(1, True), (2, True), (1, False)],
+    ids=["placed", "wide halo", "all ranks"],
+)
+def test_interpolation_is_the_composite_interpolant_and_the_deposit_s_transpose(
+    halo, placed
+) -> None:
+    mesh = hierarchy(halo=halo, placed=placed)
+    x, y, q, _ = markers()
+    nodes = CompositeNodes(mesh)
+    values = np.random.default_rng(5).normal(size=nodes.num_nodes)
+    nodes.to_patches(values, "q")
+    mesh.exchange_halos("q")
+
+    nx, ny, nq = mesh.migrate(*share(x, y, q), name="q")
+    found = mesh.interpolate(nx, ny, "q")
+
+    expected = nodes.evaluation(np.array([nx, ny])) @ values
+    assert found.shape == nx.shape
+    assert np.abs(found - expected).max() < 1e-12
+    # the transpose of the deposit: the work of the markers' charges in the field
+    work = WORLD.allreduce(float(nq @ found), op=MPI.SUM)
+    assert work == pytest.approx(float(nodes.deposit(np.array([x, y]), q) @ values))
+
+
+def test_every_marker_reads_the_field_of_its_own_patch() -> None:
+    mesh = hierarchy()
+    # a field that jumps at every patch edge: each patch holds its own number
+    for number, patch in enumerate(mesh.patches):
+        if patch.is_local:
+            patch.field("q").local_with_halos[...] = float(number)
+    x, y, _, _ = markers()
+    nx, ny = mesh.migrate(*share(x, y), name="q")
+
+    found = mesh.interpolate(nx, ny, "q")
+
+    # the weights sum to one up to round-off
+    assert np.abs(found - mesh.locate(nx, ny)).max() < 1e-12
+
+
+def test_interpolation_outside_the_domain_is_zero_and_checks_its_field() -> None:
+    mesh = hierarchy()
+    mesh.allocate_field("cells")
+    for patch in mesh.local_patches:
+        patch.field("q").local_with_halos[...] = 1.0
+    x, y, _, _ = markers(40)
+    nx, ny = mesh.migrate(*share(x, y), name="q")
+
+    found = mesh.interpolate(
+        np.concatenate([nx, [-0.3, 1.4]]), np.concatenate([ny, [0.5, 0.5]]), "q"
+    )
+
+    assert np.allclose(found[:-2], 1.0) and np.array_equal(found[-2:], [0.0, 0.0])
+    with pytest.raises(ValueError, match="node-centered"):
+        mesh.interpolate(nx, ny, "cells")
+    if SIZE > 1:
+        with pytest.raises(ValueError, match="rank that owns them"):
+            mesh.interpolate(x, y, "q")  # every rank has all of them

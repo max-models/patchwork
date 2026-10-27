@@ -60,11 +60,15 @@ the charge of the markers over the nodes (cloud-in-cell) patch by patch.
 `accumulate_halos` then brings it to the composite nodes: the halos of
 the blocks and the copies of a node in several patches are added to one
 copy, the one `CompositeNodes.from_patches` reads, so the charge is that
-of `CompositeNodes.deposit`, to round-off. `regrid` can fill the halos
-afterwards (`fill_halos`), keep patches off given cells (`forbid`, for
-example a periodic seam) and off one-cell-wide shapes
-(`min_patch_size`); a patch can be placed by a function (`placement`)
-and a large one split over ranks (`max_cells_per_rank`).
+of `CompositeNodes.deposit`, to round-off. `interpolate` is the
+transpose: each marker reads a node field in its own patch (after
+`exchange_halos`), so a field computed patch by patch is seen as its
+patch has it. Both run mpifield’s compiled linear weighting on each
+patch block. `regrid` can fill the halos afterwards (`fill_halos`), keep
+patches off given cells (`forbid`, for example a periodic seam) and off
+one-cell-wide shapes (`min_patch_size`); a patch can be placed by a
+function (`placement`) and a large one split over ranks
+(`max_cells_per_rank`).
 
 A distributed composite solve is planned next.
 

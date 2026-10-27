@@ -27,6 +27,8 @@ dependencies = [
   "cunumpy>=0.7.0",
   "maybempi>=0.1.2",
   "mpiarray>=0.2.1",
+  # the per-patch deposit and interpolation (Weighting.scatter_block, gather_block)
+  "mpifield>=0.1.0",
   "numpy",
   "scipy",
   "scope-profiler>=0.7.5",
@@ -106,4 +108,5 @@ show_missing = true
 cunumpy = { git = "https://github.com/max-models/cunumpy", branch = "devel" }
 maybempi = { git = "https://github.com/max-models/maybempi", branch = "devel" }
 mpiarray = { git = "https://github.com/max-models/mpiarray", branch = "devel" }
+mpifield = { git = "https://github.com/max-models/mpifield", branch = "devel" }
 scope-profiler = { git = "https://github.com/max-models/scope-profiler", branch = "devel" }

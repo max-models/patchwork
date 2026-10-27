@@ -4,8 +4,7 @@
 (see ``cunumpy.kernels.set_host_kernel_implementation`` to choose).
 """
 
-import cunumpy as xp
+from patchwork.kernels import KERNEL_PACKAGE
 
-from patchwork.kernels._build import KERNEL_OPTIONS
-
-kernel = xp.kernels.Kernel.from_folder(__name__, **KERNEL_OPTIONS)
+# host kernels only: no CUDA version, so CuPy arrays fall back to the host one
+kernel = KERNEL_PACKAGE.from_folder(__name__, missing_cuda="fallback")
