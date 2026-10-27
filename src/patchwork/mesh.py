@@ -1139,7 +1139,7 @@ class AMRHierarchy:
             * (patch.box[axis][0] + layout.index_bounds[axis][0] - layout.halo[axis])
             for axis in range(self.ndim)
         ]
-        return storage, BlockGrid.from_geometry(first, spacing, storage.shape)
+        return storage, BlockGrid.from_geometry(tuple(first), spacing, storage.shape)
 
     @sp.profile("patchwork.deposit", tags=PROFILE_TAGS)
     def deposit(
