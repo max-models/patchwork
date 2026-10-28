@@ -371,3 +371,29 @@ def test_interpolation_outside_the_domain_is_zero_and_checks_its_field() -> None
     if SIZE > 1:
         with pytest.raises(ValueError, match="rank that owns them"):
             mesh.interpolate(x, y, "q")  # every rank has all of them
+
+
+def test_points_beyond_a_periodic_face_are_wrapped_into_the_domain() -> None:
+    mesh = hierarchy()
+    inside = np.array([[0.2, 0.7], [0.0, 0.5]])
+    assert mesh.wrapped(inside) is inside  # nothing to wrap: no copy
+    points = np.array([[0.2, 0.7, 1.5], [1.25, -0.25, 1.0]])
+    wrapped = mesh.wrapped(points)
+    np.testing.assert_allclose(wrapped, [[0.2, 0.7, 1.5], [0.25, 0.75, 0.0]])
+    assert points[1, 0] == 1.25  # a copy
+    mesh.wrap(points)  # in place; x is not periodic and stays
+    np.testing.assert_array_equal(points, wrapped)
+    np.testing.assert_array_equal(mesh.locate(*wrapped), mesh.locate(*points))
+
+
+def test_the_node_grid_of_a_patch_holds_its_nodes() -> None:
+    mesh = hierarchy()
+    for patch in mesh.patches:
+        grid = mesh.node_grid(patch)
+        dx, dy = mesh.spacing(patch.level)
+        (i0, _), (j0, _) = patch.box
+        np.testing.assert_allclose(grid.bounds.lower_bound, (i0 * dx, j0 * dy))
+        np.testing.assert_allclose(grid.grid_spacing, (dx, dy))
+        assert tuple(grid.num_gridpoints) == patch.node_shape
+        assert grid.periodic == (False, False)
+        assert grid.geometry == (i0 * dx, j0 * dy, dx, dy, *patch.node_shape, 0, 0)

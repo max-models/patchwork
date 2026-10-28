@@ -1008,6 +1008,40 @@ class AMRHierarchy:
         points, shape = self._points(coordinates)
         return self._cells(points)[0].reshape(shape)
 
+    def wrap(self, points: Any) -> None:
+        """Move ``points`` ``(ndim, k)`` beyond a periodic face back into the domain, in place.
+
+        Only the points outside the domain along a periodic axis are touched.
+        """
+        import numpy as np
+
+        for axis, ((lower, upper), periodic) in enumerate(
+            zip(self.bounds, self.periodic, strict=True)
+        ):
+            if periodic:
+                row = points[axis]
+                out = np.flatnonzero((row < lower) | (row >= upper))
+                if out.size:
+                    row[out] = lower + np.mod(row[out] - lower, upper - lower)
+
+    def wrapped(self, points: Any) -> Any:
+        """``points`` ``(ndim, k)`` moved into the domain along its periodic axes.
+
+        The array itself if no point is beyond a periodic face, else a wrapped
+        copy (see :meth:`wrap`).
+        """
+        import numpy as np
+
+        for axis, ((lower, upper), periodic) in enumerate(
+            zip(self.bounds, self.periodic, strict=True)
+        ):
+            row = points[axis]
+            if periodic and ((row < lower) | (row >= upper)).any():
+                points = np.array(points, dtype=float)
+                self.wrap(points)
+                break
+        return points
+
     def _owners(self, found: Any, cell: tuple[Any, ...], name: str) -> Any:
         """The rank that holds the block of field ``name`` where each marker's cell starts."""
         import numpy as np
@@ -1121,25 +1155,40 @@ class AMRHierarchy:
         )
         return tuple(np.asarray(array) for array in received)
 
+    def _grid(self, patch: Patch, first: Sequence[int], shape: Sequence[int]) -> Any:
+        """The :class:`mpifield.BlockGrid` of ``shape`` nodes of ``patch`` from node ``first`` on."""
+        from mpifield import BlockGrid
+
+        spacing = self.spacing(patch.level)
+        lower = tuple(
+            self.lower_bound[axis] + spacing[axis] * (patch.box[axis][0] + first[axis])
+            for axis in range(self.ndim)
+        )
+        return BlockGrid.from_geometry(lower, spacing, tuple(shape))
+
+    def node_grid(self, patch: Patch) -> Any:
+        """The nodes of ``patch`` as an :class:`mpifield.BlockGrid`: all of them, no halo.
+
+        For compiled kernels that run on a patch's node array, such as a push
+        that gathers each marker's field in its own patch. No axis is periodic:
+        a patch holds every node, both images of a periodic seam too.
+        """
+        return self._grid(patch, (0,) * self.ndim, patch.node_shape)
+
     def _stored_block(self, patch: Patch, name: str) -> tuple[Any, Any]:
         """This rank's block of field ``name`` on ``patch``, halo included, and its grid.
 
         The grid is an :class:`mpifield.BlockGrid` of the stored nodes (the first one is
         the first halo node), so mpifield's weightings run on the block as on a field's.
         """
-        from mpifield import BlockGrid
-
         array = patch.field(name)
         layout = array.layout
-        spacing = self.spacing(patch.level)
         storage = array.local_with_halos
         first = [
-            self.lower_bound[axis]
-            + spacing[axis]
-            * (patch.box[axis][0] + layout.index_bounds[axis][0] - layout.halo[axis])
+            layout.index_bounds[axis][0] - layout.halo[axis]
             for axis in range(self.ndim)
         ]
-        return storage, BlockGrid.from_geometry(tuple(first), spacing, storage.shape)
+        return storage, self._grid(patch, first, storage.shape)
 
     @sp.profile("patchwork.deposit", tags=PROFILE_TAGS)
     def deposit(

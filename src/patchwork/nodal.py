@@ -1009,17 +1009,6 @@ class NodalPoisson:
     """
 
     # Assembly ------------------------------------------------------------------#
-    def _wrapped(self, points: np.ndarray) -> np.ndarray:
-        """``points`` ``(ndim, k)`` moved into the domain along its periodic axes."""
-        hierarchy = self.nodes.hierarchy
-        if not any(hierarchy.periodic):
-            return points
-        points = points.copy()
-        for axis, (lower, upper) in enumerate(hierarchy.bounds):
-            if hierarchy.periodic[axis]:
-                points[axis] = lower + (points[axis] - lower) % (upper - lower)
-        return points
-
     def _classify_bodies(self) -> None:
         """Which nodes are inside a body, and which one (the last listed)."""
         nodes = self.nodes
@@ -1047,7 +1036,9 @@ class NodalPoisson:
             if body.fraction is not None:
                 fraction = np.asarray(body.fraction(start, start + step), dtype=float)
             else:
-                fraction = _surface_crossing(body.inside, start, step, self._wrapped)
+                fraction = _surface_crossing(
+                    body.inside, start, step, self.nodes.hierarchy.wrapped
+                )
             result[mine] = np.maximum(fraction, self._min_fraction)
         return result
 
