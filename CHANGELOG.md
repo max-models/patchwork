@@ -7,6 +7,11 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `AMRHierarchy.wrap(points)` and `wrapped(points)`: points beyond a periodic face moved back
+  into the domain, in place or as a copy (the array itself when nothing needs wrapping), and
+  `AMRHierarchy.node_grid(patch)`: a patch's nodes as an `mpifield.BlockGrid`, for compiled
+  kernels that run on a patch's node array. The private copies in `cells` and `nodal` are gone.
+
 - Solver backends (`patchwork.backends`): `NodalPoisson(backend=...)` takes a `Backend` or
   its name, and every backend solves the same assembled operator (`LinearSystem`).
   `"lu"` (`LUBackend`, the default) factorizes it with SuperLU, or with LAPACK's tridiagonal

@@ -117,17 +117,6 @@ class EmbeddedFloating:
 Body = EmbeddedDirichlet | EmbeddedFloating
 
 
-def _wrapped(hierarchy: AMRHierarchy, points: np.ndarray) -> np.ndarray:
-    """``points`` ``(ndim, k)`` moved into the domain along its periodic axes."""
-    if not any(hierarchy.periodic):
-        return points
-    points = points.copy()
-    for axis, (lower, upper) in enumerate(hierarchy.bounds):
-        if hierarchy.periodic[axis]:
-            points[axis] = lower + (points[axis] - lower) % (upper - lower)
-    return points
-
-
 class CompositeCells:
     """The leaf cells of a hierarchy, their faces and the maps to its patches.
 
@@ -216,7 +205,7 @@ class CompositeCells:
         Periodic axes wrap; a point on a face belongs to the cell above it, the
         upper faces of the domain to the last cell.
         """
-        points = _wrapped(self.hierarchy, np.asarray(points, dtype=float))
+        points = self.hierarchy.wrapped(np.asarray(points, dtype=float))
         lower = np.asarray(self.hierarchy.lower_bound, dtype=float)
         shape = np.asarray(self.owner.shape)
         lattice = np.floor((points.T - lower) / self._spacing).astype(np.int64)
@@ -769,7 +758,7 @@ class CellOperator:
                 fraction = np.asarray(body.fraction(start, start + step), dtype=float)
             else:
                 fraction = _surface_crossing(
-                    body.inside, start, step, lambda p: _wrapped(hierarchy, p)
+                    body.inside, start, step, hierarchy.wrapped
                 )
             result[mine] = np.maximum(fraction, self._min_fraction)
         return result
