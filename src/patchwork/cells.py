@@ -82,6 +82,7 @@ from patchwork.nodal import (
     Dirichlet,
     EmbeddedDirichlet,
     Neumann,
+    _surface_crossing,
     faces_of,
 )
 
@@ -767,16 +768,9 @@ class CellOperator:
             if body.fraction is not None:
                 fraction = np.asarray(body.fraction(start, start + step), dtype=float)
             else:
-                lo = np.zeros(start.shape[1])
-                hi = np.ones(start.shape[1])
-                for _ in range(48):
-                    mid = 0.5 * (lo + hi)
-                    hit = np.asarray(
-                        body.inside(_wrapped(hierarchy, start + mid * step)), dtype=bool
-                    )
-                    hi = np.where(hit, mid, hi)
-                    lo = np.where(hit, lo, mid)
-                fraction = hi
+                fraction = _surface_crossing(
+                    body.inside, start, step, lambda p: _wrapped(hierarchy, p)
+                )
             result[mine] = np.maximum(fraction, self._min_fraction)
         return result
 
