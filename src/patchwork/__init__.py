@@ -3,6 +3,14 @@
 import scope_profiler as sp
 
 from patchwork._profiling import PROFILE_TAGS
+from patchwork.backends import (
+    AutoBackend,
+    Backend,
+    FFTBackend,
+    LinearSystem,
+    LUBackend,
+    PetscBackend,
+)
 from patchwork.cells import CellOperator, CompositeCells, EmbeddedFloating, cell_body
 from patchwork.distributed import PetscSystem
 from patchwork.mesh import AMRHierarchy, IndexBox, Patch
@@ -26,17 +34,23 @@ __version__ = "0.2.0"
 
 __all__ = [
     "AMRHierarchy",
+    "AutoBackend",
+    "Backend",
     "CellOperator",
     "CompositeCells",
     "CompositeNodes",
     "Dirichlet",
     "EmbeddedDirichlet",
     "EmbeddedFloating",
+    "FFTBackend",
     "FluxRegister",
     "IndexBox",
+    "LUBackend",
+    "LinearSystem",
     "Neumann",
     "NodalPoisson",
     "Patch",
+    "PetscBackend",
     "PetscSystem",
     "__version__",
     "cell_body",

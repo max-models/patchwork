@@ -219,7 +219,7 @@ def test_conditions_change_without_factorizing_again() -> None:
         faces={"x_lower": Dirichlet(0.0), "y_upper": Neumann(0.0)},
         embedded=[body],
     )
-    factorization = solver._factorization
+    factorization = solver.solver
     source = np.ones(solver.nodes.num_nodes)
 
     solver.set_conditions(
@@ -232,7 +232,7 @@ def test_conditions_change_without_factorizing_again() -> None:
         faces={"x_lower": Dirichlet(lambda x, y: 5.0 * y), "y_upper": Neumann(2.0)},
         embedded=[EmbeddedDirichlet(body.inside, -3.0)],
     )
-    assert solver._factorization is factorization
+    assert solver.solver is factorization
     assert solver.solve(source) == pytest.approx(fresh.solve(source), abs=1e-12)
     with pytest.raises(ValueError, match="cannot change its kind"):
         solver.set_conditions(faces={"x_lower": Neumann(0.0)})
