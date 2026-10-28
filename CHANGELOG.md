@@ -7,6 +7,17 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Solver backends (`patchwork.backends`): `NodalPoisson(backend=...)` takes a `Backend` or
+  its name, and every backend solves the same assembled operator (`LinearSystem`).
+  `"lu"` (`LUBackend`, the default) factorizes it with SuperLU, or with LAPACK's tridiagonal
+  LU (LDL^T when symmetric) on a line; `"fft"` (`FFTBackend`) solves a uniform mesh without
+  bodies with fast transforms (FFT on periodic axes, DST-I between Dirichlet faces, DCT-I
+  between Neumann faces), also the singular operators (every axis periodic or Neumann: the
+  solution of zero mean), and `spectral=True` inverts the exact Laplacian on a periodic box;
+  `"petsc"` (`PetscBackend(rtol=, options=)`) is the distributed solve; `"auto"` takes the
+  LU on a line, the FFT where it applies and the LU elsewhere. A backend refuses what it
+  cannot solve with a reason (`Backend.unsupported`).
+
 - `AMRHierarchy.interpolate(x, y, name)`: a node-centered field at markers, each read in the
   finest patch that holds it (the transpose of `deposit`), for fields computed patch by patch
   such as an electric field that jumps at a coarse-fine edge. The markers are on their
@@ -52,6 +63,9 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `NodalPoisson`: `backend="superlu"` is now `"lu"`; `rtol=` and `petsc_options=` moved to
+  `PetscBackend(rtol=, options=)`; `solver.system` is the `LinearSystem` and `solver.solver`
+  what the backend set up (a factorization, a `PetscSystem`, an `FFTSolver`).
 - `AMRHierarchy.deposit` runs mpifield's compiled linear weighting
   (`mpifield.LINEAR.scatter_block`) on each patch block instead of a NumPy `bincount`; the
   result is unchanged to round-off. New dependency: `mpifield`.

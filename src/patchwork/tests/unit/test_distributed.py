@@ -19,6 +19,7 @@ from patchwork import (
     EmbeddedDirichlet,
     Neumann,
     NodalPoisson,
+    PetscBackend,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -64,7 +65,7 @@ def test_petsc_gives_what_superlu_gives(layout: str) -> None:
     found = iterative.solve(_source(x, y))
 
     assert np.abs(found - expected).max() < 1e-8 * np.abs(expected).max()
-    assert not iterative.system.fell_back
+    assert not iterative.solver.fell_back
     # one rank holds every row: the same system in the same order
     assert np.array_equal(iterative.rows, direct.free)
     assert abs(iterative.matrix - direct.matrix).max() < 1e-12
@@ -85,7 +86,7 @@ def test_bodies_charges_and_fields_match_superlu() -> None:
     found = iterative.solve(charge=charge, potential="phi")
 
     assert np.abs(found - expected).max() < 1e-8 * np.abs(expected).max()
-    assert iterative.system.ksp.getType() == "gmres"  # Shortley-Weller rows
+    assert iterative.solver.ksp.getType() == "gmres"  # Shortley-Weller rows
     assert np.array_equal(iterative.nodes.from_patches("phi"), found)
 
 
@@ -114,13 +115,13 @@ def test_a_solve_that_does_not_converge_falls_back() -> None:
     mesh = _mesh("nested")
     direct = NodalPoisson(mesh)
     iterative = NodalPoisson(
-        mesh, backend="petsc", petsc_options={"ksp_max_it": 1, "pc_type": "none"}
+        mesh, backend=PetscBackend(options={"ksp_max_it": 1, "pc_type": "none"})
     )
     x, y = direct.nodes.coordinates.T
 
     found = iterative.solve(_source(x, y))
 
-    assert iterative.system.fell_back
+    assert iterative.solver.fell_back
     assert np.abs(found - direct.solve(_source(x, y))).max() < 1e-7
 
 

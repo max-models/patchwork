@@ -30,10 +30,10 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import scipy.sparse as sparse
-import scipy.sparse.linalg
 import scope_profiler as sp
 
 from patchwork._profiling import PROFILE_TAGS
+from patchwork.backends import Backend, LinearSystem, backend_of
 
 if TYPE_CHECKING:
     from patchwork.mesh import AMRHierarchy, Patch
@@ -966,37 +966,46 @@ class CompositeNodes:
 class NodalPoisson:
     r"""Solve :math:`-\nabla^2\phi = f` on the nodes of a patch hierarchy.
 
-    The operator is assembled and factorized once; :meth:`solve` then costs two
-    triangular solves. ``faces`` maps ``"x_lower"``, ``"x_upper"``,
-    ``"y_lower"``, ``"y_upper"`` (only the first two in 1D) to a
-    :class:`Dirichlet` or :class:`Neumann` condition; a face that is not listed is a grounded Dirichlet face, and the
-    faces of a periodic axis take none. On a domain that does not fill its
-    rectangle (``AMRHierarchy(base_boxes=...)``) these are the parts of its
-    boundary on the rectangle's faces, and ``"inner"`` is the rest: the edges
-    inside the rectangle. ``embedded`` are bodies at fixed potentials
+    The operator is assembled and its backend set up once (factorized, by
+    default); :meth:`solve` then costs two triangular solves. ``faces`` maps
+    ``"x_lower"``, ``"x_upper"``, ``"y_lower"``, ``"y_upper"`` (only the
+    first two in 1D) to a :class:`Dirichlet` or :class:`Neumann` condition; a
+    face that is not listed is a grounded Dirichlet face, and the faces of a
+    periodic axis take none. On a domain that does not fill its rectangle
+    (``AMRHierarchy(base_boxes=...)``) these are the parts of its boundary on
+    the rectangle's faces, and ``"inner"`` is the rest: the edges inside the
+    rectangle. ``embedded`` are bodies at fixed potentials
     (:class:`EmbeddedDirichlet`); where they overlap the last one listed wins.
 
-    ``backend="superlu"`` (the default) assembles the whole operator on every
-    rank and factorizes it there. ``backend="petsc"`` (needs petsc4py) assembles
-    on every rank only the rows of the unknowns it owns
-    (:attr:`CompositeNodes.node_ranks`, from where the patches are), from the
-    leaf cells around them, and solves them together with a PETSc Krylov method
-    and an algebraic multigrid preconditioner (see :class:`PetscSystem`) to the
-    relative residual ``rtol``; ``petsc_options`` are PETSc options without
-    the dash, e.g. ``{"pc_type": "gamg"}``. Both give the potential on all
-    nodes on every rank.
+    ``backend`` solves the assembled operator (:mod:`patchwork.backends`): a
+    :class:`~patchwork.backends.Backend` or its name. ``"lu"`` (the default)
+    assembles the whole operator on every rank and factorizes it there
+    (SuperLU; LAPACK's tridiagonal LU on a line). ``"petsc"`` (needs
+    petsc4py; ``PetscBackend(rtol=..., options=...)`` for its tolerance and
+    PETSc options) assembles on every rank only the rows of the unknowns it
+    owns (:attr:`CompositeNodes.node_ranks`, from where the patches are), from
+    the leaf cells around them, and solves them together with a PETSc Krylov
+    method and an algebraic multigrid preconditioner (see
+    :class:`PetscSystem`). ``"fft"`` solves a uniform mesh without bodies
+    with fast transforms, also when nothing fixes the potential (every axis
+    periodic or Neumann: the solution of zero mean); ``"auto"`` takes the LU
+    on a line, the FFT where it applies and the LU elsewhere. All give the
+    potential on all nodes on every rank.
 
     Attributes:
         nodes: The :class:`CompositeNodes` of the hierarchy.
         free: Node numbers of the unknowns: neither hanging nor fixed.
         fixed: Whether a node has a prescribed value (a face or a body).
         rows: Node numbers of the unknowns whose rows this rank holds: all of
-            :attr:`free` with SuperLU, those it owns with PETSc (in the order of
-            the distributed system: by rank, then by node number).
+            :attr:`free`, or those it owns with a distributed backend (in the
+            order of the distributed system: by rank, then by node number).
         matrix: This rank's rows of the operator, over the columns of the
-            unknowns (in :attr:`free` order with SuperLU, in the distributed
-            order with PETSc).
-        system: The :class:`PetscSystem` (PETSc backend), else ``None``.
+            unknowns (in :attr:`free` order, or in the distributed order).
+        backend: The :class:`~patchwork.backends.Backend`.
+        system: The :class:`~patchwork.backends.LinearSystem` it solves.
+        solver: What the backend set up (an LU factorization, a
+            :class:`PetscSystem`, an :class:`~patchwork.backends.FFTSolver`),
+            ``None`` without unknowns.
     """
 
     # Assembly ------------------------------------------------------------------#
@@ -1224,16 +1233,11 @@ class NodalPoisson:
         self.fixed |= solid
         self.fixed &= ~nodes.hanging
         self.free = np.nonzero(~self.fixed & ~nodes.hanging)[0]
-        if not self.fixed.any():
-            raise ValueError(
-                "the Poisson operator is singular: without a Dirichlet face or "
-                "an embedded body the potential is only known up to a constant"
-            )
         fixed = np.nonzero(self.fixed)[0]
         self._fixed_nodes = fixed
 
         reduction = nodes.reduction
-        if self.backend == "petsc":
+        if self.backend.distributed:
             # the unknowns by owner: every rank's rows are contiguous
             comm = nodes.hierarchy.comm
             owner = nodes.node_ranks[self.free]
@@ -1260,32 +1264,22 @@ class NodalPoisson:
         self._integral_load = pick
         self._lift = reduced[:, fixed].tocsr()
         self._reduction_rows = reduction[np.nonzero(nodes.hanging)[0]].tocsr()
-        self._factorization = None
-        self.system = None
-        if self.backend == "petsc":
-            from patchwork.distributed import PetscSystem
-
-            self.matrix = reduced[:, self._unknowns].tocsr()
-            if self.free.size:
-                self.system = PetscSystem(
-                    self.matrix,
-                    nodes.hierarchy.comm,
-                    symmetric=not self._embedded,
-                    options=self._petsc_options,
-                    prefix="patchwork_nodal_",
-                    rtol=self._rtol,
-                )
-            return
-        matrix = reduced[:, self.free].tocsc()
-        self.matrix = matrix
-        if self.free.size:
-            # minimum degree on the pattern of A + A^T: the mesh's own graph,
-            # about half the fill of the default column ordering; the symmetric
-            # mode keeps the diagonal pivots that ordering assumes (the operator
-            # is diagonally dominant), a fifth faster than threshold pivoting
-            self._factorization = scipy.sparse.linalg.splu(
-                matrix, permc_spec="MMD_AT_PLUS_A", options={"SymmetricMode": True}
-            )
+        self.matrix = reduced[:, self._unknowns].tocsr()
+        self.system = LinearSystem(
+            matrix=self.matrix,
+            unknowns=self._unknowns,
+            rows=self.rows,
+            nodes=nodes,
+            faces=dict(self._faces),
+            bodies=len(self._embedded),
+            singular=not self.fixed.any(),
+            symmetric=not self._embedded,
+            comm=nodes.hierarchy.comm,
+        )
+        reason = self.backend.unsupported(self.system)
+        if reason is not None:
+            raise ValueError(reason)
+        self.solver = self.backend.setup(self.system) if self.free.size else None
 
     # Boundary values ---------------------------------------------------------------#
     def _update_values(self) -> None:
@@ -1327,21 +1321,15 @@ class NodalPoisson:
         embedded: Sequence[EmbeddedDirichlet] = (),
         min_fraction: float = 1.0e-3,
         nodes: CompositeNodes | None = None,
-        backend: str = "superlu",
-        rtol: float = 1.0e-10,
-        petsc_options: Mapping[str, Any] | None = None,
+        backend: str | Backend = "lu",
     ) -> None:
-        """Assemble and factorize the operator.
+        """Assemble the operator and set up its backend.
 
         ``min_fraction`` is the smallest fraction of an edge between a node and
         an embedded surface: a surface closer than that (through the node, up to
         round-off) is moved there, which bounds the size of that node's row.
         """
-        if backend not in ("superlu", "petsc"):
-            raise ValueError(f"backend must be 'superlu' or 'petsc', got {backend!r}")
-        self.backend = backend
-        self._rtol = float(rtol)
-        self._petsc_options = dict(petsc_options or {})
+        self.backend = backend_of(backend)
         self.nodes = CompositeNodes(hierarchy) if nodes is None else nodes
         self._embedded = tuple(embedded)
         self._min_fraction = float(min_fraction)
@@ -1423,10 +1411,8 @@ class NodalPoisson:
         """
         nodes = self.nodes
         potential = self._values.copy()
-        if self._factorization is not None:
-            potential[self.free] = self._factorization.solve(right_hand_side)
-        if self.system is not None:
-            potential[self._unknowns] = self.system.solve(right_hand_side)
+        if self.solver is not None:
+            potential[self._unknowns] = self.solver.solve(right_hand_side)
         if nodes.hanging.any():
             potential[nodes.hanging] = self._reduction_rows @ potential
         return potential
@@ -1487,7 +1473,7 @@ def solve_nodal_poisson(
     potential: str = "potential",
     faces: Mapping[str, Dirichlet | Neumann] | None = None,
     embedded: Sequence[EmbeddedDirichlet] = (),
-    backend: str = "superlu",
+    backend: str | Backend = "lu",
 ) -> NodalPoisson:
     r"""Solve :math:`-\nabla^2\phi = \mathrm{rhs}` once on the nodes of ``hierarchy``.
 

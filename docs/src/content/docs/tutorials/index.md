@@ -12,7 +12,8 @@ Step by step, from a first hierarchy to stencils on patches:
 2. [Poisson's equation on cells](/patchwork/tutorials/02-cell-centered-poisson/): the
    conservative cell-centered solve and its convergence.
 3. [Poisson's equation on nodes](/patchwork/tutorials/03-node-centered-poisson/): faces with
-   different conditions, periodic axes, electrodes, solving again, and uniform-grid maps.
+   different conditions, periodic axes, electrodes, solving again, uniform-grid maps, and
+   the solver backends (LU, FFT, PETSc).
 4. [Domains that are not rectangles](/patchwork/tutorials/04-non-rectangular-domains/): an L
    and a T, with patches at their inner corners.
 5. [Halos: stencils on patches](/patchwork/tutorials/05-halo-exchange/): halo exchange and

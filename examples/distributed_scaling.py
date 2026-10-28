@@ -1,4 +1,4 @@
-"""Timings of the node-centered solve: SuperLU on every rank against PETSc over the ranks.
+"""Timings of the node-centered solve: the LU (SuperLU) on every rank against PETSc over the ranks.
 
 Run under ``mpirun -n N python examples/distributed_scaling.py [--base 256] [--weak]``.
 The hierarchy is a ``base x base`` mesh with a level-1 patch over its middle
@@ -8,10 +8,10 @@ the base mesh grows with the ranks (``base * sqrt(N)`` per side), so the
 unknowns per rank stay about the same.
 
 Prints, on rank 0, the unknowns, the time to number the nodes, to assemble
-(and factorize, for SuperLU), to solve, the Krylov iterations and the largest
+(and factorize, for the LU), to solve, the Krylov iterations and the largest
 difference of the two solutions. Times are the slowest rank's, the best of
-``--repeat`` solves. SuperLU is run on every rank for itself, as
-``NodalPoisson`` does by default (skip it with ``--no-superlu``).
+``--repeat`` solves. The LU is run on every rank for itself, as
+``NodalPoisson`` does by default (skip it with ``--no-lu``).
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ def main() -> None:
     parser.add_argument("--base", type=int, default=256)
     parser.add_argument("--weak", action="store_true")
     parser.add_argument("--repeat", type=int, default=3)
-    parser.add_argument("--no-superlu", action="store_true")
+    parser.add_argument("--no-lu", action="store_true")
     args = parser.parse_args()
     base = args.base
     if args.weak:
@@ -75,7 +75,7 @@ def main() -> None:
     rhs = source(x, y)
     rows = []
     solutions = {}
-    backends = ["petsc"] if args.no_superlu else ["superlu", "petsc"]
+    backends = ["petsc"] if args.no_lu else ["lu", "petsc"]
     for backend in backends:
         solver, setup = timed(
             lambda backend=backend: NodalPoisson(mesh, nodes=nodes, backend=backend)
@@ -91,14 +91,14 @@ def main() -> None:
         rows.append((backend, solver.free.size, held, setup, best, iterations))
 
     difference = (
-        np.abs(solutions["petsc"] - solutions["superlu"]).max()
-        if "superlu" in solutions
+        np.abs(solutions["petsc"] - solutions["lu"]).max()
+        if "lu" in solutions
         else float("nan")
     )
     if RANK == 0:
         print(
             f"ranks {SIZE}, base {base}, {nodes.num_nodes} nodes, "
-            f"numbering {numbering:.3f} s, |petsc - superlu| = {difference:.1e}"
+            f"numbering {numbering:.3f} s, |petsc - lu| = {difference:.1e}"
         )
         print(
             f"{'backend':8} {'unknowns':>9} {'rows/rank':>9} "
