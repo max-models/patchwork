@@ -76,6 +76,11 @@ jobs:
       - name: Run the PETSc and MPI tests
         env:
           OMP_NUM_THREADS: "1"
+          # Open MPI's UCX cannot open the network card of some runners (Azure MANA:
+          # "uct_iface_open ... Address not valid") and the ranks then fail or hang;
+          # on one machine the shared-memory transport of ob1 is all the tests need
+          OMPI_MCA_pml: ob1
+          OMPI_MCA_osc: ^ucx
         run: |
           python -c "from petsc4py import PETSc; print(PETSc.Sys.getVersion())"
           python -m pytest -ra src/patchwork/tests/unit/test_distributed.py src/patchwork/tests/unit/test_mpi.py

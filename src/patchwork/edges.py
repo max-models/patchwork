@@ -273,3 +273,89 @@ class CompositeEdges:
         vectors = np.asarray(vectors, dtype=float)
         x, y = self.evaluation(points)
         return x.T @ vectors[0] + y.T @ vectors[1]
+
+    def _pieces(
+        self, start: np.ndarray, end: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The straight paths from ``start`` to ``end`` ``(2, k)``, cut at the finest lattice.
+
+        Returns the path of every piece and its two ends ``(2, pieces)``. A
+        piece lies in one cell of the finest lattice, and so in one leaf cell.
+        """
+        nodes = self.nodes
+        origin = nodes._origin[:, None]
+        spacing = nodes._spacing[:, None]
+        lower = (start - origin) / spacing
+        upper = (end - origin) / spacing
+        count = start.shape[1]
+        paths, times = [np.arange(count)] * 2, [np.zeros(count), np.ones(count)]
+        for axis in range(2):
+            a, b = lower[axis], upper[axis]
+            first = np.floor(np.minimum(a, b)).astype(np.int64) + 1
+            last = np.ceil(np.maximum(a, b)).astype(np.int64) - 1
+            crossings = np.maximum(last - first + 1, 0)
+            path = np.repeat(np.arange(count), crossings)
+            offset = np.repeat(np.cumsum(crossings) - crossings, crossings)
+            line = first[path] + np.arange(path.size) - offset
+            paths.append(path)
+            times.append((line - a[path]) / (b - a)[path])
+        path = np.concatenate(paths)
+        time = np.concatenate(times)
+        order = np.lexsort((time, path))
+        path, time = path[order], time[order]
+        # consecutive times of one path bound a piece
+        same = path[1:] == path[:-1]
+        path, begin, finish = path[1:][same], time[:-1][same], time[1:][same]
+        step = end - start
+        return (
+            path,
+            start[:, path] + begin * step[:, path],
+            start[:, path] + finish * step[:, path],
+        )
+
+    def deposit_paths(
+        self, start: np.ndarray, end: np.ndarray, charges: np.ndarray
+    ) -> np.ndarray:
+        """The current of charges moving along straight paths, integrated over the paths: ``(n1,)``.
+
+        Every charge goes from ``start`` to ``end`` (``(2, k)``, not wrapped into
+        the domain on a periodic axis); its path is split at every cell face it
+        crosses, patch edges included, and each piece is integrated exactly
+        against the edge functions of its leaf cell: ``q * integral of w . dl``.
+        Then the charge is conserved exactly: ``(G T)^T j`` is the change of the
+        charge on the nodes, ``T^T`` of :meth:`CompositeNodes.deposit
+        <patchwork.nodal.CompositeNodes.deposit>` at the ends minus at the
+        starts, and ``j @ e`` is the work of the field ``e`` on the charges. The
+        current density times the time step, summed over a step's paths, is
+        ``j``. Pieces outside the domain deposit nothing. A NumPy reference,
+        one pass over all pieces.
+        """
+        start = np.asarray(start, dtype=float)
+        end = np.asarray(end, dtype=float)
+        charges = np.asarray(charges, dtype=float).reshape(-1)
+        if start.shape != end.shape or start.shape != (2, charges.size):
+            raise ValueError(
+                f"paths from {start.shape} to {end.shape} for {charges.size} charges"
+            )
+        path, a, b = self._pieces(start, end)
+        nodes = self.nodes
+        # the edge functions are linear in a leaf cell: the midpoint integrates them
+        leaf, fraction, inside = nodes.point_cells(0.5 * (a + b))
+        size = nodes.cell_size[leaf]
+        charge = np.where(inside, charges[path], 0.0)
+        step = b - a
+        current = np.zeros(self.num_edges)
+        for direction, (low, high) in ((0, (0, 1)), (1, (2, 3))):
+            across = fraction[1 - direction]
+            along = charge * step[direction] / size[:, direction]
+            current += np.bincount(
+                self.cell_edges[leaf, low],
+                weights=(1.0 - across) * along,
+                minlength=self.num_edges,
+            )
+            current += np.bincount(
+                self.cell_edges[leaf, high],
+                weights=across * along,
+                minlength=self.num_edges,
+            )
+        return current

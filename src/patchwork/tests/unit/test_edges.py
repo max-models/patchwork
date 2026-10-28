@@ -163,3 +163,74 @@ def test_the_edge_space_is_two_dimensional() -> None:
     nodes = CompositeNodes(AMRHierarchy(base_shape=(8,)))
     with pytest.raises(NotImplementedError, match="two-dimensional"):
         CompositeEdges(nodes)
+
+
+def _continuity_error(edges: CompositeEdges, start, end, charges) -> float:
+    """``(G T)^T j`` against the change of the composite nodal charge, relative."""
+    nodes = edges.nodes
+    current = edges.deposit_paths(start, end, charges)
+    divergence = (edges.gradient @ nodes.reduction).T @ current
+    change = nodes.reduction.T @ (
+        nodes.deposit(end, charges) - nodes.deposit(start, charges)
+    )
+    return float(np.abs(divergence - change).max() / np.abs(charges).max())
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        ((0.03, 0.03), (0.05, 0.06)),  # inside a coarse cell
+        ((0.03, 0.03), (0.2, 0.05)),  # across faces of coarse cells
+        ((0.45, 0.4), (0.55, 0.62)),  # across the edge of the level-1 patch
+        ((0.4, 0.4), (1.3, 0.85)),  # through both patches and out
+        ((1.0, 0.97), (1.1, 1.08)),  # across the periodic seam
+        ((0.6, 0.5), (0.6, 0.7)),  # along a lattice line
+        ((0.5, 0.5), (0.75, 0.75)),  # through lattice corners
+    ],
+)
+def test_the_path_deposit_conserves_the_charge(start, end) -> None:
+    edges = _edges("nested", periodic=(False, True))
+    start, end = np.array(start)[:, None], np.array(end)[:, None]
+    assert _continuity_error(edges, start, end, np.array([1.5])) < 1e-12
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_many_random_paths_conserve_the_charge(layout: str) -> None:
+    edges = _edges(layout, periodic=(False, True))
+    rng = np.random.default_rng(4)
+    start = _points(500, seed=9) * np.array([[0.9], [1.0]]) + np.array([[0.1], [0.0]])
+    end = start + rng.normal(scale=0.15, size=start.shape)
+    end[0] = np.clip(end[0], 0.0, 2.0)  # bounded in x, periodic in y
+    charges = rng.normal(size=500)
+    assert _continuity_error(edges, start, end, charges) < 1e-12
+
+
+def test_the_work_of_a_gradient_field_is_the_potential_difference() -> None:
+    edges = _edges("level jump", periodic=(False, True))
+    nodes = edges.nodes
+    phi = _potential(nodes)
+    start = np.array([[0.3, 0.9, 1.6], [0.2, 0.95, 0.4]])
+    end = np.array([[1.4, 1.1, 0.7], [0.65, 1.3, 0.55]])
+    charges = np.array([1.0, -2.0, 0.5])
+    work = edges.deposit_paths(start, end, charges) @ (edges.gradient @ phi)
+    expected = charges @ (nodes.evaluation(end) @ phi - nodes.evaluation(start) @ phi)
+    assert work == pytest.approx(expected, rel=1e-12)
+
+
+def test_a_uniform_field_does_the_work_of_its_displacement() -> None:
+    edges = _edges("two patches")
+    field = np.array([2.0, -0.5])
+    e = edges.length * field[edges.direction]
+    start = np.array([[0.1, 1.9], [0.1, 0.8]])
+    end = np.array([[1.7, 0.2], [0.9, 0.15]])
+    charges = np.array([0.7, 1.1])
+    work = edges.deposit_paths(start, end, charges) @ e
+    assert work == pytest.approx(float(charges @ (field @ (end - start))), rel=1e-12)
+
+
+def test_a_path_that_stays_put_deposits_nothing_and_shapes_are_checked() -> None:
+    edges = _edges("nested")
+    point = np.array([[0.4], [0.3]])
+    np.testing.assert_array_equal(edges.deposit_paths(point, point, np.ones(1)), 0.0)
+    with pytest.raises(ValueError, match="paths"):
+        edges.deposit_paths(point, np.zeros((2, 2)), np.ones(1))
