@@ -15,6 +15,11 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   for `G phi`) and `deposit(points, vectors)`, its transpose. `CompositeNodes.point_cells`
   gives the leaf cell of points and where in it they are. Tutorial: the edge space.
 
+- `CompositeEdges.deposit_paths(start, end, charges)`: the current of charges moving along
+  straight paths, each path split at every cell face it crosses (patch edges and periodic
+  seams included) and integrated exactly against the edge functions. The charge is conserved
+  to round-off: `(G T)^T j` is the change of the deposited nodal charge. A NumPy reference.
+
 - `AMRHierarchy.wrap(points)` and `wrapped(points)`: points beyond a periodic face moved back
   into the domain, in place or as a copy (the array itself when nothing needs wrapping), and
   `AMRHierarchy.node_grid(patch)`: a patch's nodes as an `mpifield.BlockGrid`, for compiled
