@@ -13,6 +13,7 @@ from patchwork.backends import (
 )
 from patchwork.cells import CellOperator, CompositeCells, EmbeddedFloating, cell_body
 from patchwork.distributed import PetscSystem
+from patchwork.edges import CompositeEdges
 from patchwork.mesh import AMRHierarchy, IndexBox, Patch
 from patchwork.nodal import (
     CompositeNodes,
@@ -38,6 +39,7 @@ __all__ = [
     "Backend",
     "CellOperator",
     "CompositeCells",
+    "CompositeEdges",
     "CompositeNodes",
     "Dirichlet",
     "EmbeddedDirichlet",

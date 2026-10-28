@@ -719,11 +719,14 @@ class CompositeNodes:
             minlength=self.num_nodes,
         )
 
-    def cell_weights(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Corner nodes and (bi)linear weights, ``(k, 2**ndim)``, of the leaf cell of each point.
+    def point_cells(
+        self, points: np.ndarray
+    ) -> tuple[np.ndarray, list[np.ndarray], np.ndarray]:
+        """The leaf cell of each point ``(ndim, k)``, where in it, and whether it is inside.
 
-        The corners are in the order of :attr:`cell_corners`; a point outside
-        the domain has weights zero.
+        Returns the leaf cell (0 for a point outside the domain), the fraction
+        of the cell's span from its lower corner per axis (one array per axis),
+        and whether the point is in the domain.
         """
         points = np.asarray(points, dtype=float)
         ndim = self.ndim
@@ -775,6 +778,15 @@ class CompositeNodes:
         fraction = [
             (local[axis] - self.cell_lower[leaf, axis]) / span for axis in range(ndim)
         ]
+        return leaf, fraction, inside
+
+    def cell_weights(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Corner nodes and (bi)linear weights, ``(k, 2**ndim)``, of the leaf cell of each point.
+
+        The corners are in the order of :attr:`cell_corners`; a point outside
+        the domain has weights zero.
+        """
+        leaf, fraction, inside = self.point_cells(points)
         weights = np.column_stack(
             [
                 np.prod(
@@ -784,7 +796,7 @@ class CompositeNodes:
                     ],
                     axis=0,
                 )
-                for corner in _corner_offsets(ndim)
+                for corner in _corner_offsets(self.ndim)
             ]
         )
         weights[~inside] = 0.0  # outside the domain: no value
