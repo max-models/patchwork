@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 import numpy as np
 import scipy.fft
-import scipy.linalg.lapack
+import scipy.linalg
 import scipy.sparse as sparse
 import scipy.sparse.linalg
 
@@ -47,6 +47,7 @@ class Solver(Protocol):
 
     def solve(self, right_hand_side: np.ndarray) -> np.ndarray:
         """The unknowns for this rank's rows of the right-hand side, on every rank."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -128,17 +129,18 @@ class TridiagonalLU:
         matrix = sparse.dia_matrix(matrix)
         lower, diagonal, upper = (matrix.diagonal(k).copy() for k in (-1, 0, 1))
         self.symmetric = bool(np.array_equal(lower, upper))
+        factorize, self._solve = scipy.linalg.get_lapack_funcs(
+            ("pttrf", "pttrs") if self.symmetric else ("gttrf", "gttrs"),
+            dtype=np.float64,
+        )
         if self.symmetric:
-            *self._factors, info = scipy.linalg.lapack.dpttrf(diagonal, upper)
+            *self._factors, info = factorize(diagonal, upper)
         else:
-            *self._factors, info = scipy.linalg.lapack.dgttrf(lower, diagonal, upper)
+            *self._factors, info = factorize(lower, diagonal, upper)
         if info != 0:  # pragma: no cover - the operator is nonsingular
             raise np.linalg.LinAlgError(
                 f"the tridiagonal factorization failed ({info})"
             )
-        self._solve = (
-            scipy.linalg.lapack.dpttrs if self.symmetric else scipy.linalg.lapack.dgttrs
-        )
 
     def solve(self, right_hand_side: np.ndarray) -> np.ndarray:
         """The solution for ``right_hand_side``."""
@@ -233,6 +235,17 @@ def _axis_kind(system: LinearSystem, axis: int) -> str | None:
     return "dirichlet" if isinstance(lower, Dirichlet) else "neumann"
 
 
+def _uniform_kinds(system: LinearSystem) -> tuple[str, ...]:
+    """The kind of every axis, for a system with no mixed faces."""
+    kinds = []
+    for axis in range(system.nodes.ndim):
+        kind = _axis_kind(system, axis)
+        if kind is None:  # pragma: no cover - FFTBackend.unsupported refuses it
+            raise ValueError(f"axis {axis} has different conditions on its faces")
+        kinds.append(kind)
+    return tuple(kinds)
+
+
 class FFTSolver:
     """The FFT solve of one uniform system (see :class:`FFTBackend`).
 
@@ -280,7 +293,7 @@ class FFTSolver:
                 # n - 1 interior nodes (sine) or n + 1 nodes (cosine)
                 k = np.arange(1, n) if kind == "dirichlet" else np.arange(n + 1)
                 values = (4.0 / h**2) * np.sin(0.5 * np.pi * k / n) ** 2
-            index = [None] * len(kinds)
+            index: list[slice | None] = [None] * len(kinds)
             index[axis] = slice(None)
             eigenvalues = eigenvalues + values[tuple(index)]
         inverse = np.zeros(eigenvalues.shape)
@@ -291,7 +304,7 @@ class FFTSolver:
     def solve(self, right_hand_side: np.ndarray) -> np.ndarray:
         """The unknowns for the right-hand side (of all rows)."""
         workers = self.workers
-        data = np.asarray(right_hand_side, dtype=float).reshape(self.shape)
+        data: Any = np.asarray(right_hand_side, dtype=float).reshape(self.shape)
         data = data * self._inverse_volumes
         for axis, kind in enumerate(self.kinds):
             if kind == "dirichlet":
@@ -369,7 +382,7 @@ class FFTBackend(Backend):
         nodes = system.nodes
         hierarchy = nodes.hierarchy
         cells = tuple(int(n) for n in hierarchy.level_shape(0))
-        kinds = tuple(_axis_kind(system, axis) for axis in range(nodes.ndim))
+        kinds = _uniform_kinds(system)
         # the unknowns of every axis on the lattice, in C order: a periodic
         # axis has no copy of its first node, a Dirichlet face no unknown
         bounds = {"periodic": (0, 0), "dirichlet": (1, 0), "neumann": (0, 1)}
