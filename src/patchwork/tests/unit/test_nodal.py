@@ -601,3 +601,77 @@ def test_a_charge_solve_is_the_source_solve_of_the_same_charge(layout) -> None:
         solver.solve(charge / nodes.volumes, charge=charge)
     with pytest.raises(ValueError, match="charge on the"):
         solver.solve(charge=charge[:-1])
+
+
+def _bisection(inside, start: np.ndarray, step: np.ndarray) -> np.ndarray:
+    """The plain bisection that :func:`patchwork.nodal._surface_crossing` replays."""
+    low, high = np.zeros(start.shape[1]), np.ones(start.shape[1])
+    for _ in range(48):
+        middle = 0.5 * (low + high)
+        hit = np.asarray(inside(start + middle * step), dtype=bool)
+        high = np.where(hit, middle, high)
+        low = np.where(hit, low, middle)
+    return high
+
+
+@pytest.mark.parametrize(("count", "num_calls"), [(3, 6), (300, 12), (20_000, 48)])
+def test_the_surface_is_found_as_by_bisection_in_fewer_calls(
+    count: int, num_calls: int
+) -> None:
+    """The same fractions to the bit, also on edges that cross the body several times.
+
+    Few edges take several bisection steps per call; very many take one.
+    """
+    from patchwork.nodal import _surface_crossing
+
+    rng = np.random.default_rng(count)
+    calls = []
+
+    def inside(points):
+        calls.append(points.shape[1])
+        # stripes and a disc: several crossings on many edges
+        stripes = np.sin(40.0 * points[0]) > 0.3
+        return stripes | (np.hypot(points[0] - 0.5, points[1] - 0.5) < 0.2)
+
+    start = rng.random((2, count))
+    start[:, inside(start)] = 0.0  # outside: on a stripe gap at the origin
+    end = 0.5 + 0.1 * (rng.random((2, count)) - 0.5)  # in the disc
+    step = end - start
+    expected = _bisection(inside, start, step)
+    calls.clear()
+
+    found = _surface_crossing(inside, start, step)
+
+    assert np.array_equal(found, expected)
+    assert len(calls) == num_calls
+
+
+def test_numbering_by_a_table_and_by_sorting_agree(monkeypatch) -> None:
+    """The lattice table and the sort of the corners give the same mesh and operator."""
+    from patchwork import nodal
+
+    _, body = _disc(0.15)
+
+    def build():
+        mesh = _mesh("level jump", periodic=(True, False))
+        solver = NodalPoisson(mesh, embedded=[body])
+        return solver.nodes, solver
+
+    table_nodes, table_solver = build()
+    monkeypatch.setattr(nodal, "_DENSE_TABLE_FACTOR", 0)
+    sorted_nodes, sorted_solver = build()
+
+    assert table_nodes._table is not None and sorted_nodes._table is None
+    for name in ("cell_corners", "lattice", "hanging", "volumes", "node_ranks"):
+        assert np.array_equal(getattr(table_nodes, name), getattr(sorted_nodes, name))
+    assert (table_nodes.reduction != sorted_nodes.reduction).nnz == 0
+    for face in ("y_lower", "y_upper", "inner"):
+        for a, b in zip(
+            table_nodes.face_edges(face), sorted_nodes.face_edges(face), strict=True
+        ):
+            assert np.array_equal(a, b)
+    assert (table_solver.matrix != sorted_solver.matrix).nnz == 0
+    # points off the lattice have no node
+    for nodes in (table_nodes, sorted_nodes):
+        off = nodes._lookup(np.array([0, 0, 4]), np.array([-1, 10**6, 8]))
+        assert off[0] == -1 and off[1] == -1 and off[2] >= 0

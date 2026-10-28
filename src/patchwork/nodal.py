@@ -54,6 +54,11 @@ INNER = "inner"
 
 Value = float | Callable[..., Any]
 
+#: :class:`CompositeNodes` numbers its nodes with a table over the finest
+#: lattice when the lattice has at most this many points per cell corner, and
+#: by sorting the corners otherwise (a deep hierarchy with small fine patches).
+_DENSE_TABLE_FACTOR = 16
+
 
 @dataclass(frozen=True)
 class Dirichlet:
@@ -98,6 +103,75 @@ def _evaluate(value: Value, *coordinates: np.ndarray) -> np.ndarray:
     """A face value at points (one array per axis): a number, or the result of a callable."""
     result = value(*coordinates) if callable(value) else value
     return np.broadcast_to(np.asarray(result, dtype=float), coordinates[0].shape).copy()
+
+
+#: The halvings of an edge that locate an embedded surface on it: the fraction
+#: is known to 2**-48 of the edge.
+_SURFACE_BISECTIONS = 48
+
+#: The cost of a call of a body's ``inside`` in points: a call with this many
+#: points costs about twice an empty one. :func:`_surface_crossing` evaluates
+#: several bisection steps in one call while the points are cheaper than the call.
+_POINTS_PER_CALL = 10_000
+
+
+def _section_bits(count: int) -> int:
+    """The bisection steps per call of ``inside`` for ``count`` edges: a divisor of 48."""
+    return min(
+        (1, 2, 3, 4, 6, 8),
+        key=lambda bits: (
+            (_SURFACE_BISECTIONS // bits) * (_POINTS_PER_CALL + count * (2**bits - 1))
+        ),
+    )
+
+
+def _surface_crossing(
+    inside: Callable[[np.ndarray], Any],
+    start: np.ndarray,
+    step: np.ndarray,
+    wrap: Callable[[np.ndarray], np.ndarray] = lambda points: points,
+) -> np.ndarray:
+    """Fraction of each segment ``start + t * step`` at which it enters a body.
+
+    ``start`` and ``step`` are ``(ndim, k)``; ``start`` is outside the body,
+    ``start + step`` inside. The result is that of :data:`_SURFACE_BISECTIONS`
+    bisections of ``inside`` (the upper end of the last interval), but each
+    call of ``inside`` evaluates the points of several bisection steps at once
+    (all ``2**b - 1`` points that ``b`` steps might visit), which are then
+    replayed: the same points and the same answer in a few calls instead of 48.
+    ``wrap`` moves the points into the domain (along its periodic axes).
+    """
+    count = start.shape[1]
+    bits = _section_bits(count)
+    pieces = 2**bits
+    low = np.zeros(count)
+    high = np.ones(count)
+    # the dyadic points of one round, exact in floating point: low + j / 2**r
+    grid = np.arange(1, pieces) / pieces
+    rows = np.arange(count)
+    for _ in range(_SURFACE_BISECTIONS // bits):
+        width = high - low
+        middle = low[:, None] + width[:, None] * grid  # (k, pieces - 1)
+        points = start[:, :, None] + middle[None] * step[:, :, None]
+        hit = np.asarray(inside(wrap(points.reshape(start.shape[0], -1))), dtype=bool)
+        # the ends of the interval: outside at 0, inside at ``pieces``
+        hit = np.concatenate(
+            (
+                np.zeros((count, 1), dtype=bool),
+                hit.reshape(count, pieces - 1),
+                np.ones((count, 1), dtype=bool),
+            ),
+            axis=1,
+        )
+        lower = np.zeros(count, dtype=np.int64)
+        upper = np.full(count, pieces, dtype=np.int64)
+        for _ in range(bits):
+            half = (lower + upper) // 2
+            found = hit[rows, half]
+            upper = np.where(found, half, upper)
+            lower = np.where(found, lower, half)
+        low, high = low + lower * (width / pieces), low + upper * (width / pieces)
+    return high
 
 
 def _corner_offsets(ndim: int) -> np.ndarray:
@@ -157,9 +231,34 @@ class CompositeNodes:
     def _lookup(self, *index: np.ndarray) -> np.ndarray:
         """Node numbers of finest-lattice points, -1 where there is no node."""
         keys = self._key(*index)
+        if self._table is not None:
+            inside = (keys >= 0) & (keys < self._table.size)
+            return np.where(inside, self._table[np.where(inside, keys, 0)], -1)
         position = np.searchsorted(self._keys, keys)
         position = np.minimum(position, self.num_nodes - 1)
         return np.where(self._keys[position] == keys, position, -1)
+
+    def _number(self, keys: np.ndarray) -> None:
+        """Number the distinct lattice keys of the cell corners in increasing order.
+
+        Sets :attr:`num_nodes`, :attr:`cell_corners` and the sorted keys. Where
+        the finest lattice is not much larger than the corners, a table over the
+        lattice replaces the sort and makes :meth:`_lookup` a gather.
+        """
+        size = int(np.prod(self._cells + 1))
+        self._table: np.ndarray | None = None
+        if size <= _DENSE_TABLE_FACTOR * keys.size:
+            present = np.zeros(size, dtype=bool)
+            present[keys.reshape(-1)] = True
+            self._keys = np.flatnonzero(present)
+            table = np.full(size, -1, dtype=np.int64)
+            table[self._keys] = np.arange(self._keys.size)
+            self._table = table
+            self.cell_corners = table[keys]
+        else:
+            self._keys, inverse = np.unique(keys, return_inverse=True)
+            self.cell_corners = inverse.reshape(keys.shape)
+        self.num_nodes = int(self._keys.size)
 
     def _find_hanging_nodes(self) -> None:
         """Find the nodes inside coarser cells' edges and their interpolation.
@@ -354,10 +453,7 @@ class CompositeNodes:
         corners = (
             self.cell_lower[:, None, :] + self.cell_span[:, None, None] * offsets
         )  # (m, 2**ndim, ndim)
-        keys = self._key(*(corners[..., axis] for axis in range(ndim)))
-        self._keys, self.cell_corners = np.unique(keys, return_inverse=True)
-        self.cell_corners = self.cell_corners.reshape(keys.shape)
-        self.num_nodes = int(self._keys.size)
+        self._number(self._key(*(corners[..., axis] for axis in range(ndim))))
         self.lattice = np.column_stack(
             np.unravel_index(self._keys, tuple(int(n) + 1 for n in self._cells))
         )
@@ -373,11 +469,10 @@ class CompositeNodes:
             self.cell_corners.reshape(-1),
             np.repeat(self.cell_ranks, 2**ndim),
         )
-        self.volumes = np.zeros(self.num_nodes)
-        np.add.at(
-            self.volumes,
+        self.volumes = np.bincount(
             self.cell_corners.reshape(-1),
-            np.repeat(np.prod(size, axis=1) / 2**ndim, 2**ndim),
+            weights=np.repeat(np.prod(size, axis=1) / 2**ndim, 2**ndim),
+            minlength=self.num_nodes,
         )
         self._find_hanging_nodes()
         self._leaf_map: np.ndarray | None = None
@@ -943,54 +1038,42 @@ class NodalPoisson:
             if body.fraction is not None:
                 fraction = np.asarray(body.fraction(start, start + step), dtype=float)
             else:
-                low = np.zeros(start.shape[1])
-                high = np.ones(start.shape[1])
-                for _ in range(48):
-                    middle = 0.5 * (low + high)
-                    hit = np.asarray(
-                        body.inside(self._wrapped(start + middle * step)), dtype=bool
-                    )
-                    high = np.where(hit, middle, high)
-                    low = np.where(hit, low, middle)
-                fraction = high
+                fraction = _surface_crossing(body.inside, start, step, self._wrapped)
             result[mine] = np.maximum(fraction, self._min_fraction)
         return result
 
     def _shortley_weller(
-        self,
-        operator: sparse.csr_matrix,
-        wall: sparse.csr_matrix,
-        outside: np.ndarray,
-        inside: np.ndarray,
-        distance: np.ndarray,
-    ) -> tuple[sparse.csr_matrix, sparse.csr_matrix]:
-        """Replace the rows of regular nodes next to a body by Shortley-Weller rows.
+        self, outside: np.ndarray, inside: np.ndarray, distance: np.ndarray
+    ) -> tuple[np.ndarray, tuple, tuple] | None:
+        """The Shortley-Weller rows of the regular nodes next to a body.
 
         A node is regular if four cells of one size meet at it (two in 1D). Its row is then
         the finite-difference Laplacian with unequal arms, times its control
         volume: second-order accurate up to the surface, as on a uniform grid.
+        Returns those nodes and the ``(rows, columns, entries)`` of their rows
+        of the operator and of the surface couplings, which replace the rows of
+        the cell-by-cell assembly; ``None`` if there are none.
         """
         nodes = self.nodes
         n = nodes.num_nodes
         ndim = nodes.ndim
         corners = 2**ndim
         if not outside.size:
-            return operator, wall
-        count = np.zeros(n, dtype=np.int64)
-        np.add.at(count, nodes.cell_corners.reshape(-1), 1)
+            return None
+        flat = nodes.cell_corners.reshape(-1)
+        count = np.bincount(flat, minlength=n)
         smallest = np.full(n, np.iinfo(np.int64).max)
         largest = np.zeros(n, dtype=np.int64)
         spans = np.repeat(nodes.cell_span, corners)
-        np.minimum.at(smallest, nodes.cell_corners.reshape(-1), spans)
-        np.maximum.at(largest, nodes.cell_corners.reshape(-1), spans)
+        np.minimum.at(smallest, flat, spans)
+        np.maximum.at(largest, flat, spans)
         regular = (count == corners) & (smallest == largest) & ~nodes.hanging
         cut_nodes = np.unique(outside[regular[outside]])
         if not cut_nodes.size:
-            return operator, wall
+            return None
 
         span = smallest[cut_nodes]
         spacing = span[:, None] * nodes._spacing  # (k, ndim)
-        position = {int(node): k for k, node in enumerate(cut_nodes)}
         # arm lengths and what each arm ends at: [axis][side] over the cut nodes
         arm = np.stack([np.stack([spacing[:, axis]] * 2) for axis in range(ndim)])
         body = np.full((ndim, 2, cut_nodes.size), -1, dtype=np.int64)
@@ -1001,13 +1084,16 @@ class NodalPoisson:
                 step[:, axis] = sign * span
                 there = nodes.lattice[cut_nodes] + step
                 neighbour[axis, side] = nodes._lookup(*there.T)
-        for out_node, in_node, d in zip(outside, inside, distance, strict=True):
-            k = position.get(int(out_node))
-            if k is None:
-                continue
-            axis, side = np.argwhere(neighbour[:, :, k] == in_node)[0]
-            arm[axis, side, k] = d
-            body[axis, side, k] = self._owner[in_node]
+        # the cut edges from a regular node: the arm they shorten
+        position = np.minimum(np.searchsorted(cut_nodes, outside), cut_nodes.size - 1)
+        mine = cut_nodes[position] == outside
+        position, in_node = position[mine], inside[mine]
+        match = (neighbour[:, :, position] == in_node).reshape(2 * ndim, -1)
+        if not match.any(axis=0).all():  # pragma: no cover
+            raise RuntimeError("a cut edge of a regular node is not one of its arms")
+        which = match.argmax(axis=0)
+        arm[which // 2, which % 2, position] = distance[mine]
+        body[which // 2, which % 2, position] = self._owner[in_node]
 
         rows, columns, entries = [], [], []
         wall_rows, wall_columns, wall_entries = [], [], []
@@ -1028,22 +1114,13 @@ class NodalPoisson:
         rows.append(cut_nodes)
         columns.append(cut_nodes)
         entries.append(diagonal)
-
-        keep = np.ones(n)
-        keep[cut_nodes] = 0.0
-        keep = sparse.diags(keep)
-        operator = keep @ operator + sparse.coo_matrix(
-            (np.concatenate(entries), (np.concatenate(rows), np.concatenate(columns))),
-            shape=(n, n),
-        )
-        wall = keep @ wall + sparse.coo_matrix(
-            (
-                np.concatenate(wall_entries),
-                (np.concatenate(wall_rows), np.concatenate(wall_columns)),
+        return (
+            cut_nodes,
+            tuple(np.concatenate(part) for part in (rows, columns, entries)),
+            tuple(
+                np.concatenate(part) for part in (wall_rows, wall_columns, wall_entries)
             ),
-            shape=wall.shape,
         )
-        return sparse.csr_matrix(operator), sparse.csr_matrix(wall)
 
     def _operator(
         self, cells: np.ndarray | None
@@ -1093,32 +1170,45 @@ class NodalPoisson:
         plain = ~(cut_a | cut_b)
         first, second, conductance = first[plain], second[plain], conductance[plain]
 
-        rows = np.concatenate((first, second, first, second, outside))
-        columns = np.concatenate((first, second, second, first, outside))
-        entries = np.concatenate(
-            (
-                conductance,
-                conductance,
-                -conductance,
-                -conductance,
-                cut_conductance / fraction,
-            )
+        # the diagonal summed per node, the couplings once per edge half
+        diagonal = np.bincount(
+            np.concatenate((first, second, outside)),
+            weights=np.concatenate(
+                (conductance, conductance, cut_conductance / fraction)
+            ),
+            minlength=n,
         )
-        num_bodies = len(self._embedded)
+        on = np.flatnonzero(diagonal)
+        rows = np.concatenate((first, second, on))
+        columns = np.concatenate((second, first, on))
+        entries = np.concatenate((-conductance, -conductance, diagonal[on]))
         # the surface values' share of the right-hand side, per body
-        wall = sparse.csr_matrix(
-            sparse.coo_matrix(
-                (cut_conductance / fraction, (outside, self._owner[inside])),
-                shape=(n, max(num_bodies, 1)),
-            )
-        )
-        operator = sparse.csr_matrix(
-            sparse.coo_matrix((entries, (rows, columns)), shape=(n, n))
-        )
+        wall_rows, wall_columns = outside, self._owner[inside]
+        wall_entries = cut_conductance / fraction
 
-        return self._shortley_weller(
-            operator, wall, outside, inside, fraction * cut_length
+        stencils = self._shortley_weller(outside, inside, fraction * cut_length)
+        if stencils is not None:
+            # the rows of the regular nodes next to a body are theirs
+            cut_nodes, replace, replace_wall = stencils
+            assembled = np.ones(n, dtype=bool)
+            assembled[cut_nodes] = False
+            keep, keep_wall = assembled[rows], assembled[wall_rows]
+            rows, columns, entries = (
+                np.concatenate((part[keep], new))
+                for part, new in zip((rows, columns, entries), replace, strict=True)
+            )
+            wall_rows, wall_columns, wall_entries = (
+                np.concatenate((part[keep_wall], new))
+                for part, new in zip(
+                    (wall_rows, wall_columns, wall_entries), replace_wall, strict=True
+                )
+            )
+        num_bodies = len(self._embedded)
+        wall = sparse.csr_matrix(
+            (wall_entries, (wall_rows, wall_columns)), shape=(n, max(num_bodies, 1))
         )
+        operator = sparse.csr_matrix((entries, (rows, columns)), shape=(n, n))
+        return operator, wall
 
     def _assemble(self) -> None:
         """Build this rank's rows of the operator, the solver and the right-hand-side maps."""
@@ -1190,9 +1280,11 @@ class NodalPoisson:
         self.matrix = matrix
         if self.free.size:
             # minimum degree on the pattern of A + A^T: the mesh's own graph,
-            # about half the fill of the default column ordering
+            # about half the fill of the default column ordering; the symmetric
+            # mode keeps the diagonal pivots that ordering assumes (the operator
+            # is diagonally dominant), a fifth faster than threshold pivoting
             self._factorization = scipy.sparse.linalg.splu(
-                matrix, permc_spec="MMD_AT_PLUS_A"
+                matrix, permc_spec="MMD_AT_PLUS_A", options={"SymmetricMode": True}
             )
 
     # Boundary values ---------------------------------------------------------------#
