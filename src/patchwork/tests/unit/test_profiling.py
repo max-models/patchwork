@@ -43,3 +43,17 @@ def test_enable_tags_records_the_patchwork_regions():
         "patchwork.exchange_halos",
         "patchwork.build_schedule",
     } <= names
+
+
+def test_the_opt_in_tag_has_an_entry_point():
+    """``scope-profiler tags`` finds the tag through the package's entry point."""
+    from importlib.metadata import entry_points
+
+    from patchwork._profiling import PROFILE_TAGS
+
+    found = {
+        entry_point.name: entry_point.value
+        for entry_point in entry_points(group="scope_profiler.opt_in_tags")
+    }
+    assert found.get("patchwork") == "patchwork"
+    assert "patchwork" in PROFILE_TAGS

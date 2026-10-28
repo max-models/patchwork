@@ -64,6 +64,9 @@ Source = "https://github.com/max-models/patchwork"
 [project.scripts]
 patchwork = "patchwork.main:main"
 
+[project.entry-points."scope_profiler.opt_in_tags"]
+patchwork = "patchwork"
+
 [tool.setuptools.packages.find]
 where = [ "src" ]
 
