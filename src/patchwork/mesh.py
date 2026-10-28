@@ -993,6 +993,7 @@ class AMRHierarchy:
             )
         return tuple(array.reshape(-1) for array in arrays), shape
 
+    @sp.profile("patchwork.locate", tags=PROFILE_TAGS)
     def locate(self, *coordinates: Any) -> Any:
         """The finest patch that holds each point: its index in :attr:`patches`.
 
