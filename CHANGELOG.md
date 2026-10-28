@@ -7,6 +7,14 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `CompositeEdges`: the lowest-order edge space of a 2D hierarchy, one line integral of the
+  field per edge of the leaf cells. A coarse edge on a patch edge is two hanging half-edges
+  (`reduction`, which commutes with the gradient: `G T = T1 G T`). `gradient` (the incidence of
+  edges and nodes), `mass(lumped=True|False)` (lumped, `G^T M1 G` is `NodalPoisson`'s
+  operator), `evaluation(points)` (the field at points, the gradient of the bilinear potential
+  for `G phi`) and `deposit(points, vectors)`, its transpose. `CompositeNodes.point_cells`
+  gives the leaf cell of points and where in it they are. Tutorial: the edge space.
+
 - `AMRHierarchy.wrap(points)` and `wrapped(points)`: points beyond a periodic face moved back
   into the domain, in place or as a copy (the array itself when nothing needs wrapping), and
   `AMRHierarchy.node_grid(patch)`: a patch's nodes as an `mpifield.BlockGrid`, for compiled
