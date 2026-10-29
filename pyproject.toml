@@ -61,9 +61,6 @@ test = [ "pytest", "pytest-cov", "patchwork-amr[pyccel]" ]
 [project.urls]
 Source = "https://github.com/max-models/patchwork"
 
-[project.scripts]
-patchwork = "patchwork.main:main"
-
 [project.entry-points."scope_profiler.opt_in_tags"]
 patchwork = "patchwork"
 
