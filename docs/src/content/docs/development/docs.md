@@ -7,8 +7,9 @@ The site in `docs/` is built with [Astro](https://astro.build/) and
 [Starlight](https://starlight.astro.build/). It has three kinds of pages:
 
 - **Hand-written pages** in `docs/src/content/docs/`, as Markdown or MDX.
-- **Tutorials**, converted from the Jupyter notebooks in `tutorials/` by `starlight-notebooks`.
-  Each notebook is executed and its outputs (text, images, tables) are written into an MDX page.
+- **Examples**, converted from the Jupyter notebooks in `tutorials/` by `starlight-notebooks`
+  (the `section` setting in `docs/package.json` publishes them under `examples/`). Each
+  notebook is executed and its outputs (text, images, tables) are written into an MDX page.
 - **API reference**, generated from the docstrings by
   [starlight-pydocs](https://ewels.github.io/starlight-pydocs/), one page per module.
 
@@ -37,7 +38,7 @@ make docs-clean       # remove generated pages and build output
 `make docs-notebooks` only reruns a notebook whose cells changed since the last run; pass
 `FORCE=1` to rerun all of them.
 
-## Writing tutorials
+## Writing example notebooks
 
 Put a notebook in `tutorials/`. Its first `# Heading` becomes the page title and the first
 paragraph its description. Cell tags control the output:

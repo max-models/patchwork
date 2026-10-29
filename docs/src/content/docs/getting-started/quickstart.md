@@ -43,7 +43,7 @@ The composite Poisson example solves a smooth source across the coarse-fine inte
 ![Composite Poisson solution on a refined patch](/patchwork/figures/composite_poisson.png)
 For nested levels and a complete script, run `python examples/nested_patches.py`.
 
-The [tutorials](/patchwork/tutorials/) go further, step by step: fields on patches, the
+The [examples](/patchwork/examples/) go further, step by step: fields on patches, the
 cell-centered and node-centered Poisson solves (faces with different conditions, periodic
 axes, electrodes), domains that are not rectangles, halos, and regridding.
 

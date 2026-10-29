@@ -10,7 +10,7 @@ export default defineDocs({
 	pythonPackage: 'patchwork',
 	nav: [
 		{ label: 'Getting started', link: '/getting-started/installation/' },
-		{ label: 'Tutorials', link: '/tutorials/' },
+		{ label: 'Examples', link: '/examples/' },
 		{ label: 'Development', link: '/development/docs/' },
 		{ label: 'API', link: '/api/patchwork/' },
 	],
@@ -23,8 +23,8 @@ export default defineDocs({
 			],
 		},
 		{
-			label: 'Tutorials',
-			items: [{ autogenerate: { directory: 'tutorials' } }],
+			label: 'Examples',
+			items: [{ autogenerate: { directory: 'examples' } }],
 		},
 		{
 			label: 'Development',
