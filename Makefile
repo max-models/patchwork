@@ -5,7 +5,7 @@ NOTEBOOKS = cd docs && $(DOCS_ENV) npx starlight-notebooks
 DOCS_ENV = DOCS_PYTHON=$(shell $(PYTHON) -c "import sys; print(sys.executable)")
 FORCE ?=
 
-.PHONY: help install test lint readme readme-check docs-install docs-notebooks docs-dev docs-build docs-preview docs-clean
+.PHONY: help install test lint readme readme-check docs-install docs-notebooks docs-hero docs-dev docs-build docs-preview docs-clean
 
 help:  ## list the targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -37,6 +37,9 @@ docs-install:  ## Python docs extra and the npm packages
 docs-notebooks:  ## execute the changed tutorials and convert all of them (FORCE=1 reruns all)
 	$(NOTEBOOKS) execute $(if $(FORCE),--force,)
 	$(NOTEBOOKS) convert
+
+docs-hero:  ## redraw the home page figure (docs/src/assets/hero.svg)
+	$(PYTHON) docs/hero.py
 
 docs-dev:  ## live preview at http://localhost:4321/patchwork/
 	$(NOTEBOOKS) convert
