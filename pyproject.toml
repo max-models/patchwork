@@ -11,7 +11,6 @@ version = "0.2.0"
 description = "Block-structured adaptive meshes backed by mpiarray."
 readme = "README.md"
 keywords = [ "python" ]
-license = { file = "LICENSE.txt" }
 authors = [ { name = "Max" } ]
 requires-python = ">=3.10"
 classifiers = [
