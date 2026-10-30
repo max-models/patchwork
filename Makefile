@@ -34,7 +34,7 @@ docs-install:  ## Python docs extra and the npm packages
 	$(PYTHON) -m pip install -e ".[docs]"
 	cd docs && npm ci
 
-docs-notebooks:  ## execute the changed tutorials and convert all of them (FORCE=1 reruns all)
+docs-notebooks:  ## execute the changed notebooks and convert all of them (FORCE=1 reruns all)
 	$(NOTEBOOKS) execute $(if $(FORCE),--force,)
 	$(NOTEBOOKS) convert
 

@@ -27,5 +27,5 @@ jobs:
       node-version: "24"
       smoke-paths: |
         getting-started/installation/index.html
-        tutorials/01-first-hierarchy/index.html
+        examples/01-first-hierarchy/index.html
         api/patchwork/index.html
