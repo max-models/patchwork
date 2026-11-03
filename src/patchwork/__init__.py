@@ -9,6 +9,7 @@ from patchwork.backends import (
     FFTBackend,
     LinearSystem,
     LUBackend,
+    MultigridBackend,
     PetscBackend,
 )
 from patchwork.cells import CellOperator, CompositeCells, EmbeddedFloating, cell_body
@@ -52,6 +53,7 @@ __all__ = [
     "Neumann",
     "NodalPoisson",
     "Patch",
+    "MultigridBackend",
     "PetscBackend",
     "PetscSystem",
     "__version__",

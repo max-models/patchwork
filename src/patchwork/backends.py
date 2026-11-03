@@ -18,6 +18,9 @@ give the same answer to round-off (or to the tolerance of an iterative one).
   hierarchy of one level that fills its box) without embedded bodies, every
   axis periodic or with the same kind of condition, Dirichlet or Neumann, on
   both of its faces. Also the singular operators: all axes periodic or Neumann.
+- ``"multigrid"`` (`MultigridBackend`): geometric multigrid (PETSc's PCMG)
+  on a uniform mesh, with bodies, any faces and the r-z metric; ``O(N)`` per
+  solve, for large meshes and 3D (needs petsc4py).
 - ``"auto"`` (`AutoBackend`): the tridiagonal LU on a line, the FFT
   where it applies, the LU elsewhere.
 
@@ -441,6 +444,64 @@ class FFTBackend(Backend):
         return f"FFTBackend(spectral={self.spectral!r}, workers={self.workers!r})"
 
 
+class MultigridBackend(Backend):
+    """Geometric multigrid on a uniform mesh: `~patchwork.multigrid.MultigridSolver`.
+
+    The mesh is one level that fills its box; embedded bodies, Neumann and
+    periodic faces and the r-z metric are all taken (the coarse operators are
+    Galerkin products of the assembled one). Conjugate gradients (GMRES for a
+    non-symmetric operator) with a V-cycle as preconditioner, to the relative
+    residual ``rtol``. Costs ``O(N)`` per solve where the LU's triangular solves
+    grow faster: the backend for large meshes and 3D. The whole system on every
+    rank, like `LUBackend`. ``options`` are PETSc options of the Krylov solver
+    without the dash and the prefix. Needs petsc4py.
+    """
+
+    name = "multigrid"
+
+    def __init__(
+        self,
+        rtol: float = 1.0e-10,
+        smoothing_steps: int = 1,
+        options: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Keep the tolerance and the options."""
+        self.rtol = float(rtol)
+        self.smoothing_steps = int(smoothing_steps)
+        self.options = dict(options or {})
+
+    def unsupported(self, system: LinearSystem) -> str | None:
+        """A singular operator, or a mesh that is not one level filling its box."""
+        reason = super().unsupported(system)
+        if reason is not None:
+            return reason
+        nodes = system.nodes
+        hierarchy = nodes.hierarchy
+        if hierarchy.max_level > 0:
+            return "the 'multigrid' backend needs a uniform mesh: one level, no patches"
+        if nodes.cell_span.size != int(np.prod(hierarchy.level_shape(0))):
+            return "the 'multigrid' backend needs a domain that fills its box"
+        return None
+
+    def setup(self, system: LinearSystem) -> Solver:
+        """Build the hierarchy and the preconditioner."""
+        from patchwork.multigrid import MultigridSolver
+
+        return MultigridSolver(
+            system,
+            rtol=self.rtol,
+            smoothing_steps=self.smoothing_steps,
+            options=self.options,
+        )
+
+    def __repr__(self) -> str:
+        """The backend with its tolerance and options."""
+        return (
+            f"MultigridBackend(rtol={self.rtol!r}, "
+            f"smoothing_steps={self.smoothing_steps!r}, options={self.options!r})"
+        )
+
+
 class AutoBackend(Backend):
     """The fastest exact backend: the LU on a line, else the FFT where it applies, else the LU.
 
@@ -474,7 +535,7 @@ class AutoBackend(Backend):
 #: The backends by name, as ``backend=`` takes them.
 BACKENDS: dict[str, type[Backend]] = {
     backend.name: backend
-    for backend in (LUBackend, PetscBackend, FFTBackend, AutoBackend)
+    for backend in (LUBackend, PetscBackend, FFTBackend, MultigridBackend, AutoBackend)
 }
 
 
