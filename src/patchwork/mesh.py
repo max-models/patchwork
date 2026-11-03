@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 import mpiarray as mpa
 import scope_profiler as sp
 from maybempi import MPI
+from methodcard import Rule, method
 
 from patchwork._profiling import PROFILE_TAGS
 
@@ -64,7 +65,7 @@ def _gather_blocks(
 ) -> dict[int, tuple[list[tuple[int, IndexBox]], bool]]:
     """Which block of field ``name`` every rank holds, by patch number (collective).
 
-    For each patch (index in :attr:`AMRHierarchy.patches`): the ranks of the hierarchy's
+    For each patch (index in `AMRHierarchy.patches`): the ranks of the hierarchy's
     communicator that hold a part of it, each with its block ``((a0, a1), (b0, b1))`` in
     the patch's own indices, and whether the field is replicated (every rank of a patch
     on several ranks holds all of it).
@@ -230,6 +231,61 @@ class Patch:
         )
 
 
+def _ring(r0: float, dr: float, dz: float) -> AMRHierarchy:
+    """Four by four rings from the radius ``r0`` (for the rules of the metric)."""
+    return AMRHierarchy(
+        base_shape=(4, 4),
+        bounds=((r0, r0 + 4.0 * dr), (0.0, 4.0 * dz)),
+        geometry="cylindrical",
+    )
+
+
+def _metric_rules() -> dict:
+    """The SymPy rules of the r–z metric of `AMRHierarchy` (for the tests)."""
+    import sympy
+
+    r0, dr, dz = sympy.symbols("r0 dr dz", positive=True)
+    ranges = {"r0": (0.0, 2.0), "dr": (0.1, 1.0), "dz": (0.1, 1.0)}
+    return {
+        "ring_volume": Rule(
+            2 * sympy.pi * (r0 + sympy.Rational(3, 2) * dr) * dr * dz,
+            implementation=lambda r0, dr, dz: float(
+                _ring(r0, dr, dz).cell_volumes(0, 1)
+            ),
+            ranges=ranges,
+        ),
+        "radial_face": Rule(
+            2 * sympy.pi * (r0 + dr) * dz,
+            implementation=lambda r0, dr, dz: float(
+                _ring(r0, dr, dz).face_areas(0, 0, 1)
+            ),
+            ranges=ranges,
+        ),
+        "axial_face": Rule(
+            sympy.pi * ((r0 + 2 * dr) ** 2 - (r0 + dr) ** 2),
+            # the area of an axial face does not depend on the height
+            implementation=lambda r0, dr: float(_ring(r0, dr, 1.0).face_areas(0, 1, 1)),
+            ranges=ranges,
+        ),
+    }
+
+
+@method(
+    equations={
+        "levels": r"h_L = \frac{h_0}{r^L}, \qquad r \ge 2 \text{ on every axis and level}",
+        "nesting": r"\mathrm{lo}_L \equiv \mathrm{hi}_L \equiv 0 \pmod r, \qquad \Big[\tfrac{\mathrm{lo}_L}{r}, \tfrac{\mathrm{hi}_L}{r}\Big) \subset \bigcup_{\text{patches of } L-1} \text{box}",
+        "ring_volume": r"V = 2\pi r_c\,\Delta r\,\Delta z, \qquad r_c = \tfrac12 (r_0 + r_1)",
+        "radial_face": r"A_r = 2\pi r_f\,\Delta z",
+        "axial_face": r"A_z = \pi (r_1^2 - r_0^2) = 2\pi r_c\,\Delta r",
+        "plane": r"V = \Delta x\,\Delta y, \quad A = \Delta y \text{ or } \Delta x \ \text{(2D)}; \qquad V = \Delta x, \quad A = 1 \ \text{(1D)}",
+    },
+    assumptions=(
+        r"one refinement ratio $r$ for all axes and levels; patch boxes half open, in cells of their level",
+        r"proper nesting by a margin is not required by `add_patch`; `regrid` enforces it",
+        r"in $(r, z)$: 2D, $r_0 \ge 0$, the radius not periodic; the ring volumes and areas are exact, so the faces of a cell close it and fine faces add up to the coarse one",
+    ),
+    symbolic=_metric_rules,
+)
 class AMRHierarchy:
     """A 1D or 2D nested patch hierarchy with mpiarray-backed fields.
 
@@ -242,9 +298,9 @@ class AMRHierarchy:
     A child patch's bounds must align with the parent level and lie within the
     patches of that level. The refinement ratio is two by default. Fields
     are cell-centered, or node-centered (one value per cell corner, see
-    :meth:`allocate_field`). ``periodic`` flags the axes on which the last
+    `allocate_field`). ``periodic`` flags the axes on which the last
     cell neighbours the first; the node-centered solver
-    (:class:`~patchwork.nodal.NodalPoisson`) uses it. Without an MPI launcher,
+    (`NodalPoisson`) uses it. Without an MPI launcher,
     mpiarray supplies a serial communicator and the same interface works with a
     single process.
 
@@ -255,7 +311,7 @@ class AMRHierarchy:
     where a patch goes that is added without ``ranks``: ``"all"`` puts it on
     every rank, ``"balanced"`` on the one rank that holds the fewest cells so
     far, or a function ``placement(level, box)`` that returns the ranks (as
-    ``ranks`` of :meth:`add_patch` takes them). With ``max_cells_per_rank``, a
+    ``ranks`` of `add_patch` takes them). With ``max_cells_per_rank``, a
     ``"balanced"`` patch with more cells than that is split over as many of
     the least loaded ranks as it needs (at most all of them).
 
@@ -267,8 +323,8 @@ class AMRHierarchy:
     ``geometry`` is ``"cartesian"``, a plane ``(x, y)``, or ``"cylindrical"``,
     the axisymmetric plane ``(r, z)`` of a body of revolution: the first axis
     is the radius (``bounds[0][0] >= 0``, not periodic), and a cell is a ring
-    of volume ``2 pi r dr dz`` (:meth:`cell_volumes`). :meth:`integral`,
-    :meth:`restrict` and the conservative interpolation of :meth:`regrid` then
+    of volume ``2 pi r dr dz`` (`cell_volumes`). `integral`,
+    `restrict` and the conservative interpolation of `regrid` then
     weight cells by their volumes. Fields are per unit length along ``z`` in
     the Cartesian plane and totals over the ring in r–z; in 1D they are per
     unit area of the planes normal to ``x``. The r–z plane is 2D only.
@@ -349,7 +405,7 @@ class AMRHierarchy:
         ``base_boxes`` are half-open boxes of base cells that do not overlap;
         their union is the domain. By default it is the whole rectangle.
         ``base_ranks`` gives the ranks of each base box, as ``ranks`` of
-        :meth:`add_patch` does for a patch; by default ``placement`` decides.
+        `add_patch` does for a patch; by default ``placement`` decides.
         """
         ndim = len(base_shape)
         if ndim not in DIMENSIONS or any(int(n) != n or n <= 0 for n in base_shape):
@@ -499,7 +555,7 @@ class AMRHierarchy:
         or ``dx`` in the Cartesian plane (per unit length out of it); in r–z,
         ``2 pi r dz`` for a radial face at ``r`` and ``2 pi r dr`` for an axial
         face of a cell of mid-radius ``r``, so that the faces of a cell close it
-        (:meth:`cell_volumes`) and the faces of the fine cells over a coarse
+        (`cell_volumes`) and the faces of the fine cells over a coarse
         face add up to it. The area does not depend on the other indices.
         """
         import numpy as np
@@ -530,7 +586,7 @@ class AMRHierarchy:
 
     @property
     def local_patches(self) -> tuple[Patch, ...]:
-        """The patches this rank holds a part of, ordered as :attr:`patches`."""
+        """The patches this rank holds a part of, ordered as `patches`."""
         return tuple(patch for patch in self.patches if patch.is_local)
 
     @property
@@ -654,7 +710,7 @@ class AMRHierarchy:
         touch or nest share the nodes they have in common.
 
         A ``conservative`` field is an amount per area, such as a density, whose
-        integral (:meth:`integral`) :meth:`regrid` keeps: it is restricted
+        integral (`integral`) `regrid` keeps: it is restricted
         before a regrid, and the cells of new patches are filled from the level
         below so that the fine cells of a coarse cell keep its mean. It must be
         cell-centered.
@@ -698,7 +754,7 @@ class AMRHierarchy:
         between the ranks of each patch. Halo points outside the domain are
         left for the boundary conditions. Collective over ``comm``; the
         schedule is built at the first call and kept until a patch is added.
-        See :class:`~patchwork.halos.HaloExchange`.
+        See `HaloExchange`.
 
         With ``level``, only the halos of the patches of that level are filled.
         With ``below``, the values interpolated from the level below are those
@@ -730,14 +786,35 @@ class AMRHierarchy:
         (node-centered), finest level first. With ``level``, only the points
         of that level under the next finer one (a level that has caught up
         with the finer ones when they subcycle). Collective over ``comm``;
-        call :meth:`exchange_halos` after it for the halos. See
-        :class:`~patchwork.halos.Restriction`.
+        call `exchange_halos` after it for the halos. See
+        `Restriction`.
         """
         from patchwork.halos import Restriction
 
         self._schedule("restrict", name, Restriction).execute(level=level)
 
     @sp.profile("patchwork.regrid", tags=PROFILE_TAGS)
+    @method(
+        equations={
+            "grow": r"\tilde T_L = \mathrm{grow}_{b}\Big(T_L \cup \mathrm{coarsen}_r\big(\mathrm{grow}_{m}(\tilde T_{L+1})\big)\Big) \cap \Omega_L, \qquad L = L_\mathrm{max}, \dots, 0",
+            "allowed": r"\mathcal{A}_L = \mathrm{shrink}_{m}\big(\textstyle\bigcup \text{new boxes of } L\big) \setminus \{\text{cells with forbidden fine cells}\}",
+            "boxes": r"B_{L+1} = r \cdot \mathrm{cluster}\big(\tilde T_L \cap \mathcal{A}_L\big)",
+            "transfer": r"u^\mathrm{new} = \begin{cases} u^\mathrm{old} & \text{on an old patch of the level} \\ \mathcal{I}(u^\mathrm{new}_{L-1}) & \text{else} \end{cases}",
+        },
+        assumptions=(
+            r"$b$ = `buffer`, $m$ = `nesting` (cells of the level below; the domain's edge does not count as an edge)",
+            r"$\mathcal{I}$ the bilinear (renormalised) interpolation, or for a conservative field the conservative fill after a restriction",
+            "the base level is kept; levels above the last tagged one are dropped",
+            "halos stay zero unless `fill_halos`",
+        ),
+        references=(
+            "[Berger and Rigoutsos, IEEE Trans. Syst. Man Cybern. 21(5) (1991)](https://ieeexplore.ieee.org/document/120081/)",
+        ),
+        components=(
+            "patchwork.regrid.cluster",
+            "patchwork.halos.conservative_from_below",
+        ),
+    )
     def regrid(
         self,
         tags: Mapping[int, Any],
@@ -754,14 +831,14 @@ class AMRHierarchy:
         """A new hierarchy with patches over the tagged cells, and the fields moved to it.
 
         ``tags`` maps a level to booleans of that level's shape
-        (:meth:`level_shape`): the cells that need the next finer level. Make
-        them with :func:`~patchwork.regrid.gradient_tags`,
-        :func:`~patchwork.regrid.function_tags` or by hand; each rank may tag
+        (`level_shape`): the cells that need the next finer level. Make
+        them with `gradient_tags`,
+        `function_tags` or by hand; each rank may tag
         from the data it holds, and the tags are combined over the ranks.
 
         Level by level from the coarsest, the tagged cells, grown by
         ``buffer`` cells, are covered with boxes by
-        :func:`~patchwork.regrid.cluster` (at least ``efficiency`` of their
+        `cluster` (at least ``efficiency`` of their
         cells tagged, at most ``max_patch_size`` cells of the new level long).
         A level also covers, with a margin, what the finer levels need, and
         each patch keeps ``nesting`` cells of the level below between itself
@@ -770,11 +847,11 @@ class AMRHierarchy:
 
         Every field is moved: a point takes the value of an old patch of the
         same level that has it, else the bilinear interpolation of the new
-        level below. A conservative field (see :meth:`allocate_field`) is first
+        level below. A conservative field (see `allocate_field`) is first
         restricted on this hierarchy, and its new cells are filled so that the
-        fine cells of a coarse cell keep its mean: its :meth:`integral` is the
+        fine cells of a coarse cell keep its mean: its `integral` is the
         same before and after. Halos are not filled unless ``fill_halos``
-        (then :meth:`exchange_halos` runs for every field of the new
+        (then `exchange_halos` runs for every field of the new
         hierarchy).
 
         ``min_patch_size`` is the shortest side a patch may have, in cells of
@@ -782,7 +859,7 @@ class AMRHierarchy:
         that would be narrower is widened where there is room, so that no
         patch is one cell wide. ``forbid`` keeps patches off places a code
         cannot handle, such as a periodic seam: a mapping from a level
-        (1 and up) to booleans of that level's shape (:meth:`level_shape`),
+        (1 and up) to booleans of that level's shape (`level_shape`),
         true where no patch of that level may cover a cell, or a function of
         the cell centres ``(x, y)`` of a level that returns such booleans and
         is used for every refined level. Tags that would need a forbidden cell
@@ -837,7 +914,7 @@ class AMRHierarchy:
         """The integral of field ``name`` over the domain, from the finest values.
 
         Cell-centered: the sum of value times area (in r–z: times volume,
-        :meth:`cell_volumes`) over the cells that no finer patch covers.
+        `cell_volumes`) over the cells that no finer patch covers.
         Node-centered: the trapezoidal rule over those cells (Cartesian only).
         Collective over ``comm``; the same value on every rank.
         """
@@ -885,10 +962,10 @@ class AMRHierarchy:
         return float(self.comm.allreduce(total, op=MPI.SUM))
 
     def _locator(self) -> tuple[Any, ...]:
-        """The tables of :meth:`locate`: which patch holds each cell, level by level.
+        """The tables of `locate`: which patch holds each cell, level by level.
 
         Every level's table covers the bounding box of its patches and holds the
-        index into :attr:`patches` of the patch over each cell, -1 where there is
+        index into `patches` of the patch over each cell, -1 where there is
         none. Returns the arguments of the ``locate_points`` kernel that describe
         the hierarchy, always for two axes (a 1D hierarchy gets one cell along
         ``y``): the domain's bounds and periodic axes, the spacing and cell count
@@ -995,7 +1072,7 @@ class AMRHierarchy:
 
     @sp.profile("patchwork.locate", tags=PROFILE_TAGS)
     def locate(self, *coordinates: Any) -> Any:
-        """The finest patch that holds each point: its index in :attr:`patches`.
+        """The finest patch that holds each point: its index in `patches`.
 
         ``locate(x)`` in 1D, ``locate(x, y)`` in 2D: arrays of the same shape
         (physical coordinates); the result has that shape and is -1 for a point
@@ -1029,7 +1106,7 @@ class AMRHierarchy:
         """``points`` ``(ndim, k)`` moved into the domain along its periodic axes.
 
         The array itself if no point is beyond a periodic face, else a wrapped
-        copy (see :meth:`wrap`).
+        copy (see `wrap`).
         """
         import numpy as np
 
@@ -1095,8 +1172,8 @@ class AMRHierarchy:
         ``owner(x, name)`` in 1D, ``owner(x, y, name)`` in 2D. A marker belongs
         to the rank that holds the block of field ``name`` in which the lower
         (left) corner of its cell lies, in the finest patch that holds it (see
-        :meth:`locate`). That block is the one :meth:`deposit` writes into: the
-        other corners of the cell are in its halo, which :meth:`accumulate_halos`
+        `locate`). That block is the one `deposit` writes into: the
+        other corners of the cell are in its halo, which `accumulate_halos`
         hands on. The same for a cell-centered and a node-centered field, since
         cell ``(i, j)`` starts at node ``(i, j)``. Collective the first time for
         a field (until a patch is added), as the ranks tell each other their
@@ -1117,10 +1194,10 @@ class AMRHierarchy:
         name=...)`` in 2D: the positions of this rank's markers (1D arrays) and
         any other per-marker data, with one row per marker (velocities as
         ``v.T`` if they are stored ``(3, n)``). Each marker goes to
-        :meth:`owner` of field ``name``, with :func:`mpiarray.migrate`. Returns
+        `owner` of field ``name``, with `mpiarray.migrate`. Returns
         the positions and ``arrays`` of the markers now on this rank, as given:
         those that stayed and those that arrived, ordered by the rank they came
-        from. Call it again on the hierarchy :meth:`regrid` returns to move the
+        from. Call it again on the hierarchy `regrid` returns to move the
         markers whose patch changed ranks.
 
         A marker outside the domain raises ``ValueError`` on every rank with
@@ -1157,7 +1234,7 @@ class AMRHierarchy:
         return tuple(np.asarray(array) for array in received)
 
     def _grid(self, patch: Patch, first: Sequence[int], shape: Sequence[int]) -> Any:
-        """The :class:`mpifield.BlockGrid` of ``shape`` nodes of ``patch`` from node ``first`` on."""
+        """The `mpifield.BlockGrid` of ``shape`` nodes of ``patch`` from node ``first`` on."""
         from mpifield import BlockGrid
 
         spacing = self.spacing(patch.level)
@@ -1168,7 +1245,7 @@ class AMRHierarchy:
         return BlockGrid.from_geometry(lower, spacing, tuple(shape))
 
     def node_grid(self, patch: Patch) -> Any:
-        """The nodes of ``patch`` as an :class:`mpifield.BlockGrid`: all of them, no halo.
+        """The nodes of ``patch`` as an `mpifield.BlockGrid`: all of them, no halo.
 
         For compiled kernels that run on a patch's node array, such as a push
         that gathers each marker's field in its own patch. No axis is periodic:
@@ -1179,7 +1256,7 @@ class AMRHierarchy:
     def _stored_block(self, patch: Patch, name: str) -> tuple[Any, Any]:
         """This rank's block of field ``name`` on ``patch``, halo included, and its grid.
 
-        The grid is an :class:`mpifield.BlockGrid` of the stored nodes (the first one is
+        The grid is an `mpifield.BlockGrid` of the stored nodes (the first one is
         the first halo node), so mpifield's weightings run on the block as on a field's.
         """
         array = patch.field(name)
@@ -1192,6 +1269,19 @@ class AMRHierarchy:
         return storage, self._grid(patch, first, storage.shape)
 
     @sp.profile("patchwork.deposit", tags=PROFILE_TAGS)
+    @method(
+        equations={
+            "cloud_in_cell": r"q_{00} = q(1-\xi)(1-\eta), \quad q_{10} = q\,\xi(1-\eta), \quad q_{01} = q(1-\xi)\,\eta, \quad q_{11} = q\,\xi\eta, \qquad \xi = \frac{x - x_i}{h_x}, \ \eta = \frac{y - y_j}{h_y}",
+            "line": r"q_0 = q(1-\xi), \qquad q_1 = q\,\xi",
+            "gather": r"E(\mathbf{x}) = \sum_{\text{corners } c} w_c(\mathbf{x})\,E_c \quad (\text{the transpose: } \texttt{interpolate})",
+        },
+        assumptions=(
+            "each marker in the finest patch that holds it; the values are charges, not a density",
+            "a marker gathers the field of its own patch, which may jump at a coarse-fine edge",
+            "the halos and the copies of shared nodes are summed afterwards (`accumulate_halos`)",
+        ),
+        components=("patchwork.accumulate.Accumulation",),
+    )
     def deposit(
         self, *arguments: Any, name: str | None = None, reset: bool = True
     ) -> None:
@@ -1201,15 +1291,15 @@ class AMRHierarchy:
         2D. Each marker spreads its ``charge`` over the corners of its cell (two
         in 1D, four in 2D), in the finest patch that holds it, with linear or
         bilinear (cloud-in-cell) weights: the same weights as
-        :meth:`CompositeNodes.deposit <patchwork.nodal.CompositeNodes.deposit>`,
+        `CompositeNodes.deposit`,
         whose transposed interpolation the field gather is, and of
-        :meth:`interpolate`; mpifield's compiled kernels do the work. The values are
+        `interpolate`; mpifield's compiled kernels do the work. The values are
         charges, not a density. The markers must be on the ranks that
-        :meth:`owner` gives (use :meth:`migrate`), so that the corners fall in
+        `owner` gives (use `migrate`), so that the corners fall in
         the block or its halo, and the field needs a halo of at least one node.
         The corners in the halo, and the nodes that several patches share, are
         not yet where the composite mesh wants them: follow with
-        :meth:`accumulate_halos`. With ``reset`` the field is zeroed first,
+        `accumulate_halos`. With ``reset`` the field is zeroed first,
         halos included. Collective (the check of the owners).
         """
         import numpy as np
@@ -1252,11 +1342,11 @@ class AMRHierarchy:
 
         ``interpolate(x, name)`` in 1D, ``interpolate(x, y, name)`` in 2D. Each marker
         reads the corners of its cell in the finest patch that holds it, with the
-        linear or bilinear weights of :meth:`deposit`, of which this is the transpose:
+        linear or bilinear weights of `deposit`, of which this is the transpose:
         for a field computed patch by patch, such as an electric field that jumps at a
         coarse-fine edge, every marker sees the field of its own patch. The markers
-        must be on the ranks that :meth:`owner` gives (use :meth:`migrate`) and the
-        halos filled (:meth:`exchange_halos`), since a cell's upper corners may be in
+        must be on the ranks that `owner` gives (use `migrate`) and the
+        halos filled (`exchange_halos`), since a cell's upper corners may be in
         the halo. A marker outside the domain gets zero. Returns an array of the shape
         of ``x``. Collective (the check of the owners).
         """
@@ -1286,7 +1376,7 @@ class AMRHierarchy:
 
     @sp.profile("patchwork.accumulate_halos", tags=PROFILE_TAGS)
     def accumulate_halos(self, name: str) -> None:
-        """Bring deposited charge to the composite nodes: the scatter-add after :meth:`deposit`.
+        """Bring deposited charge to the composite nodes: the scatter-add after `deposit`.
 
         For a node-centered field, in two steps. First each patch adds the halos of its
         blocks into the neighbouring blocks (mpiarray's ``accumulate_halos``; at the edges
@@ -1294,17 +1384,16 @@ class AMRHierarchy:
         one: the node is held by every patch that has it as a corner, and by the two
         copies of a node on a periodic seam (the upper one, at the end of the axis, is
         the owner there); the owner copy is that of the finest patch
-        that holds it, the one :meth:`CompositeNodes.from_patches
-        <patchwork.nodal.CompositeNodes.from_patches>` reads, and the last of the patches of
-        that level in the order of :attr:`patches`. The other copies end up zero. So the
+        that holds it, the one `CompositeNodes.from_patches` reads, and the last of the patches of
+        that level in the order of `patches`. The other copies end up zero. So the
         total is kept, and ``from_patches`` returns what
-        :meth:`CompositeNodes.deposit <patchwork.nodal.CompositeNodes.deposit>` gives for
+        `CompositeNodes.deposit` gives for
         the same markers, to round-off.
 
         This is the whole of the scatter-add of a bilinear deposit: a marker's cell is in
         one patch, so its corners are nodes of that patch and no halo reaches over a
         coarse-fine edge. (The charge on a hanging node is passed to its coarse neighbours
-        by :meth:`NodalPoisson.solve <patchwork.nodal.NodalPoisson.solve>`.) Cell-centered
+        by `NodalPoisson.solve`.) Cell-centered
         fields are not supported. Collective; the schedule is built at the first call and
         kept until a patch is added.
         """

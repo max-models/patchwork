@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import scipy.sparse as sparse
 import scope_profiler as sp
+from methodcard import ConvergenceProblem, Rule, method
 
 from patchwork._profiling import PROFILE_TAGS
 from patchwork.backends import Backend, LinearSystem, backend_of
@@ -39,7 +40,7 @@ if TYPE_CHECKING:
     from patchwork.mesh import AMRHierarchy, Patch
 
 #: The faces of the domain's bounding rectangle, as ``(axis, side)`` with side 0
-#: the lower one. A 1D domain has the two ``x`` faces (see :func:`faces_of`).
+#: the lower one. A 1D domain has the two ``x`` faces (see `faces_of`).
 FACES = {"x_lower": (0, 0), "x_upper": (0, 1), "y_lower": (1, 0), "y_upper": (1, 1)}
 
 
@@ -54,7 +55,7 @@ INNER = "inner"
 
 Value = float | Callable[..., Any]
 
-#: :class:`CompositeNodes` numbers its nodes with a table over the finest
+#: `CompositeNodes` numbers its nodes with a table over the finest
 #: lattice when the lattice has at most this many points per cell corner, and
 #: by sorting the corners otherwise (a deep hierarchy with small fine patches).
 _DENSE_TABLE_FACTOR = 16
@@ -110,7 +111,7 @@ def _evaluate(value: Value, *coordinates: np.ndarray) -> np.ndarray:
 _SURFACE_BISECTIONS = 48
 
 #: The cost of a call of a body's ``inside`` in points: a call with this many
-#: points costs about twice an empty one. :func:`_surface_crossing` evaluates
+#: points costs about twice an empty one. `_surface_crossing` evaluates
 #: several bisection steps in one call while the points are cheaper than the call.
 _POINTS_PER_CALL = 10_000
 
@@ -134,7 +135,7 @@ def _surface_crossing(
     """Fraction of each segment ``start + t * step`` at which it enters a body.
 
     ``start`` and ``step`` are ``(ndim, k)``; ``start`` is outside the body,
-    ``start + step`` inside. The result is that of :data:`_SURFACE_BISECTIONS`
+    ``start + step`` inside. The result is that of `_SURFACE_BISECTIONS`
     bisections of ``inside`` (the upper end of the last interval), but each
     call of ``inside`` evaluates the points of several bisection steps at once
     (all ``2**b - 1`` points that ``b`` steps might visit), which are then
@@ -182,6 +183,42 @@ def _corner_offsets(ndim: int) -> np.ndarray:
     )
 
 
+def _deposit_rules() -> dict:
+    """The SymPy rule of `CompositeNodes.deposit` (for the tests)."""
+    import sympy
+
+    from patchwork.mesh import AMRHierarchy
+
+    x, y, q = sympy.symbols("x y q", real=True)
+    nodes = CompositeNodes(AMRHierarchy(base_shape=(4, 4)))
+    # the lower-left corner of the cell [1/4, 1/2]^2
+    corner = int(np.argmin(np.abs(nodes.lattice - (1, 1)).sum(axis=1)))
+
+    def charge(x: float, y: float, q: float) -> float:
+        return float(nodes.deposit(np.array([[x], [y]]), np.array([q]))[corner])
+
+    return {
+        "bilinear": Rule(
+            q * (2 - 4 * x) * (2 - 4 * y),
+            implementation=charge,
+            ranges={"x": (0.26, 0.49), "y": (0.26, 0.49), "q": (0.5, 2.0)},
+        )
+    }
+
+
+@method(
+    equations={
+        "lattice": r"\mathbf{k} = \mathbf{i}_L\, r^{L_\mathrm{max} - L}",
+        "hanging": r"\phi_\mathrm{hanging} = \Big(1 - \frac{k}{s}\Big)\phi_a + \frac{k}{s}\,\phi_b \quad \text{(from the ends } a, b \text{ of the coarsest edge it lies in, span } s\text{)}",
+        "composition": r"T \leftarrow T\,T \quad \text{until no master hangs (at most } L_\mathrm{max} + 1 \text{ times)}",
+        "control_volume": r"V_p = \sum_{K \ni p} \frac{|K|}{2^d}",
+    },
+    assumptions=(
+        "nodes shared by patches are one unknown; a periodic axis wraps the lattice",
+        "in 1D no node hangs: a coarse-fine interface is a node of both levels",
+        "a node is owned by the lowest rank of its leaf cells",
+    ),
+)
 class CompositeNodes:
     """The nodes and leaf cells of a hierarchy, and the maps to its patches.
 
@@ -241,9 +278,9 @@ class CompositeNodes:
     def _number(self, keys: np.ndarray) -> None:
         """Number the distinct lattice keys of the cell corners in increasing order.
 
-        Sets :attr:`num_nodes`, :attr:`cell_corners` and the sorted keys. Where
+        Sets `num_nodes`, `cell_corners` and the sorted keys. Where
         the finest lattice is not much larger than the corners, a table over the
-        lattice replaces the sort and makes :meth:`_lookup` a gather.
+        lattice replaces the sort and makes `_lookup` a gather.
         """
         size = int(np.prod(self._cells + 1))
         self._table: np.ndarray | None = None
@@ -503,9 +540,9 @@ class CompositeNodes:
         return nodes
 
     def _patch_reads(self) -> list[tuple[np.ndarray, tuple[np.ndarray, ...]]]:
-        """For every patch, the nodes whose value :meth:`from_patches` takes from it.
+        """For every patch, the nodes whose value `from_patches` takes from it.
 
-        One entry per patch of :attr:`AMRHierarchy.patches`: the node numbers and
+        One entry per patch of `AMRHierarchy.patches`: the node numbers and
         where those nodes are in the patch's node array (one index array per axis).
         A node shared by several patches is read from the finest, the last of that
         level in the order of the patches; a node on a periodic seam that a patch
@@ -572,7 +609,7 @@ class CompositeNodes:
         return self._boundary[face]
 
     def face_nodes(self, face: str) -> np.ndarray:
-        """Node numbers of the nodes on a part of the boundary (see :meth:`face_edges`)."""
+        """Node numbers of the nodes on a part of the boundary (see `face_edges`)."""
         first, second, _, _ = self._boundary[face]
         return np.unique(np.concatenate((first, second)))
 
@@ -632,7 +669,7 @@ class CompositeNodes:
         """(Bi)linear interpolation from a level's lattice to the composite nodes.
 
         The matrix has shape ``(n, nodes of the level lattice)``, the lattice in
-        C order with :meth:`level_shape`. It prolongs a field known on the
+        C order with `level_shape`. It prolongs a field known on the
         uniform grid of ``level`` (e.g. the base grid) to every node.
         """
         span = self.hierarchy.refinement_ratio ** (self._finest - level)
@@ -661,7 +698,7 @@ class CompositeNodes:
         Each point takes the linear (1D) or bilinear (2D) interpolant of the
         leaf cell it is in.
         Apply it to node values that have their hanging nodes filled (as
-        :meth:`NodalPoisson.solve` returns them). A point outside the domain
+        `NodalPoisson.solve` returns them). A point outside the domain
         gets an empty row: the value zero.
         """
         points = np.asarray(points, dtype=float)
@@ -676,15 +713,27 @@ class CompositeNodes:
         matrix.eliminate_zeros()
         return matrix
 
+    @method(
+        equations={
+            "bilinear": r"Q_c = \sum_k q_k\, w_c(\mathbf{x}_k), \qquad w_{00} = (1-\xi)(1-\eta),\ w_{10} = \xi(1-\eta),\ w_{01} = (1-\xi)\eta,\ w_{11} = \xi\eta",
+            "transpose": r"Q = E^\top q, \qquad E_{kc} = w_c(\mathbf{x}_k) \quad (\texttt{evaluation})",
+            "hanging": r"Q_F = (T^\top Q)_F \quad \text{(in } \texttt{NodalPoisson.solve(charge=)}\text{): the total is kept}",
+        },
+        assumptions=(
+            r"$(\xi, \eta)$ the fractions of the point in its leaf cell, from its lower-left corner; linear weights in 1D",
+            "points outside the domain deposit nothing",
+        ),
+        symbolic=_deposit_rules,
+    )
     def deposit(self, points: np.ndarray, charges: np.ndarray) -> np.ndarray:
         """The charges of point particles at ``points`` ``(ndim, k)`` on the nodes: ``(n,)``.
 
         Each charge is spread over the corners of its leaf cell with the
-        (bi)linear weights of :meth:`evaluation`, whose transpose this is: the
-        work a field interpolated with :meth:`evaluation` does on the particles
+        (bi)linear weights of `evaluation`, whose transpose this is: the
+        work a field interpolated with `evaluation` does on the particles
         is the work their deposited charge feels, and no particle pushes
         itself through the coupling. Hanging nodes receive charge like any
-        other; :meth:`NodalPoisson.solve` with ``charge=`` hands it to the
+        other; `NodalPoisson.solve` with ``charge=`` hands it to the
         nodes they hang from with the transposed interpolation, so the total
         charge is kept. Points outside the domain deposit nothing. In 2D a compiled
         kernel (``deposit_nodes``) makes one pass over the points.
@@ -783,7 +832,7 @@ class CompositeNodes:
     def cell_weights(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Corner nodes and (bi)linear weights, ``(k, 2**ndim)``, of the leaf cell of each point.
 
-        The corners are in the order of :attr:`cell_corners`; a point outside
+        The corners are in the order of `cell_corners`; a point outside
         the domain has weights zero.
         """
         leaf, fraction, inside = self.point_cells(points)
@@ -806,7 +855,7 @@ class CompositeNodes:
         """The composite interpolant on a level's lattice over the whole domain.
 
         Shape ``(nodes of the level lattice, n)``, the lattice in C order with
-        :meth:`level_shape`: the solution sampled on a uniform grid.
+        `level_shape`: the solution sampled on a uniform grid.
         """
         shape = self.level_shape(level)
         spacing = np.asarray(self.hierarchy.spacing(level))
@@ -886,7 +935,7 @@ class CompositeNodes:
         return fine
 
     def _sample_scalar(self, arrays: Sequence[np.ndarray], level: int) -> np.ndarray:
-        """:meth:`sample_patches` of one value per node."""
+        """`sample_patches` of one value per node."""
         ratio = self.hierarchy.refinement_ratio
         patches = self.hierarchy.patches
         # zero where the domain does not fill its rectangle
@@ -941,7 +990,7 @@ class CompositeNodes:
         patch, and directly from the coinciding node of a finer one. Nodes
         outside a domain that does not fill its rectangle are zero.
 
-        Returns an array of :meth:`level_shape` plus the further axes, ``out``
+        Returns an array of `level_shape` plus the further axes, ``out``
         if given.
         """
         level = self._finest if level is None else level
@@ -975,48 +1024,139 @@ class CompositeNodes:
         return out
 
 
+def _diagonal(solver: NodalPoisson, lattice: tuple[int, ...]) -> float:
+    """The diagonal entry of the operator at the node of a finest-lattice point."""
+    node = int(np.argmin(np.abs(solver.nodes.lattice - lattice).sum(axis=1)))
+    row = int(np.flatnonzero(solver.free == node)[0])
+    return float(solver.matrix[row, row])
+
+
+def _five_point(hx: float, hy: float) -> float:
+    """The diagonal of the operator at the centre of four cells ``hx`` by ``hy``."""
+    from patchwork.mesh import AMRHierarchy
+
+    mesh = AMRHierarchy(base_shape=(4, 4), bounds=((0.0, 4.0 * hx), (0.0, 4.0 * hy)))
+    return _diagonal(NodalPoisson(mesh), (2, 2))
+
+
+def _cut_arm(theta: float) -> float:
+    """The diagonal of a regular node whose right arm a wall cuts at ``theta h``."""
+    from patchwork.mesh import AMRHierarchy
+
+    wall = 0.5 + theta / 8.0
+    body = EmbeddedDirichlet(
+        lambda points: points[0] > wall,
+        1.0,
+        fraction=lambda start, end: (wall - start[0]) / (end[0] - start[0]),
+    )
+    solver = NodalPoisson(AMRHierarchy(base_shape=(8, 8)), embedded=(body,))
+    return _diagonal(solver, (4, 4))
+
+
+def _nodal_rules() -> dict:
+    """The SymPy rules of `NodalPoisson` (for the tests)."""
+    import sympy
+
+    hx, hy, theta = sympy.symbols("hx hy theta", positive=True)
+    return {
+        "stencil": Rule(
+            2 * hy / hx + 2 * hx / hy,
+            implementation=_five_point,
+            ranges={"hx": (0.05, 1.0), "hy": (0.05, 1.0)},
+        ),
+        "shortley_weller": Rule(
+            2 + 2 / theta, implementation=_cut_arm, ranges={"theta": (0.05, 0.95)}
+        ),
+    }
+
+
+def _nodal_problem() -> ConvergenceProblem:
+    """A manufactured solution on two nested patches, in the volume-weighted L2 norm."""
+    from patchwork.mesh import AMRHierarchy
+
+    def error(spacing: float) -> float:
+        n = round(1.0 / spacing)
+        mesh = AMRHierarchy(base_shape=(n, n))
+        mesh.add_patch(level=1, box=((n // 2, 3 * n // 2),) * 2)
+        mesh.add_patch(level=2, box=((3 * n // 2, 5 * n // 2),) * 2)
+        solver = NodalPoisson(mesh)
+        x, y = solver.nodes.coordinates.T
+        exact = np.sin(np.pi * x) * np.sin(np.pi * y)
+        difference = solver.solve(2.0 * np.pi**2 * exact) - exact
+        return float(np.sqrt(np.sum(difference**2 * solver.nodes.volumes)))
+
+    return ConvergenceProblem(error, steps=[1 / 16, 1 / 32, 1 / 64])
+
+
+@method(
+    equations={
+        "problem": r"-\nabla^2 \phi = f \ \text{in } \Omega, \qquad \phi = \phi_D \ \text{or} \ \partial_n \phi = g \ \text{on faces}, \qquad \phi = U_k \ \text{in bodies } B_k",
+        "stencil": r"A_{pp} \mathrel{+}= g,\ A_{qq} \mathrel{+}= g,\ A_{pq} = A_{qp} \mathrel{-}= g \quad \text{per leaf-cell edge } pq \text{ along } a, \qquad g = \frac{h_\perp}{2 h_a} \ \text{(2D)}, \ \frac{1}{h} \ \text{(1D)}",
+        "uniform": r"A_{pp} = \frac{2h_y}{h_x} + \frac{2h_x}{h_y}, \qquad A_{p,x\pm} = -\frac{h_y}{h_x}, \qquad A_{p,y\pm} = -\frac{h_x}{h_y}",
+        "reduced": r"(T^\top A T)_{FF}\,\phi_F = T^\top V f - (T^\top A T)_{FD}\,\phi_D + T^\top b_N + W U, \qquad V = \mathrm{diag}(V_p)",
+        "charge": r"T^\top V f \to T^\top q \quad (\texttt{solve(charge=q)})",
+        "neumann": r"b_{N,p} \mathrel{+}= \tfrac12 |e|\, g \quad \text{for each end } p \text{ of a boundary edge } e",
+        "cut_edge": r"A_{pp} \mathrel{+}= \frac{g}{\theta}, \qquad b_p \mathrel{+}= \frac{g}{\theta}\, U_k, \qquad \theta = \max(\theta_\mathrm{found}, \theta_\mathrm{min})",
+        "shortley_weller": r"A_{pp} = h_x h_y \sum_\mathrm{axes} \Big(\frac{2}{a_-(a_- + a_+)} + \frac{2}{a_+(a_- + a_+)}\Big), \qquad A_{p,\pm} = -\,h_x h_y\,\frac{2}{a_\pm(a_- + a_+)}",
+    },
+    order=2,
+    assumptions=(
+        r"unlisted faces are grounded; no permittivity: for a charge pass $\rho / \varepsilon_0$",
+        "Cartesian control volumes and conductances, also on an $(r, z)$ hierarchy",
+        r"the Shortley-Weller rows at regular cut nodes (four equal cells, not hanging), the diagonal-only cut elsewhere; they make the matrix unsymmetric",
+        r"$\theta$ by 48 bisections of `inside`, or the body's `fraction`; $\theta_\mathrm{min}$ = `min_fraction` ($10^{-3}$)",
+        r"the order is in the volume-weighted $L_2$ norm; in the maximum norm about 1.86 on nested patches (an $O(1)$ truncation error on the interface nodes)",
+    ),
+    references=(
+        "[Shortley and Weller, J. Appl. Phys. 9, 334 (1938)](https://doi.org/10.1063/1.1710426)",
+        "[Gibou, Fedkiw, Cheng and Kang, J. Comput. Phys. 176, 205 (2002)](https://doi.org/10.1006/jcph.2001.6977): the diagonal-only cut edge",
+    ),
+    components=(CompositeNodes,),
+    symbolic=_nodal_rules,
+    problem=_nodal_problem,
+)
 class NodalPoisson:
-    r"""Solve :math:`-\nabla^2\phi = f` on the nodes of a patch hierarchy.
+    r"""Solve $-\nabla^2\phi = f$ on the nodes of a patch hierarchy.
 
     The operator is assembled and its backend set up once (factorized, by
-    default); :meth:`solve` then costs two triangular solves. ``faces`` maps
+    default); `solve` then costs two triangular solves. ``faces`` maps
     ``"x_lower"``, ``"x_upper"``, ``"y_lower"``, ``"y_upper"`` (only the
-    first two in 1D) to a :class:`Dirichlet` or :class:`Neumann` condition; a
+    first two in 1D) to a `Dirichlet` or `Neumann` condition; a
     face that is not listed is a grounded Dirichlet face, and the faces of a
     periodic axis take none. On a domain that does not fill its rectangle
     (``AMRHierarchy(base_boxes=...)``) these are the parts of its boundary on
     the rectangle's faces, and ``"inner"`` is the rest: the edges inside the
     rectangle. ``embedded`` are bodies at fixed potentials
-    (:class:`EmbeddedDirichlet`); where they overlap the last one listed wins.
+    (`EmbeddedDirichlet`); where they overlap the last one listed wins.
 
-    ``backend`` solves the assembled operator (:mod:`patchwork.backends`): a
-    :class:`~patchwork.backends.Backend` or its name. ``"lu"`` (the default)
+    ``backend`` solves the assembled operator (`patchwork.backends`): a
+    `Backend` or its name. ``"lu"`` (the default)
     assembles the whole operator on every rank and factorizes it there
     (SuperLU; LAPACK's tridiagonal LU on a line). ``"petsc"`` (needs
     petsc4py; ``PetscBackend(rtol=..., options=...)`` for its tolerance and
     PETSc options) assembles on every rank only the rows of the unknowns it
-    owns (:attr:`CompositeNodes.node_ranks`, from where the patches are), from
+    owns (`CompositeNodes.node_ranks`, from where the patches are), from
     the leaf cells around them, and solves them together with a PETSc Krylov
     method and an algebraic multigrid preconditioner (see
-    :class:`PetscSystem`). ``"fft"`` solves a uniform mesh without bodies
+    `PetscSystem`). ``"fft"`` solves a uniform mesh without bodies
     with fast transforms, also when nothing fixes the potential (every axis
     periodic or Neumann: the solution of zero mean); ``"auto"`` takes the LU
     on a line, the FFT where it applies and the LU elsewhere. All give the
     potential on all nodes on every rank.
 
     Attributes:
-        nodes: The :class:`CompositeNodes` of the hierarchy.
+        nodes: The `CompositeNodes` of the hierarchy.
         free: Node numbers of the unknowns: neither hanging nor fixed.
         fixed: Whether a node has a prescribed value (a face or a body).
         rows: Node numbers of the unknowns whose rows this rank holds: all of
-            :attr:`free`, or those it owns with a distributed backend (in the
+            `free`, or those it owns with a distributed backend (in the
             order of the distributed system: by rank, then by node number).
         matrix: This rank's rows of the operator, over the columns of the
-            unknowns (in :attr:`free` order, or in the distributed order).
-        backend: The :class:`~patchwork.backends.Backend`.
-        system: The :class:`~patchwork.backends.LinearSystem` it solves.
+            unknowns (in `free` order, or in the distributed order).
+        backend: The `Backend`.
+        system: The `LinearSystem` it solves.
         solver: What the backend set up (an LU factorization, a
-            :class:`PetscSystem`, an :class:`~patchwork.backends.FFTSolver`),
+            `PetscSystem`, an `FFTSolver`),
             ``None`` without unknowns.
     """
 
@@ -1385,7 +1525,7 @@ class NodalPoisson:
     # Solving -------------------------------------------------------------------#
     @property
     def load(self) -> sparse.csr_matrix:
-        """Map from a source on all nodes to the right-hand side of this rank's :attr:`rows`."""
+        """Map from a source on all nodes to the right-hand side of this rank's `rows`."""
         return self._load
 
     @property
@@ -1393,7 +1533,7 @@ class NodalPoisson:
         """Map from a source integrated over each node's control volume to the right-hand side.
 
         The transposed interpolation of the hanging nodes, restricted to the
-        unknowns: what a deposited charge (:meth:`CompositeNodes.deposit`)
+        unknowns: what a deposited charge (`CompositeNodes.deposit`)
         needs. ``load == integral_load @ diag(volumes)``.
         """
         return self._integral_load
@@ -1405,7 +1545,7 @@ class NodalPoisson:
 
     @sp.profile("patchwork.nodal_poisson_solve_reduced", tags=PROFILE_TAGS)
     def solve_reduced(self, right_hand_side: np.ndarray) -> np.ndarray:
-        """Solve for a right-hand side of this rank's :attr:`rows`; the potential on all nodes.
+        """Solve for a right-hand side of this rank's `rows`; the potential on all nodes.
 
         ``right_hand_side`` is ``load @ source + constant``, which callers that
         solve repeatedly with a source of fixed structure can precompute as one
@@ -1430,12 +1570,12 @@ class NodalPoisson:
     ) -> np.ndarray:
         r"""Solve for a source given on the nodes; the potential on all nodes.
 
-        ``source`` is an array ``(n,)`` over :attr:`nodes`, or the name of a
+        ``source`` is an array ``(n,)`` over `nodes`, or the name of a
         node-centered field of the hierarchy. Or ``charge`` is the source
         integrated over each node's control volume, ``(n,)``, as
-        :meth:`CompositeNodes.deposit` gives it for point particles (divide a
-        charge by the permittivity for :math:`-\nabla^2\phi = \rho /
-        \varepsilon_0`); the charge on hanging nodes goes to the nodes they hang
+        `CompositeNodes.deposit` gives it for point particles (divide a
+        charge by the permittivity for $-\nabla^2\phi = \rho /
+        \varepsilon_0$); the charge on hanging nodes goes to the nodes they hang
         from, and the charge on fixed nodes is ignored. A source or charge array
         is the whole one on every rank (the sum over the ranks' deposits); each
         rank reads the part its rows need. With ``potential`` the result is also
@@ -1478,10 +1618,10 @@ def solve_nodal_poisson(
     embedded: Sequence[EmbeddedDirichlet] = (),
     backend: str | Backend = "lu",
 ) -> NodalPoisson:
-    r"""Solve :math:`-\nabla^2\phi = \mathrm{rhs}` once on the nodes of ``hierarchy``.
+    r"""Solve $-\nabla^2\phi = \mathrm{rhs}$ once on the nodes of ``hierarchy``.
 
     ``rhs`` and ``potential`` name node-centered fields; see
-    :class:`NodalPoisson` for the conditions and the backends. Returns the
+    `NodalPoisson` for the conditions and the backends. Returns the
     solver, which can solve again without assembling.
     """
     solver = NodalPoisson(hierarchy, faces=faces, embedded=embedded, backend=backend)

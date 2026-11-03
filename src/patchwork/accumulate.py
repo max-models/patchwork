@@ -1,8 +1,8 @@
 """Scatter-add of a node-centered deposit: every node's charge goes to one copy.
 
 A particle code deposits the charge of its markers patch by patch (see
-:meth:`AMRHierarchy.deposit <patchwork.mesh.AMRHierarchy.deposit>`). The result is not
-yet the charge of the composite mesh (:class:`~patchwork.nodal.CompositeNodes`), for two
+`AMRHierarchy.deposit`). The result is not
+yet the charge of the composite mesh (`CompositeNodes`), for two
 reasons:
 
 1. a marker near the edge of a rank's block deposits into the halo of the block, and
@@ -10,13 +10,13 @@ reasons:
    corners that touch or nest, and the two copies of a node on a periodic seam), and
    each copy only has the charge of the markers whose cell is in its own patch.
 
-:class:`Accumulation` fixes both. The halos are added into the neighbouring blocks with
+`Accumulation` fixes both. The halos are added into the neighbouring blocks with
 mpiarray's ``accumulate_halos``. Then the charge of every copy of a node is moved to the
 owner copy: the one in the finest patch that holds the node (the last one in
-:attr:`AMRHierarchy.patches` among the patches of that level), which is the copy
-:meth:`CompositeNodes.from_patches <patchwork.nodal.CompositeNodes.from_patches>` reads.
+`AMRHierarchy.patches` among the patches of that level), which is the copy
+`CompositeNodes.from_patches` reads.
 The other copies end up zero, so the sum over all copies is kept. The transport is one
-``Alltoallv`` (:func:`mpiarray.migrate`) over the hierarchy's communicator.
+``Alltoallv`` (`mpiarray.migrate`) over the hierarchy's communicator.
 
 The owner copy of every node is found with one table on the finest lattice of the whole
 domain (one integer per lattice node, painted patch by patch from the coarsest).
@@ -28,16 +28,28 @@ from typing import TYPE_CHECKING, Any
 
 import mpiarray as mpa
 import numpy as np
+from methodcard import method
 
 if TYPE_CHECKING:
     from patchwork.mesh import AMRHierarchy
 
 
+@method(
+    equations={
+        "halos": r"q_p \mathrel{+}= \sum_{\text{neighbouring blocks } b} q_p^{\mathrm{halo}(b)} \quad \text{(within a patch; dropped at its edges)}",
+        "owner": r"q_p^{\mathrm{owner}} = \sum_{\text{copies } c \text{ of node } p} q_p^{c}, \qquad q_p^{c} = 0 \ \ (c \ne \mathrm{owner})",
+    },
+    assumptions=(
+        "the owner copy is in the finest patch that holds the node (the last of that level in `patches`), the upper copy on a periodic seam",
+        "the sum over all copies is kept; the result equals `CompositeNodes.deposit` to round-off",
+        "node-centered fields only",
+    ),
+)
 class Accumulation:
     """Add the halos of node field ``name`` and move every node's charge to its owner copy.
 
     Built collectively (the ranks tell each other which block they hold), executed as
-    often as needed. Collective over the hierarchy's communicator, as is :meth:`execute`.
+    often as needed. Collective over the hierarchy's communicator, as is `execute`.
     """
 
     def __init__(self, hierarchy: AMRHierarchy, name: str) -> None:
@@ -202,7 +214,7 @@ class Accumulation:
         return halos, moves, targets
 
     def _execute_serial(self) -> None:
-        """:meth:`execute` on one rank: every patch is one block, nothing to send.
+        """`execute` on one rank: every patch is one block, nothing to send.
 
         The halos of a block that is a whole patch are dropped (as mpiarray's
         ``accumulate_halos`` does at the edges of a patch), and the charge of the

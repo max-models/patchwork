@@ -1,28 +1,28 @@
 """The lowest-order edge space of a 2D hierarchy, next to its nodes.
 
-:class:`CompositeEdges` holds the edges of the leaf cells of
-:class:`~patchwork.nodal.CompositeNodes`. A field ``e`` on them is the line
+`CompositeEdges` holds the edges of the leaf cells of
+`CompositeNodes`. A field ``e`` on them is the line
 integral of the electric field along every edge, and inside a leaf cell the
 field is the lowest-order (Whitney) edge interpolant: the x component varies
 linearly in y between the cell's lower and upper x-edges, the y component
 linearly in x between its left and right y-edges, and the tangential component
 is constant along every edge. Then
 
-- the discrete gradient :attr:`CompositeEdges.gradient` is the incidence of
+- the discrete gradient `CompositeEdges.gradient` is the incidence of
   edges and nodes (end minus start), exact for any potential, and the field of
   ``gradient @ phi`` is the gradient of the bilinear interpolant of ``phi``;
 - a coarse edge on a patch edge is two fine half-edges, which hang: the line
   integral of a constant tangential field over a half is half the coarse one
-  (:attr:`CompositeEdges.reduction`), and the hanging nodes' interpolation
+  (`CompositeEdges.reduction`), and the hanging nodes' interpolation
   commutes with the gradient (``G T = T1 G T``);
-- the edge mass matrix (:meth:`CompositeEdges.mass`) is the field energy
+- the edge mass matrix (`CompositeEdges.mass`) is the field energy
   ``e^T M e`` of the cells (without ``eps0``); lumped, ``G^T M G`` is the
-  operator of :class:`~patchwork.nodal.NodalPoisson` (its five-point stencil
+  operator of `NodalPoisson` (its five-point stencil
   inside a patch).
 
 This is the space of the implicit, energy-conserving PIC: the field gather
-(:meth:`CompositeEdges.evaluation`) and the current deposit, its transpose
-(:meth:`CompositeEdges.deposit`).
+(`CompositeEdges.evaluation`) and the current deposit, its transpose
+(`CompositeEdges.deposit`).
 """
 
 from __future__ import annotations
@@ -32,13 +32,14 @@ from typing import TYPE_CHECKING
 import numpy as np
 import scipy.sparse as sparse
 import scope_profiler as sp
+from methodcard import Rule, method
 
 from patchwork._profiling import PROFILE_TAGS
 
 if TYPE_CHECKING:
     from patchwork.nodal import CompositeNodes
 
-#: The sides of a leaf cell, in the order of :attr:`CompositeEdges.cell_edges`:
+#: The sides of a leaf cell, in the order of `CompositeEdges.cell_edges`:
 #: direction of the edge, offset of its lower end from the cell's lower corner
 #: (in spans, per axis), and the corners (of ``cell_corners``) at its two ends.
 _SIDES = (
@@ -49,6 +50,129 @@ _SIDES = (
 )
 
 
+def _uniform_edges(hx: float, hy: float, cells: int = 4) -> CompositeEdges:
+    """The edges of ``cells`` by ``cells`` uniform cells of ``hx`` by ``hy``."""
+    from patchwork.mesh import AMRHierarchy
+    from patchwork.nodal import CompositeNodes
+
+    bounds = ((0.0, cells * hx), (0.0, cells * hy))
+    mesh = AMRHierarchy(base_shape=(cells, cells), bounds=bounds)
+    return CompositeEdges(CompositeNodes(mesh))
+
+
+def _interior_x_edge(edges: CompositeEdges) -> int:
+    """The x-edge from lattice point (1, 2): two cells share it."""
+    lattice = edges.lattice
+    found = (edges.direction == 0) & (lattice[:, 0] == 1) & (lattice[:, 1] == 2)
+    return int(np.flatnonzero(found)[0])
+
+
+def _mass_rules() -> dict:
+    """The SymPy rules of `CompositeEdges.mass` (for the tests)."""
+    import sympy
+
+    hx, hy = sympy.symbols("hx hy", positive=True)
+    ranges = {"hx": (0.05, 1.0), "hy": (0.05, 1.0)}
+
+    def entry(hx: float, hy: float, lumped: bool) -> float:
+        edges = _uniform_edges(hx, hy)
+        edge = _interior_x_edge(edges)
+        return float(edges.mass(lumped)[edge, edge])
+
+    return {
+        "lumped": Rule(
+            hy / hx,
+            implementation=lambda hx, hy: entry(hx, hy, True),
+            ranges=ranges,
+        ),
+        "consistent": Rule(
+            2 * hy / (3 * hx),
+            implementation=lambda hx, hy: entry(hx, hy, False),
+            ranges=ranges,
+        ),
+    }
+
+
+def _whitney_rules() -> dict:
+    """The SymPy rule of `CompositeEdges.evaluation` (for the tests)."""
+    import sympy
+
+    hx, eta, lower, upper = sympy.symbols("hx eta e_lower e_upper", real=True)
+
+    def field(hx: float, eta: float, e_lower: float, e_upper: float) -> float:
+        edges = _uniform_edges(hx, 1.0, cells=2)
+        cell = int(np.flatnonzero((edges.nodes.cell_lower == 0).all(axis=1))[0])
+        e = np.zeros(edges.num_edges)
+        e[edges.cell_edges[cell, 0]] = e_lower
+        e[edges.cell_edges[cell, 1]] = e_upper
+        # E_x does not vary along x in a cell: any point of the row
+        x, _ = edges.evaluation(np.array([[0.3 * hx], [eta]]))
+        return float((x @ e)[0])
+
+    return {
+        "whitney": Rule(
+            ((1 - eta) * lower + eta * upper) / hx,
+            implementation=field,
+            ranges={
+                "hx": (0.1, 1.0),
+                "eta": (0.01, 0.99),
+                "e_lower": (0.5, 2.0),
+                "e_upper": (0.5, 2.0),
+            },
+        )
+    }
+
+
+def _continuity_rules() -> dict:
+    """The SymPy rule of `CompositeEdges.deposit_paths` (for the tests)."""
+    import sympy
+
+    from patchwork.mesh import AMRHierarchy
+    from patchwork.nodal import CompositeNodes
+
+    x0, y0, q = sympy.symbols("x0 y0 q", real=True)
+    mesh = AMRHierarchy(base_shape=(8, 8))
+    mesh.add_patch(level=1, box=((8, 16), (8, 16)))
+    nodes = CompositeNodes(mesh)
+    edges = CompositeEdges(nodes)
+    divergence = (edges.gradient @ nodes.reduction).T
+    # the lower-left corner (1/8, 1/8) of the coarse cell where the paths start
+    corner = int(np.argmin(np.abs(nodes.lattice - (2, 2)).sum(axis=1)))
+
+    def change(x0: float, y0: float, q: float) -> float:
+        start = np.array([[x0], [y0]])
+        # into the fine patch, across coarse faces and the patch's edge
+        end = start + np.array([[0.55], [0.6]])
+        current = edges.deposit_paths(start, end, np.array([q]))
+        return float((divergence @ current)[corner])
+
+    xi, eta = 8 * x0 - 1, 8 * y0 - 1
+    return {
+        "continuity": Rule(
+            -q * (1 - xi) * (1 - eta),
+            implementation=change,
+            ranges={"x0": (0.13, 0.2), "y0": (0.13, 0.2), "q": (0.5, 2.0)},
+        )
+    }
+
+
+@method(
+    equations={
+        "gradient": r"(G\phi)_e = \phi_{\mathrm{end}(e)} - \phi_{\mathrm{start}(e)}",
+        "hanging_edges": r"(T_1 e)_f = \frac{s_f}{s_c}\, e_c \quad \text{for a fine edge of span } s_f \text{ in a coarse edge of span } s_c",
+        "commuting": r"G\,T = T_1\,G\,T",
+        "nodal_operator": r"\big(T^\top G^\top M_\mathrm{lumped}\, G\, T\big)_{FF} = A_\mathrm{NodalPoisson}",
+    },
+    assumptions=(
+        "2D Cartesian only; edges addressed on the finest lattice",
+        "a coarse edge and the fine edges that halve it are different edges; the fine ones hang",
+    ),
+    references=(
+        "H. Whitney, Geometric Integration Theory, Princeton University Press (1957)",
+        "[Bossavit, IEE Proc. A 135, 493 (1988)](https://doi.org/10.1049/ip-a-1.1988.0077)",
+    ),
+    components=("patchwork.nodal.CompositeNodes",),
+)
 class CompositeEdges:
     """The edges of the leaf cells of a 2D hierarchy, and the operators on them.
 
@@ -58,7 +182,7 @@ class CompositeEdges:
     the fine ones hang.
 
     Attributes:
-        nodes: The :class:`~patchwork.nodal.CompositeNodes` of the hierarchy.
+        nodes: The `CompositeNodes` of the hierarchy.
         num_edges: Number of edges.
         direction: The axis along every edge, ``(n1,)``.
         lattice: Finest-lattice coordinates of the lower end of every edge,
@@ -191,13 +315,26 @@ class CompositeEdges:
         self._find_hanging_edges()
 
     # Operators -------------------------------------------------------------------#
+    @method(
+        equations={
+            "energy": r"e^\top M e = \int |\mathbf{E}|^2\, dA \quad \text{(no } \varepsilon_0\text{)}",
+            "lumped": r"M_{ee} = \sum_{K \ni e} \frac{h_\perp}{2 h_\parallel}",
+            "consistent": r"M_K = \frac{h_\perp}{h_\parallel} \begin{pmatrix} 1/3 & 1/6 \\ 1/6 & 1/3 \end{pmatrix} \quad \text{per cell and direction}",
+        },
+        assumptions=(
+            "lumped: the vertex (trapezoidal) quadrature, diagonal; its entries are the edge conductances of the nodal stencil",
+            "consistent: the exact integral of the products of the linear profiles",
+            r"for a field on hanging edges use $T_1^\top M T_1$",
+        ),
+        symbolic=_mass_rules,
+    )
     def mass(self, lumped: bool = True) -> sparse.csr_matrix:
         """The edge mass matrix ``M1``: ``e^T M1 e`` is the integral of ``|E|^2``.
 
         Summed over the leaf cells, each with the edge interpolant of its own
         four edges. ``lumped`` takes the vertex (trapezoidal) quadrature, which
         makes it diagonal: ``h_perp / (2 h)`` per cell and edge, the conductance
-        of :class:`~patchwork.nodal.NodalPoisson`'s stencil. Otherwise the exact
+        of `NodalPoisson`'s stencil. Otherwise the exact
         integral, ``h_perp / h`` times ``[[1/3, 1/6], [1/6, 1/3]]`` for the two
         edges of a direction. Both are symmetric and positive definite on the
         free edges. For a field on hanging edges, use ``T1^T M1 T1``.
@@ -231,6 +368,20 @@ class CompositeEdges:
             )
         )
 
+    @method(
+        equations={
+            "whitney": r"E_x = \frac{(1-\eta)\,e_\mathrm{lower} + \eta\,e_\mathrm{upper}}{h_x}, \qquad E_y = \frac{(1-\xi)\,e_\mathrm{left} + \xi\,e_\mathrm{right}}{h_y}",
+            "deposit": r"j = E_x^\top v_x + E_y^\top v_y \quad (\texttt{deposit}\text{, the transpose})",
+        },
+        assumptions=(
+            r"$(\xi, \eta)$ the fractions from the lower-left corner of the leaf cell; the tangential component is constant along every edge",
+            r"apply to edge values with their hanging edges filled ($T_1 e$); a point outside the domain gets zero",
+        ),
+        references=(
+            "[Bossavit, IEE Proc. A 135, 493 (1988)](https://doi.org/10.1049/ip-a-1.1988.0077)",
+        ),
+        symbolic=_whitney_rules,
+    )
     def evaluation(self, points: np.ndarray) -> tuple[sparse.csr_matrix, ...]:
         """The field of an edge field at ``points`` ``(2, k)``: one ``(k, n1)`` matrix per axis.
 
@@ -263,7 +414,7 @@ class CompositeEdges:
     def deposit(self, points: np.ndarray, vectors: np.ndarray) -> np.ndarray:
         """Vectors ``(2, k)`` at ``points`` ``(2, k)`` on the edges: ``(n1,)``.
 
-        The transpose of :meth:`evaluation`: ``deposit(points, v) @ e`` is the
+        The transpose of `evaluation`: ``deposit(points, v) @ e`` is the
         sum of ``v . E(points)`` for the field ``E`` of ``e``. With the
         velocities times the charges of markers, it is their current at those
         points (a path integral of it is the current along their paths).
@@ -313,6 +464,24 @@ class CompositeEdges:
             start[:, path] + finish * step[:, path],
         )
 
+    @method(
+        equations={
+            "pieces": r"j_\mathrm{lower} \mathrel{+}= q\,\frac{\Delta x}{h_x}(1 - \eta_\mathrm{mid}), \qquad j_\mathrm{upper} \mathrel{+}= q\,\frac{\Delta x}{h_x}\,\eta_\mathrm{mid}, \qquad \text{likewise for the } y\text{-edges}",
+            "continuity": r"(G T)^\top j = T^\top\big(Q(\mathbf{x}_1) - Q(\mathbf{x}_0)\big)",
+            "product": r"a_1 b_1 - a_0 b_0 = \Delta a\,\bar b + \bar a\,\Delta b \quad \text{for linear } a(t), b(t)",
+            "work": r"j^\top e = \sum_k q_k \int_{\mathbf{x}_0}^{\mathbf{x}_1} \mathbf{E}\cdot d\mathbf{l}",
+        },
+        assumptions=(
+            "straight paths, cut at every finest-lattice line so that each piece lies in one leaf cell; the midpoint integrates the linear edge functions exactly",
+            r"$Q$ the bilinear node deposit (`CompositeNodes.deposit`); conserved across patch edges and periodic seams to round-off",
+            "pieces outside the domain deposit nothing",
+        ),
+        references=(
+            "[Villasenor and Buneman, Comput. Phys. Commun. 69, 306 (1992)](https://doi.org/10.1016/0010-4655(92)90169-Y)",
+        ),
+        components=("patchwork.nodal.CompositeNodes.deposit",),
+        symbolic=_continuity_rules,
+    )
     def deposit_paths(
         self, start: np.ndarray, end: np.ndarray, charges: np.ndarray
     ) -> np.ndarray:
@@ -323,8 +492,7 @@ class CompositeEdges:
         crosses, patch edges included, and each piece is integrated exactly
         against the edge functions of its leaf cell: ``q * integral of w . dl``.
         Then the charge is conserved exactly: ``(G T)^T j`` is the change of the
-        charge on the nodes, ``T^T`` of :meth:`CompositeNodes.deposit
-        <patchwork.nodal.CompositeNodes.deposit>` at the ends minus at the
+        charge on the nodes, ``T^T`` of `CompositeNodes.deposit` at the ends minus at the
         starts, and ``j @ e`` is the work of the field ``e`` on the charges. The
         current density times the time step, summed over a step's paths, is
         ``j``. Pieces outside the domain deposit nothing. A NumPy reference,

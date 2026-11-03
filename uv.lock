@@ -2222,6 +2222,23 @@ wheels = [
 ]
 
 [[package]]
+name = "methodcard"
+version = "0.1.0"
+source = { git = "https://github.com/max-models/methodcard?branch=devel#cc1c7bd98faefc860c3dee8b8843045c69990430" }
+dependencies = [
+    { name = "griffe" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "scope-profiler" },
+]
+
+[package.optional-dependencies]
+symbolic = [
+    { name = "sympy" },
+]
+
+[[package]]
 name = "mistune"
 version = "3.3.4"
 source = { registry = "https://pypi.org/simple" }
@@ -2858,6 +2875,7 @@ source = { editable = "." }
 dependencies = [
     { name = "cunumpy" },
     { name = "maybempi" },
+    { name = "methodcard" },
     { name = "mpiarray" },
     { name = "mpifield" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -2877,6 +2895,7 @@ dev = [
     { name = "jupyterlab" },
     { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "matplotlib", version = "3.11.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "methodcard", extra = ["symbolic"] },
     { name = "nbclient" },
     { name = "nbformat" },
     { name = "pre-commit" },
@@ -2910,6 +2929,7 @@ pyccel = [
     { name = "pyccel" },
 ]
 test = [
+    { name = "methodcard", extra = ["symbolic"] },
     { name = "pyccel" },
     { name = "pytest" },
     { name = "pytest-cov" },
@@ -2923,6 +2943,8 @@ requires-dist = [
     { name = "jupyterlab", marker = "extra == 'dev'" },
     { name = "matplotlib", marker = "extra == 'plot'" },
     { name = "maybempi", git = "https://github.com/max-models/maybempi?branch=devel" },
+    { name = "methodcard", git = "https://github.com/max-models/methodcard?branch=devel" },
+    { name = "methodcard", extras = ["symbolic"], marker = "extra == 'test'", git = "https://github.com/max-models/methodcard?branch=devel" },
     { name = "mpiarray", git = "https://github.com/max-models/mpiarray?branch=devel" },
     { name = "mpiarray", extras = ["mpi"], marker = "extra == 'mpi'", git = "https://github.com/max-models/mpiarray?branch=devel" },
     { name = "mpifield", git = "https://github.com/max-models/mpifield?branch=devel" },

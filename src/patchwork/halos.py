@@ -1,7 +1,7 @@
 """Halo exchange between patches, and restriction from fine patches to coarse ones.
 
 Each patch field is an mpiarray array on the patch's own ranks, with a halo of
-``halo`` cells (or nodes) around it. :class:`HaloExchange` fills that halo from
+``halo`` cells (or nodes) around it. `HaloExchange` fills that halo from
 the rest of the hierarchy:
 
 1. from the patches of the same level that the halo overlaps, across periodic
@@ -11,13 +11,13 @@ the rest of the hierarchy:
 3. between the ranks inside each patch, with mpiarray's own ``update_halos``.
 
 Halo points outside the domain are left as they are: they belong to the
-boundary conditions. :class:`Restriction` goes the other way and gives the
+boundary conditions. `Restriction` goes the other way and gives the
 coarse points under a finer patch the fine values: the mean of the fine cells,
 or the coinciding fine node.
 
 Both are schedules, built once (collectively) for a field and executed as often
 as needed. All transport is one ``Alltoallv`` per execution
-(:class:`mpiarray.CopyPlan`) over the hierarchy's communicator.
+(`mpiarray.CopyPlan`) over the hierarchy's communicator.
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 import mpiarray as mpa
 import numpy as np
+from methodcard import ConvergenceProblem, method
 
 if TYPE_CHECKING:
     from patchwork.mesh import AMRHierarchy, Patch
@@ -236,7 +237,7 @@ def interpolate_from_below(
     (``None`` likewise). Appends to ``copies`` the copies that bring the coarse
     values into a buffer on the patch's ranks; the weights leave out coarse
     points on no patch and are renormalised. Returns what to compute after the
-    copies (see :func:`apply_interpolations`) on the ranks that hold some of
+    copies (see `apply_interpolations`) on the ranks that hold some of
     the points, else ``None``.
     """
     if not index[0].size:
@@ -322,6 +323,21 @@ class _Conservative:
         self.array.local_with_halos[self.index] = result
 
 
+@method(
+    equations={
+        "fill": r"u_f = u_c + \sum_a \sigma_a\, \xi_a, \qquad \xi = \frac{(i \bmod r) + \frac12}{r} - \frac12",
+        "slope": r"\sigma = \mathrm{minmod}\Big(2\Delta_+,\ 2\Delta_-,\ \tfrac12(\Delta_+ + \Delta_-)\Big), \qquad \sigma = 0 \text{ without both neighbours}",
+        "radial_shift": r"\xi_r \to \xi_r - \frac{\Delta r \sum_k \xi_k^2}{r\, r_c} \quad (r\text{–}z)",
+        "mean": r"\frac{\sum_{f \subset c} V_f u_f}{\sum_{f \subset c} V_f} = u_c",
+    },
+    assumptions=(
+        "cell-centered fields; the volume-weighted mean of the fine cells of a coarse cell is its value",
+        "no new extrema (a positive density stays positive); a linear field is reproduced away from walls",
+    ),
+    references=(
+        "[van Leer, J. Comput. Phys. 23, 276 (1977)](https://doi.org/10.1016/0021-9991(77)90095-X): the monotonized central limiter",
+    ),
+)
 def conservative_from_below(
     hierarchy: AMRHierarchy,
     points: _Points,
@@ -343,7 +359,7 @@ def conservative_from_below(
     offsets are measured from the cell's volume-weighted centre), no new
     extrema appear (a positive density stays positive), and a linear field is
     reproduced away from walls.
-    Arguments and result as for :func:`interpolate_from_below`.
+    Arguments and result as for `interpolate_from_below`.
     """
     if not index[0].size:
         return None
@@ -399,10 +415,57 @@ def apply_interpolations(interpolations: list) -> None:
         interpolation.apply()
 
 
+def _halo_problem() -> ConvergenceProblem:
+    """A smooth cell field interpolated into the halo of a level-1 patch, maximum norm."""
+    from patchwork.mesh import AMRHierarchy
+
+    def function(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        return np.sin(np.pi * x) * np.cos(1.3 * y)
+
+    def error(spacing: float) -> float:
+        n = round(1.0 / spacing)
+        mesh = AMRHierarchy(base_shape=(n, n))
+        fine = mesh.add_patch(level=1, box=((n // 2, 3 * n // 2),) * 2)
+        mesh.allocate_field("u", halo=1)
+        exact = {}
+        for patch in mesh.patches:
+            (i0, i1), (j0, j1) = patch.box
+            dx, dy = mesh.spacing(patch.level)
+            i, j = np.meshgrid(
+                np.arange(i0 - 1, i1 + 1), np.arange(j0 - 1, j1 + 1), indexing="ij"
+            )
+            exact[patch.level] = function((i + 0.5) * dx, (j + 0.5) * dy)
+            storage = patch.field("u").local_with_halos
+            storage[...] = 0.0
+            storage[1:-1, 1:-1] = exact[patch.level][1:-1, 1:-1]
+        mesh.exchange_halos("u")
+        halo = np.ones(exact[1].shape, dtype=bool)
+        halo[1:-1, 1:-1] = False
+        values = np.asarray(fine.field("u").local_with_halos)
+        return float(np.abs(values - exact[1])[halo].max())
+
+    return ConvergenceProblem(error, steps=[1 / 16, 1 / 32, 1 / 64])
+
+
+@method(
+    equations={
+        "same_level": r"u_\mathrm{halo} = u \text{ of a patch of the same level (periodic images included)}",
+        "position": r"X = \frac{i_f + \frac12}{r} - \frac12 \ \text{(cells)}, \qquad X = \frac{i_f}{r} \ \text{(nodes)}",
+        "bilinear": r"u_f = \sum_{c \in \{0,1\}^d} \frac{w_c\, u_c}{\sum_{c\ \text{available}} w_c}, \qquad w_c = \prod_a \big(c_a \lambda_a + (1 - c_a)(1 - \lambda_a)\big), \quad \lambda = X - \lfloor X \rfloor",
+    },
+    order=2,
+    assumptions=(
+        "coarse points on no patch are dropped and the weights renormalised; next to a non-periodic wall the stencil is clipped to the two inside points (linear extrapolation)",
+        "halo points outside the domain are left to the boundary conditions",
+        "then mpiarray's `update_halos` within a patch; one `Alltoallv` per execution",
+        "the order is that of the interpolated halo values of a smooth field, maximum norm",
+    ),
+    problem=_halo_problem,
+)
 class HaloExchange:
     """Fill the halo of every patch of field ``name``; see the module docstring.
 
-    Collective over the hierarchy's communicator, as is :meth:`execute`.
+    Collective over the hierarchy's communicator, as is `execute`.
     """
 
     def _field(self, patch: Patch) -> Any:
@@ -514,14 +577,24 @@ class HaloExchange:
                     patch.field(self._name).update_halos()
 
 
+@method(
+    equations={
+        "cells": r"u_c = \frac{\sum_{f \subset c} V_f\, u_f}{\sum_{f \subset c} V_f}",
+        "nodes": r"u_c = u_f \quad \text{at the coinciding fine node}",
+    },
+    assumptions=(
+        "finest level first, or one level; volume-weighted in $(r, z)$, a plain mean in the plane",
+        "only the points of each rank's block are written",
+    ),
+)
 class Restriction:
     """Give the coarse points under finer patches the fine values of field ``name``.
 
     Cell-centered: the mean of the fine cells of each coarse cell, weighted by
     their volumes in r–z (where they grow with the radius).
     Node-centered: the fine node at each coarse node. Only the points of each
-    rank's block are written; the halos follow with :class:`HaloExchange`.
-    Collective over the hierarchy's communicator, as is :meth:`execute`.
+    rank's block are written; the halos follow with `HaloExchange`.
+    Collective over the hierarchy's communicator, as is `execute`.
     """
 
     def _add(

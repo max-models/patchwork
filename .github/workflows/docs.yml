@@ -28,4 +28,6 @@ jobs:
       smoke-paths: |
         getting-started/installation/index.html
         examples/01-first-hierarchy/index.html
+        numerics/index.html
+        numerics/nodal/index.html
         api/patchwork/index.html

@@ -1,0 +1,88 @@
+---
+title: Overview
+description: The discretisations of patchwork, from the patch hierarchy to the composite solves and the charge-conserving deposit, and what it leaves out.
+sidebar:
+  label: Overview
+---
+
+import MethodCard from '@max-models/starlight-theme/components/MethodCard.astro';
+
+patchwork is a block-structured adaptive mesh in one or two dimensions: nested rectangular
+patches of cells, each finer by the refinement ratio $r$ (2 by default), each patch an mpiarray
+array on its own ranks. On the *composite mesh*, the leaf cells that no finer patch covers, it
+solves elliptic problems for a particle-in-cell or fluid code: a node-centred Poisson equation
+for the potential and a cell-centred operator with variable coefficients, in the Cartesian
+$(x, y)$ or the axisymmetric $(r, z)$ plane. Around them are the pieces a time-dependent code
+needs: halo exchange, restriction, regridding, refluxing, and the deposit and gather of markers,
+with an edge space whose current deposit conserves the charge exactly.
+
+Each equation on these pages is declared on the code that implements it, as a method card, and
+checked by the tests: ten closed forms against SymPy rules and four discretisations against
+their order of convergence on manufactured solutions. The pages of this section list the cards
+module by module; this one shows how they fit together.
+
+## The pipeline
+
+1. **[Hierarchy](/patchwork/numerics/mesh/).** Level $L$ has the spacing $h_L = h_0 / r^L$;
+   patch boxes are aligned to the level below and covered by it. In $(r, z)$ a cell is a ring
+   with its exact volume and face areas. Markers are deposited with cloud-in-cell weights in the
+   finest patch that holds them, and the copies of a node are summed by the
+   [deposit accumulation](/patchwork/numerics/accumulate/).
+2. **[Halos and restriction](/patchwork/numerics/halos/).** A halo takes the values of the
+   patches of its level, else the bilinear interpolation of the level below; restriction gives a
+   coarse cell the volume-weighted mean of its fine cells.
+3. **[Regridding](/patchwork/numerics/regrid/).** Cells are tagged where a field changes by more
+   than a threshold, covered with boxes by the Berger-Rigoutsos clustering, and the fields moved
+   to the new hierarchy, conservatively where they must be.
+4. **[Nodal Poisson](/patchwork/numerics/nodal/).** $-\nabla^2\phi = f$ on the nodes of the leaf
+   cells: assembled cell by cell, with the hanging nodes of coarse-fine interfaces eliminated by
+   their interpolation, and Shortley-Weller rows at embedded surfaces:
+
+<MethodCard name="patchwork.nodal.NodalPoisson" headingLevel={3} />
+
+5. **[Cell operator](/patchwork/numerics/cells/).** $-\nabla\cdot(a\nabla u) + c\,u = f$ on the
+   leaf cells, assembled from an energy so that it stays symmetric (or, with conservative
+   coarse-fine faces, conservative face by face), with the curl-curl of an azimuthal vector
+   potential in $(r, z)$ and fixed or floating bodies.
+6. **[Edge space](/patchwork/numerics/edges/).** The lowest-order (Whitney) edge interpolant on
+   the leaf cells, whose lumped mass matrix gives back the nodal operator, and the current
+   deposit along straight paths that conserves the charge exactly:
+
+<MethodCard name="patchwork.edges.CompositeEdges.deposit_paths" headingLevel={3} />
+
+7. **[Refluxing](/patchwork/numerics/reflux/).** For an explicit, conservative time step, the
+   coarse cells next to finer levels take the fine fluxes instead of their own (Berger and
+   Colella), with or without subcycling.
+
+The assembled operators go to a **[solver backend](/patchwork/numerics/backends/)**: a direct LU
+on every rank, fast transforms on a uniform mesh, or the
+[distributed solve](/patchwork/numerics/distributed/) with PETSc's Krylov methods and algebraic
+multigrid. The [legacy cell Poisson](/patchwork/numerics/poisson/) solve is kept for its users.
+
+## Units and conventions
+
+The operators carry no physical constants: for a charge density pass $\rho / \varepsilon_0$ as
+the source, and $\mu_0$ goes into the coefficients of the cell operator. Fields are per unit
+length out of the plane in $(x, y)$, totals over the ring in $(r, z)$, and per unit area on a
+line. A node-centred deposit holds charges, not densities. Face conditions are named
+`x_lower`, `x_upper`, `y_lower`, `y_upper` and `inner` (the edges of a domain that does not
+fill its rectangle); an unlisted face is grounded.
+
+## Not in the model
+
+- No time integration or particle push: the fluxes of refluxing and the markers are the caller's.
+- No multigrid over the patches; the only multigrid is PETSc's algebraic preconditioner. The
+  cell operator has the LU only, on every rank.
+- No three dimensions, no per-axis or per-level refinement ratios, no non-rectangular patches.
+- The edge space is 2D Cartesian only; the nodal Poisson solve uses Cartesian control volumes
+  also on an $(r, z)$ hierarchy.
+- The Shortley-Weller rows are used only at regular nodes; elsewhere, and for the cell operator,
+  an embedded surface is a two-point flux (about first order in the maximum norm).
+
+## Verification
+
+Besides the checks of the cards, the tests reproduce linear potentials exactly across patches,
+compare the FFT and PETSc backends with SuperLU, solve a current loop and a conducting column in
+a solenoid against their closed forms in $(r, z)$, conserve the integral to round-off through
+refluxing, restriction and regridding, and conserve the charge of 500 random paths per patch
+layout through the edge deposit.

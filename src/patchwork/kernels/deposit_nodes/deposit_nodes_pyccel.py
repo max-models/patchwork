@@ -2,8 +2,8 @@
 
 The Pyccel version (CPU) of the ``deposit_nodes`` kernel; ``deposit_nodes_numpy.py``
 next to this file is the NumPy version, with the same arguments. Loaded by
-:mod:`patchwork.kernels.deposit_nodes`, compiled with Pyccel on first use; called by
-:meth:`CompositeNodes.deposit <patchwork.nodal.CompositeNodes.deposit>`.
+`patchwork.kernels.deposit_nodes`, compiled with Pyccel on first use; called by
+`CompositeNodes.deposit`.
 
 ``points`` is ``(2, n)``. Each point is found in the leaf cell over its cell of the
 finest lattice (``leaf_map``, ``(nx, ny)``, -1 outside the domain), as in

@@ -1,23 +1,23 @@
 r"""Cell-centered composite linear solves on a static patch hierarchy.
 
-:class:`CellOperator` solves :math:`-\nabla\cdot(a\nabla u) + c\,u = f` for one
+`CellOperator` solves $-\nabla\cdot(a\nabla u) + c\,u = f$ for one
 value per *leaf cell* (a cell of a patch that no finer patch covers), with a
 variable diffusion coefficient ``a`` (real, positive) and reaction ``c`` (real or
 complex), in the Cartesian plane or in the axisymmetric r–z plane of the
 hierarchy (``AMRHierarchy(geometry=...)``). In r–z it also takes the
-curl-curl of an azimuthal vector component, :math:`\nabla\times(a\nabla\times
-A_\phi\hat\phi) = -a(\nabla^2 - 1/r^2)A_\phi` for constant ``a``, the operator of a
+curl-curl of an azimuthal vector component, $\nabla\times(a\nabla\times
+A_\phi\hat\phi) = -a(\nabla^2 - 1/r^2)A_\phi$ for constant ``a``, the operator of a
 magnetoquasistatic field driven by azimuthal currents (``component="azimuthal"``).
 
 The operator is assembled from an energy, so it is symmetric (complex
 symmetric, not Hermitian, for a complex ``c``):
 
-.. math::
+$$
+E(u) = \sum_\text{faces} a_f\,c_f\,(v_f^\top u)^2 + \sum_\text{cells} c_i V_i u_i^2,
+$$
 
-    E(u) = \sum_\text{faces} a_f\,c_f\,(v_f^\top u)^2 + \sum_\text{cells} c_i V_i u_i^2,
-
-where across a face between two cells of one size :math:`v_f^\top u = w_+u_+ -
-w_-u_-` and :math:`c_f` is the face area over the distance of the centres.
+where across a face between two cells of one size $v_f^\top u = w_+u_+ -
+w_-u_-$ and $c_f$ is the face area over the distance of the centres.
 Across a coarse–fine face the coarse value is interpolated along the face to
 the middle of the fine face, quadratically from the coarse cell and its two
 neighbours along the face (linearly or not at all where they are missing), so
@@ -31,30 +31,31 @@ coarse value is that of the coarse cell itself. ``coarse_fine="conservative"``
 instead builds a fine ghost value beyond the face, quadratic through the two
 fine cells and the interpolated coarse value, and adds that face flux to the
 fine cell and takes it from the coarse one: second order everywhere and
-conservative face by face, but not symmetric. The weights are :math:`w = 1` for a
-scalar, and for an azimuthal component across a radial face :math:`w = r` (the
-axial field is :math:`(1/r)\,\partial_r(rA)`) with :math:`c_f` divided by
-:math:`r_f^2`. On the axis an azimuthal component vanishes: the half cell
+conservative face by face, but not symmetric. The weights are $w = 1$ for a
+scalar, and for an azimuthal component across a radial face $w = r$ (the
+axial field is $(1/r)\,\partial_r(rA)$) with $c_f$ divided by
+$r_f r_m$, the face's radius times the mean radius of the two values (which is
+$r_f^2$ only midway between them). On the axis an azimuthal component vanishes: the half cell
 between the axis and the first centre, where it grows linearly, adds
-:math:`4\pi\,\Delta z\,a\,u^2` (without it the curl-free :math:`1/r` field is
+$4\pi\,\Delta z\,a\,u^2$ (without it the curl-free $1/r$ field is
 nearly free next to the axis).
 
-Faces of the domain take :class:`~patchwork.nodal.Dirichlet` values (at the
+Faces of the domain take `Dirichlet` values (at the
 middle of each boundary face, half a cell from the centre) or
-:class:`~patchwork.nodal.Neumann` gradients, as for
-:class:`~patchwork.nodal.NodalPoisson`; periodic axes take none, nor does the
+`Neumann` gradients, as for
+`NodalPoisson`; periodic axes take none, nor does the
 axis of a cylindrical domain. Bodies inside the domain
-(:class:`~patchwork.nodal.EmbeddedDirichlet`) hold the cells whose centres they
+(`EmbeddedDirichlet`) hold the cells whose centres they
 contain at their value; across a face from a free cell to a body cell the
 surface is located along the line of the centres and the free cell couples to
-the surface value at its distance. A floating body (:class:`EmbeddedFloating`)
+the surface value at its distance. A floating body (`EmbeddedFloating`)
 is one more unknown, its uniform value ``U``: its surface couplings enter the
-energy as :math:`s\,(w\,u - w_s U)^2`, so its row is the net flux into it, set to
+energy as $s\,(w\,u - w_s U)^2$, so its row is the net flux into it, set to
 the body's ``source`` (the integral of ``f`` over it; zero for an isolated
-conductor), and the operator stays symmetric. :func:`cell_body` makes a body of
+conductor), and the operator stays symmetric. `cell_body` makes a body of
 leaf cells given by a mask, with its surface on their faces.
 
-:meth:`CellOperator.gradient` and :meth:`CellOperator.curl` differentiate a
+`CellOperator.gradient` and `CellOperator.curl` differentiate a
 solution with the operator's own faces: every face gives the difference of its two
 values (the weighted ones, ``w u``) over their distance, located half way between
 them, with the same coarse–fine interpolation as the operator, the surfaces of the
@@ -74,6 +75,7 @@ import numpy as np
 import scipy.sparse as sparse
 import scipy.sparse.linalg
 import scope_profiler as sp
+from methodcard import ConvergenceProblem, method
 
 from patchwork._profiling import PROFILE_TAGS
 from patchwork.nodal import (
@@ -97,14 +99,24 @@ CellValue = float | complex | np.ndarray | Callable[..., Any]
 COMPONENTS = ("scalar", "azimuthal")
 
 
+@method(
+    equations={
+        "energy": r"E \mathrel{+}= s\,(w\,u - w_s U)^2 \quad \text{per surface coupling } s",
+        "net_flux": r"\oint_{\partial B} a\,\partial_n u\, dA = S, \qquad U \text{ uniform over } B",
+    },
+    assumptions=(
+        r"$S$ = `source`, the integral of $f$ over the body; zero for an isolated conductor",
+        "the operator stays symmetric; a floating body does not anchor the solution",
+    ),
+)
 @dataclass(frozen=True)
 class EmbeddedFloating:
     r"""A floating body inside the domain: one uniform value, an unknown.
 
     ``inside`` and ``fraction`` are those of
-    :class:`~patchwork.nodal.EmbeddedDirichlet`. ``source`` is the integral of
+    `EmbeddedDirichlet`. ``source`` is the integral of
     ``f`` over the body: the net flux the body's surface carries,
-    :math:`\oint a\,\partial_n u` outward from the domain into it; zero for an
+    $\oint a\,\partial_n u$ outward from the domain into it; zero for an
     isolated conductor (no net charge, or no net current for a magnetic vector
     potential).
     """
@@ -117,6 +129,18 @@ class EmbeddedFloating:
 Body = EmbeddedDirichlet | EmbeddedFloating
 
 
+@method(
+    equations={
+        "leaf_cells": r"\text{leaf} = \text{cells of a patch that no finer patch covers}, \qquad \text{span} = r^{L_\mathrm{max} - L} \text{ lattice cells}",
+        "volumes": r"V_i = \Delta x\,\Delta y \ \text{(plane)}, \qquad V_i = 2\pi r_c\,\Delta r\,\Delta z \ \text{(}r\text{–}z\text{)}",
+        "face_areas": r"A_f = t_1 - t_0 \ \text{(plane)}, \qquad A_{r} = 2\pi r_f (z_1 - z_0), \quad A_{z} = \pi (r_1^2 - r_0^2) \ \text{(}r\text{–}z\text{)}",
+    },
+    assumptions=(
+        "a face is a run of finest-lattice faces between one pair of leaf cells",
+        "in 1D a face is a point of area 1",
+    ),
+    components=("patchwork.mesh.AMRHierarchy",),
+)
 class CompositeCells:
     """The leaf cells of a hierarchy, their faces and the maps to its patches.
 
@@ -216,7 +240,7 @@ class CompositeCells:
         return result
 
     def evaluate(self, value: CellValue, dtype: Any = float) -> np.ndarray:
-        """A :data:`CellValue` on the leaf cells, ``(n,)``."""
+        """A `CellValue` on the leaf cells, ``(n,)``."""
         if callable(value):
             value = value(*self.centers.T)
         result = np.asarray(value, dtype=dtype)
@@ -283,7 +307,7 @@ class CompositeCells:
 
         Arrays over the faces: ``cell``, the leaf cell inside; ``side``, 0 if
         the boundary is below the cell and 1 above; ``plane``, ``start``,
-        ``count`` as in :meth:`faces`; ``rectangle``, whether the face is on a
+        ``count`` as in `faces`; ``rectangle``, whether the face is on a
         face of the domain's rectangle (else on an edge inside it).
         """
         low, high, plane, start, count = self._segments(axis)
@@ -347,7 +371,7 @@ class CompositeCells:
         """Write leaf-cell values to the cell-centered field ``name`` (collective).
 
         The cells under finer patches get the (volume-weighted) mean of their
-        fine cells (:meth:`~patchwork.mesh.AMRHierarchy.restrict`).
+        fine cells (`AMRHierarchy.restrict`).
         """
         hierarchy = self.hierarchy
         for number, patch in enumerate(hierarchy.patches):
@@ -398,13 +422,118 @@ def _solve(
     return factorization.solve(right_hand_side)
 
 
-class CellOperator:
-    r"""Solve :math:`-\nabla\cdot(a\nabla u) + c\,u = f` on the leaf cells of a hierarchy.
+def _refined(n: int) -> AMRHierarchy:
+    """A unit square of ``n`` by ``n`` cells with two nested patches (for the problems)."""
+    from patchwork.mesh import AMRHierarchy
 
-    The operator is assembled and factorized once; :meth:`solve` then costs two
-    triangular solves, and :meth:`set_reaction` refactorizes for a new ``c``
+    mesh = AMRHierarchy(base_shape=(n, n))
+    mesh.add_patch(level=1, box=((n // 2, 3 * n // 2),) * 2)
+    mesh.add_patch(level=2, box=((3 * n // 2, 5 * n // 2),) * 2)
+    return mesh
+
+
+def _manufactured(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """The manufactured solution of the convergence problems."""
+    return np.sin(np.pi * x) * np.cos(1.3 * y) + 0.2 * x * y
+
+
+def _manufactured_gradient(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Its gradient, ``(n, 2)``."""
+    return np.stack(
+        [
+            np.pi * np.cos(np.pi * x) * np.cos(1.3 * y) + 0.2 * y,
+            -1.3 * np.sin(np.pi * x) * np.sin(1.3 * y) + 0.2 * x,
+        ],
+        axis=1,
+    )
+
+
+def _diffusion(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    return 1.0 + 0.5 * np.sin(2.0 * x + y)
+
+
+def _reaction(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    return 2.0 + x
+
+
+def _manufactured_source(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """``-div(a grad u) + c u`` of the manufactured solution."""
+    ux, uy = _manufactured_gradient(x, y).T
+    laplacian = -(np.pi**2 + 1.69) * np.sin(np.pi * x) * np.cos(1.3 * y)
+    ax, ay = np.cos(2.0 * x + y), 0.5 * np.cos(2.0 * x + y)
+    divergence = ax * ux + ay * uy + _diffusion(x, y) * laplacian
+    return -divergence + _reaction(x, y) * _manufactured(x, y)
+
+
+def _cell_problem() -> ConvergenceProblem:
+    """Variable coefficients on two nested patches, in the volume-weighted L2 norm."""
+
+    def error(spacing: float) -> float:
+        faces = {face: Dirichlet(_manufactured) for face in FACES}
+        solver = CellOperator(
+            _refined(round(1.0 / spacing)),
+            diffusion=_diffusion,
+            reaction=_reaction,
+            faces=faces,
+        )
+        x, y = solver.cells.centers.T
+        difference = solver.solve(_manufactured_source) - _manufactured(x, y)
+        return float(np.sqrt(np.sum(np.abs(difference) ** 2 * solver.cells.volumes)))
+
+    return ConvergenceProblem(error, steps=[1 / 16, 1 / 32, 1 / 64])
+
+
+def _gradient_problem() -> ConvergenceProblem:
+    """The gradient of the manufactured solution on two nested patches, maximum norm."""
+
+    def error(spacing: float) -> float:
+        faces = {face: Dirichlet(_manufactured) for face in FACES}
+        solver = CellOperator(
+            _refined(round(1.0 / spacing)), faces=faces, factorize=False
+        )
+        x, y = solver.cells.centers.T
+        gradient = solver.gradient(_manufactured(x, y))
+        return float(np.abs(gradient - _manufactured_gradient(x, y)).max())
+
+    return ConvergenceProblem(error, steps=[1 / 16, 1 / 32, 1 / 64])
+
+
+@method(
+    equations={
+        "problem": r"-\nabla\cdot(a\nabla u) + c\,u = f, \qquad a \ge 0, \quad c \in \mathbb{R} \text{ or } \mathbb{C}",
+        "curl_curl": r"\nabla\times\big(a\,\nabla\times(A_\phi\hat\phi)\big) + c\,A_\phi = f, \qquad \nabla\times(A_\phi\hat\phi) = \Big(-\partial_z A_\phi,\ \tfrac{1}{r}\partial_r(rA_\phi)\Big)",
+        "energy": r"E(u) = \sum_{\text{faces } f} a_f\,c_f\,(v_f^\top u)^2 + \sum_{\text{cells } i} c_i V_i u_i^2, \qquad v_f^\top u = w_+ u_+ - w_- u_-, \qquad c_f = \frac{A_f}{d_f}",
+        "azimuthal_conductance": r"w = r, \qquad c_f = \frac{A_f}{r_f\, r_m\, d_f} \quad \text{(radial face of } A_\phi\text{; } r_m \text{ the mean radius of the two values)}",
+        "face_mean": r"a_f = \frac{2 a_- a_+}{a_- + a_+} \ \text{(harmonic, the default)}, \qquad a_f = \tfrac12(a_- + a_+) \ \text{(arithmetic)}",
+        "symmetric_coarse_fine": r"u^* = \tfrac12\delta(\delta - 1)\,u_\mathrm{below} + (1 - \delta^2)\,u_C + \tfrac12\delta(\delta + 1)\,u_\mathrm{above}, \qquad \delta = \frac{k + \frac12}{r} - \frac12, \qquad d_f = \tfrac12 (h_f + h_c)",
+        "conservative_ghost": r"u_\mathrm{ghost} = \frac{1-r}{3+r}\,u_\mathrm{inner} + \frac{2(r-1)}{r+1}\,u_\mathrm{fine} + \frac{8}{(r+1)(r+3)}\,u^*, \qquad F = a_f A_f\,\frac{(wu)_\mathrm{ghost} - (wu)_\mathrm{fine}}{h_f}",
+        "dirichlet_wall": r"A_{ii} \mathrel{+}= \frac{a A_f}{h/2}, \qquad b_i \mathrel{+}= \frac{a A_f}{h/2}\, u_D",
+        "neumann_wall": r"b_i \mathrel{+}= a\,A_f\,g",
+        "axis": r"A_{ii} \mathrel{+}= 4\pi\,\Delta z\,a \quad \text{for } A_\phi = u\,r/r_c \text{ on } 0 < r < r_c",
+        "body": r"A_{ii} \mathrel{+}= \frac{a_\mathrm{free} A_f}{\theta\, d_f}, \qquad b_i \mathrel{+}= \frac{a_\mathrm{free} A_f}{\theta\, d_f}\, U_k",
+    },
+    order=2,
+    assumptions=(
+        r"the matrix is $\partial E / \partial u$ up to a factor 2: symmetric, complex symmetric (not Hermitian) for complex $c$; the conservative coarse-fine faces make it unsymmetric",
+        r"symmetric coarse-fine faces: second order in the mean, first order in the maximum norm next to a coarse-fine edge; linear or no interpolation where a neighbour along the face is missing, the mirror image beyond a `Neumann(0.0)` wall or the axis",
+        "conservative coarse-fine faces: one flux, into the fine cell and out of the coarse one; linear ghost without the next fine cell",
+        "bodies: a two-point flux to the surface (not Shortley-Weller), about first order in the maximum norm",
+        'the order is in the volume-weighted $L_2$ norm, for `coarse_fine="symmetric"` (the default)',
+        "SuperLU on every rank; variable $a$ with the azimuthal component is assembled but only constant $a$ is tested",
+    ),
+    references=(
+        'D. F. Martin and K. L. Cartwright, Solving Poisson\'s equation using adaptive mesh refinement, Tech. Rep. UCB/ERL M96/66, UC Berkeley (1996): quadratic coarse-fine interpolation as in `coarse_fine="conservative"`',
+    ),
+    components=(CompositeCells,),
+    problem=_cell_problem,
+)
+class CellOperator:
+    r"""Solve $-\nabla\cdot(a\nabla u) + c\,u = f$ on the leaf cells of a hierarchy.
+
+    The operator is assembled and factorized once; `solve` then costs two
+    triangular solves, and `set_reaction` refactorizes for a new ``c``
     without assembling the faces again. ``diffusion`` (``a``, real and positive)
-    and ``reaction`` (``c``, real or complex) are :data:`CellValue`\ s; the face
+    and ``reaction`` (``c``, real or complex) are `CellValue`s; the face
     coefficient is the harmonic mean of its two cells (``mean="arithmetic"``
     for the plain mean). ``coarse_fine`` is ``"symmetric"`` or
     ``"conservative"``, the two treatments of coarse–fine faces of the module
@@ -415,25 +544,25 @@ class CellOperator:
     ``faces`` maps ``"x_lower"``, ``"x_upper"``, ``"y_lower"``, ``"y_upper"``
     (only the first two in 1D; and ``"inner"``, the edges of a domain that
     does not fill its rectangle) to a
-    :class:`~patchwork.nodal.Dirichlet` or :class:`~patchwork.nodal.Neumann`
+    `Dirichlet` or `Neumann`
     condition; a face that is not listed is a grounded Dirichlet face. Periodic
     axes take none, and nor does the axis of a cylindrical domain
     (``"x_lower"`` when the radius starts at 0): no flux for a scalar, zero for
     an azimuthal component. A Neumann gradient is the outward normal derivative
     of ``u``; an azimuthal component takes only the natural (zero) condition on
     a radial face. ``embedded`` are bodies at fixed values
-    (:class:`~patchwork.nodal.EmbeddedDirichlet`) or floating
-    (:class:`EmbeddedFloating`), the last one listed wins where they overlap;
+    (`EmbeddedDirichlet`) or floating
+    (`EmbeddedFloating`), the last one listed wins where they overlap;
     ``min_fraction`` bounds how close to a free cell's centre their surface may
     be, as a fraction of the distance of the centres. ``diffusion`` may be zero
     on some cells (a face between two such cells then carries nothing). With
-    ``factorize=False`` the LU is computed on the first :meth:`solve`, not
-    before: an operator only assembled (for :attr:`stiffness`, :meth:`apply`,
-    :meth:`gradient` or :meth:`curl`) never needs it, nor a condition that
+    ``factorize=False`` the LU is computed on the first `solve`, not
+    before: an operator only assembled (for `stiffness`, `apply`,
+    `gradient` or `curl`) never needs it, nor a condition that
     anchors it.
 
     Attributes:
-        cells: The :class:`CompositeCells` of the hierarchy.
+        cells: The `CompositeCells` of the hierarchy.
         solid: Whether a leaf cell is inside a body (fixed or floating).
         free: Leaf-cell numbers of the free cells; the unknowns are these, then
             one per floating body.
@@ -1226,7 +1355,7 @@ class CellOperator:
     ) -> np.ndarray:
         """Solve for a source ``f``; the solution on all leaf cells, ``(n,)``.
 
-        ``source`` is a :data:`CellValue` or the name of a cell-centered field;
+        ``source`` is a `CellValue` or the name of a cell-centered field;
         or ``integrated`` is the source already integrated over each cell,
         ``V f``. Body cells hold their values. With ``potential`` the result is
         also written to the cell-centered field of that name (allocated, complex
@@ -1471,7 +1600,7 @@ class CellOperator:
         }
 
     def _derivatives(self, u: np.ndarray) -> np.ndarray:
-        """``(n, ndim)``: the estimates of :meth:`face_gradients` interpolated to the centres."""
+        """``(n, ndim)``: the estimates of `face_gradients` interpolated to the centres."""
         u = np.asarray(u)
         n = self.cells.num_cells
         ndim = self.cells.hierarchy.ndim
@@ -1505,12 +1634,33 @@ class CellOperator:
         result[self.solid] = 0.0
         return result
 
+    @method(
+        equations={
+            "face_difference": r"g_f = \frac{(wu)_+ - (wu)_-}{d_f} \quad \text{at the middle of the two values}",
+            "centre": r"\partial_a u \approx \frac{g_- o_+ - g_+ o_-}{o_+ - o_-}, \qquad o_- < 0 < o_+",
+        },
+        order=2,
+        assumptions=(
+            r"$g_\pm$ the face-length weighted means of the estimates on each side of the cell along the axis, at mean offsets $o_\pm$; one side only gives that side's value",
+            "the operator's own faces: coarse-fine interpolation (or the ghost), walls and surfaces of bodies; zero in bodies",
+            r"exact for linear fields and for $A_\phi = B r / 2$; the order is in the maximum norm",
+        ),
+        problem=_gradient_problem,
+    )
     def gradient(self, u: np.ndarray) -> np.ndarray:
         """The gradient of a scalar ``u`` on the leaf cells, ``(n, ndim)``; zero in bodies."""
         if self._azimuthal:
             raise ValueError("an azimuthal component has a curl, not a gradient")
         return self._derivatives(u)
 
+    @method(
+        equations={
+            "scalar": r"\nabla\times(u\,\hat z) = (\partial_y u,\ -\partial_x u)",
+            "azimuthal": r"\nabla\times(u\,\hat\phi) = \Big(-\partial_z u,\ \frac{1}{r}\partial_r(r u)\Big)",
+        },
+        assumptions=("2D only; the derivatives of `gradient`",),
+        components=("patchwork.cells.CellOperator.gradient",),
+    )
     def curl(self, u: np.ndarray) -> np.ndarray:
         """The in-plane curl of the field ``u`` normal to the plane, ``(n, 2)``.
 
@@ -1528,6 +1678,12 @@ class CellOperator:
         return np.stack([derivatives[:, 1], -derivatives[:, 0]], axis=1)
 
 
+@method(
+    equations={
+        "fraction": r"\theta = \frac{h_\mathrm{out}}{h_\mathrm{out} + h_\mathrm{in}} \quad \text{(the surface on the shared face)}",
+    },
+    assumptions=("a body given by a mask of leaf cells, fixed or floating",),
+)
 def cell_body(
     cells: CompositeCells,
     mask: np.ndarray,
@@ -1540,7 +1696,7 @@ def cell_body(
     For a region given by cells rather than by a shape (the cells outside a
     plasma, say): a free cell next to it couples to the body's value on the
     face they share. ``value`` is the body's value, or with ``floating`` the
-    ``source`` of an :class:`EmbeddedFloating` body.
+    ``source`` of an `EmbeddedFloating` body.
     """
     selected = np.asarray(mask, dtype=bool)
     if selected.shape != (cells.num_cells,):
