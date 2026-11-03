@@ -7,6 +7,20 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Method cards (methodcard) on the numerical methods: the hierarchy and its $(r, z)$ metric,
+  the marker deposit and its accumulation, halos, restriction and the conservative fill,
+  tagging, clustering and regridding, the composite nodes and the nodal Poisson operator (with
+  the cut edges and Shortley-Weller rows), the cell operator (energy, coarse-fine treatments,
+  walls, axis, bodies) with its gradient and curl, the edge space (gradient, Whitney
+  interpolant, mass matrices, charge-conserving path deposit), refluxing, the solver backends
+  and the legacy cell Poisson solve, with their assumptions and references.
+  `test_method_cards.py` checks them: SymPy rules for ten closed forms, the observed order of
+  `NodalPoisson`, `CellOperator`, `CellOperator.gradient` and `HaloExchange`, and the cards of
+  the docs against those of the code. Adds the `methodcard` dependency.
+- A Numerics section in the docs (header and sidebar): an overview of the methods
+  (`docs/src/content/docs/numerics/index.mdx`, with the main cards) and one page per module
+  (starlight-theme's `methodcard: { pages: true }`, theme 0.7.4).
+
 - `CompositeEdges`: the lowest-order edge space of a 2D hierarchy, one line integral of the
   field per edge of the leaf cells. A coarse edge on a patch edge is two hanging half-edges
   (`reduction`, which commutes with the gradient: `G T = T1 G T`). `gradient` (the incidence of
@@ -113,6 +127,11 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   instead of converting it by hand.
 
 ### Fixed
+
+- The math in the docstrings renders on the API pages: `$$` blocks and `$...$` instead of reST
+  `.. math::` and `:math:` (shown as code), and code spans instead of `:class:`, `:meth:` and
+  the other roles. The module docstring of `cells` gives the radial conductance of an
+  azimuthal component as the code computes it, over $r_f r_m$ (not $r_f^2$).
 
 - `integral` counted a replicated field (`split=None`) once per rank of a patch on several
   ranks.

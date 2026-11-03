@@ -2,14 +2,14 @@
 
 The Pyccel version (CPU) of the ``locate_points`` kernel; ``locate_points_numpy.py``
 next to this file is the NumPy version, with the same arguments. Loaded by
-:mod:`patchwork.kernels.locate_points`, compiled with Pyccel on first use.
+`patchwork.kernels.locate_points`, compiled with Pyccel on first use.
 
 Two axes: a 1D hierarchy is passed as 2D with one cell along ``y``. ``points`` is
 ``(2, n)``. A point's cell on the finest lattice of the hierarchy is
 ``floor((x - lower) / finest_spacing)`` per axis (the upper face of the domain in the
 last cell), and its cell on level ``l`` that index divided by ``span[l]`` (the
 refinement ratio to the power of the levels between): the cells of
-:class:`~patchwork.nodal.CompositeNodes`, whatever the level. Every level has a table
+`CompositeNodes`, whatever the level. Every level has a table
 of which patch holds each of its cells over the bounding box of its patches (-1 where
 none does): all tables flattened (C order, 32-bit integers) one after the other into ``tables``, level
 ``l`` from ``table_offset[l]``, with its lower corner ``table_corner[l]`` and shape

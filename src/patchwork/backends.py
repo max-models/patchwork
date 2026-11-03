@@ -1,7 +1,7 @@
 r"""Solver backends: one assembled composite operator, solved in different ways.
 
-A composite solve (:class:`~patchwork.NodalPoisson`) assembles its operator
-once, as a :class:`LinearSystem`: the rows of the unknowns, the mesh they live
+A composite solve (`NodalPoisson`) assembles its operator
+once, as a `LinearSystem`: the rows of the unknowns, the mesh they live
 on and the conditions they were assembled with. A backend turns that system
 into a solver whose ``solve(right_hand_side)`` returns the unknowns. Every
 backend solves the same operator, so on a problem that two of them support they
@@ -9,21 +9,21 @@ give the same answer to round-off (or to the tolerance of an iterative one).
 
 ``backend=`` of a solve takes a backend or its name:
 
-- ``"lu"`` (:class:`LUBackend`): a direct LU factorization, on every rank
+- ``"lu"`` (`LUBackend`): a direct LU factorization, on every rank
   (LAPACK's for the tridiagonal operator of a line, SuperLU otherwise). Any
   mesh, any conditions, embedded bodies; not a singular operator.
-- ``"petsc"`` (:class:`PetscBackend`): the rows distributed over the ranks, a
+- ``"petsc"`` (`PetscBackend`): the rows distributed over the ranks, a
   PETSc Krylov method with algebraic multigrid (needs petsc4py).
-- ``"fft"`` (:class:`FFTBackend`): fast transforms on a uniform mesh (a
+- ``"fft"`` (`FFTBackend`): fast transforms on a uniform mesh (a
   hierarchy of one level that fills its box) without embedded bodies, every
   axis periodic or with the same kind of condition, Dirichlet or Neumann, on
   both of its faces. Also the singular operators: all axes periodic or Neumann.
-- ``"auto"`` (:class:`AutoBackend`): the tridiagonal LU on a line, the FFT
+- ``"auto"`` (`AutoBackend`): the tridiagonal LU on a line, the FFT
   where it applies, the LU elsewhere.
 
-A backend states what it cannot solve (:meth:`Backend.unsupported`), and the
+A backend states what it cannot solve (`Backend.unsupported`), and the
 solve refuses such a system with that reason. A new backend subclasses
-:class:`Backend`.
+`Backend`.
 """
 
 from __future__ import annotations
@@ -37,13 +37,14 @@ import scipy.fft
 import scipy.linalg
 import scipy.sparse as sparse
 import scipy.sparse.linalg
+from methodcard import method
 
 if TYPE_CHECKING:
     from patchwork.nodal import CompositeNodes, Dirichlet, Neumann
 
 
 class Solver(Protocol):
-    """What :meth:`Backend.setup` returns: a solver of one system."""
+    """What `Backend.setup` returns: a solver of one system."""
 
     def solve(self, right_hand_side: np.ndarray) -> np.ndarray:
         """The unknowns for this rank's rows of the right-hand side, on every rank."""
@@ -59,9 +60,9 @@ class LinearSystem:
             unknowns: all rows unless the backend is distributed.
         unknowns: Node numbers of the columns, in their order.
         rows: Node numbers of this rank's rows.
-        nodes: The :class:`~patchwork.nodal.CompositeNodes` of the mesh.
+        nodes: The `CompositeNodes` of the mesh.
         faces: The condition of every part of the boundary (as
-            :class:`~patchwork.NodalPoisson` keeps them, with ``"inner"``).
+            `NodalPoisson` keeps them, with ``"inner"``).
         bodies: The number of embedded bodies.
         singular: Whether nothing fixes the potential (no Dirichlet face, no
             body): the operator then has the constants as its null space.
@@ -81,10 +82,10 @@ class LinearSystem:
 
 
 class Backend:
-    """A way to solve a :class:`LinearSystem`; subclasses implement :meth:`setup`.
+    """A way to solve a `LinearSystem`; subclasses implement `setup`.
 
     ``distributed`` backends get only the rows of the unknowns their rank owns
-    (:attr:`~patchwork.nodal.CompositeNodes.node_ranks`), in a numbering in
+    (`CompositeNodes.node_ranks`), in a numbering in
     which every rank's unknowns are contiguous; the others get all rows on
     every rank. A backend is a configuration: one instance can set up any
     number of systems (e.g. one per regrid).
@@ -154,11 +155,26 @@ def _tridiagonal(matrix: sparse.spmatrix) -> bool:
     return bool(np.all(np.abs(matrix.row - matrix.col) <= 1))
 
 
+@method(
+    equations={
+        "tridiagonal": r"A = L D L^\top \ (\texttt{pttrf/pttrs}, \text{ equal off-diagonals}), \qquad P A = L U \ (\texttt{gttrf/gttrs})",
+        "sparse": r"P_r A P_c = L U, \qquad P_c \text{ minimum degree on the pattern of } A + A^\top",
+    },
+    assumptions=(
+        "the whole matrix on every rank; a line without a periodic seam is tridiagonal",
+        "SuperLU in symmetric mode: diagonal pivots, as the ordering assumes (the operator is diagonally dominant)",
+        "refuses a singular operator (no Dirichlet face, no body)",
+    ),
+    references=(
+        "[E. Anderson et al., LAPACK Users' Guide, 3rd ed., SIAM (1999)](https://netlib.org/lapack/lug/)",
+        "X. S. Li, An overview of SuperLU: algorithms, implementation, and user interface, ACM Trans. Math. Softw. 31, 302 (2005); [SuperLU](https://portal.nersc.gov/project/sparse/superlu/)",
+    ),
+)
 class LUBackend(Backend):
     """A direct LU factorization of the whole operator, on every rank.
 
     A tridiagonal operator (a line without a periodic seam) is factorized with
-    LAPACK (:class:`TridiagonalLU`), any other with SciPy's SuperLU. Its
+    LAPACK (`TridiagonalLU`), any other with SciPy's SuperLU. Its
     ordering is minimum degree on the pattern of ``A + A^T``, the mesh's own
     graph, with about half the fill of the default column ordering; the
     symmetric mode keeps the diagonal pivots that ordering assumes (the
@@ -179,7 +195,7 @@ class LUBackend(Backend):
 
 
 class PetscBackend(Backend):
-    """The rows distributed over the ranks and solved with PETSc (:class:`~patchwork.PetscSystem`).
+    """The rows distributed over the ranks and solved with PETSc (`PetscSystem`).
 
     Conjugate gradients for a symmetric operator, GMRES otherwise, with an
     algebraic multigrid preconditioner, to the relative residual ``rtol``.
@@ -246,8 +262,22 @@ def _uniform_kinds(system: LinearSystem) -> tuple[str, ...]:
     return tuple(kinds)
 
 
+@method(
+    equations={
+        "scaled": r"V^{-1} A\,\phi = V^{-1} b, \qquad V^{-1} A = -\sum_a \delta^2_a \ \text{(the difference Laplacian)}",
+        "dirichlet": r"\lambda_k = \frac{4}{h^2}\sin^2\frac{\pi k}{2n}, \quad k = 1, \dots, n-1 \ \text{(DST-I)}",
+        "neumann": r"\lambda_k = \frac{4}{h^2}\sin^2\frac{\pi k}{2n}, \quad k = 0, \dots, n \ \text{(DCT-I)}",
+        "periodic": r"\lambda_k = \frac{4}{h^2}\sin^2\frac{\pi k}{n}, \quad k = 0, \dots, n-1 \ \text{(FFT)}; \qquad \lambda_k = |2\pi\,\texttt{fftfreq}(n, h)|^2 \ (\texttt{spectral})",
+        "solve": r"\hat\phi_\mathbf{k} = \frac{\hat b_\mathbf{k}}{\sum_a \lambda_{k_a}}, \qquad \hat\phi_\mathbf{0} = 0 \text{ where the sum vanishes}",
+    },
+    assumptions=(
+        "one level that fills its rectangle, Cartesian, no bodies; both faces of a non-periodic axis of one kind",
+        "a singular operator gives the solution of zero volume-weighted mean; `spectral=True` is not the assembled operator",
+        r"$O(N \log N)$ per solve, no factorization",
+    ),
+)
 class FFTSolver:
-    """The FFT solve of one uniform system (see :class:`FFTBackend`).
+    """The FFT solve of one uniform system (see `FFTBackend`).
 
     The operator divided by the control volumes is the standard difference
     Laplacian, a sum over the axes of second differences, which the transforms
@@ -334,7 +364,7 @@ class FFTSolver:
 
 
 class FFTBackend(Backend):
-    """Fast transforms on a uniform mesh: :class:`FFTSolver`.
+    """Fast transforms on a uniform mesh: `FFTSolver`.
 
     The mesh is one level that fills its box (a uniform grid), without
     embedded bodies; on every axis that is not periodic, both faces are
@@ -345,7 +375,7 @@ class FFTBackend(Backend):
     ``spectral=True`` (every axis periodic) replaces the eigenvalues of the
     difference Laplacian by those of the exact one, ``|k|**2``: a spectral
     solve, which is not the assembled operator. ``workers`` is passed to
-    :mod:`scipy.fft` (threads per transform).
+    `scipy.fft` (threads per transform).
     """
 
     name = "fft"

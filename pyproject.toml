@@ -25,6 +25,8 @@ dependencies = [
   # the kernel dispatch and the Pyccel build cache (cunumpy.kernels)
   "cunumpy>=0.7.0",
   "maybempi>=0.1.2",
+  # the method cards of the numerical methods (equations, orders, references)
+  "methodcard",
   "mpiarray>=0.2.1",
   # the per-patch deposit and interpolation (Weighting.scatter_block, gather_block)
   "mpifield>=0.1.0",
@@ -55,7 +57,7 @@ docs = [
   "nbclient>=0.11.0",
   "nbformat>=5.11.1",
 ]
-test = [ "pytest", "pytest-cov", "patchwork-amr[pyccel]" ]
+test = [ "methodcard[symbolic]", "pytest", "pytest-cov", "patchwork-amr[pyccel]" ]
 
 [project.urls]
 Source = "https://github.com/max-models/patchwork"
@@ -93,6 +95,7 @@ typeCheckingMode = "standard"
 pythonpath = [ "src" ]
 testpaths = [ "src" ]
 addopts = "-ra"
+markers = [ "convergence: an order-of-accuracy test of a method card" ]
 
 [tool.coverage.run]
 source = [ "patchwork" ]
@@ -106,6 +109,7 @@ show_missing = true
 [tool.uv.sources]
 cunumpy = { git = "https://github.com/max-models/cunumpy", branch = "devel" }
 maybempi = { git = "https://github.com/max-models/maybempi", branch = "devel" }
+methodcard = { git = "https://github.com/max-models/methodcard", branch = "devel" }
 mpiarray = { git = "https://github.com/max-models/mpiarray", branch = "devel" }
 mpifield = { git = "https://github.com/max-models/mpifield", branch = "devel" }
 scope-profiler = { git = "https://github.com/max-models/scope-profiler", branch = "devel" }

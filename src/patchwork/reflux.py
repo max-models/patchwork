@@ -4,27 +4,26 @@ A model with a conserved cell-centered quantity ``u`` (an amount per volume, suc
 as a density or an energy density) advances it patch by patch with the fluxes
 through the faces of its cells,
 
-.. math::
+$$
+V_i\,\frac{u_i^{n+1} - u_i^n}{\Delta t} = -\sum_{f \in \partial i} A_f\,F_f\,n_{f,i},
+$$
 
-    V_i\,\frac{u_i^{n+1} - u_i^n}{\Delta t} = -\sum_{f \in \partial i} A_f\,F_f\,n_{f,i},
-
-where :math:`F_f` is the flux density through face :math:`f` along its axis,
-:math:`A_f` its area and :math:`V_i` the cell's volume (``AMRHierarchy.face_areas``
+where $F_f$ is the flux density through face $f$ along its axis,
+$A_f$ its area and $V_i$ the cell's volume (``AMRHierarchy.face_areas``
 and ``cell_volumes``: in r–z the faces and cells are rings). Each patch computes
-its fluxes from its own cells and its halo (:meth:`AMRHierarchy.exchange_halos
-<patchwork.mesh.AMRHierarchy.exchange_halos>`). Where a patch meets a coarser
+its fluxes from its own cells and its halo (`AMRHierarchy.exchange_halos`). Where a patch meets a coarser
 level, the coarse cell next to it takes the flux of its coarse face, while the
 fine cells on the other side take the fluxes of their fine faces. The two do not
-agree, and the :meth:`~patchwork.mesh.AMRHierarchy.integral` of ``u`` drifts.
+agree, and the `AMRHierarchy.integral` of ``u`` drifts.
 
-:class:`FluxRegister` restores it (Berger and Colella, *J. Comput. Phys.* 82, 1989).
+`FluxRegister` restores it (Berger and Colella, *J. Comput. Phys.* 82, 1989).
 For every face of a coarse leaf cell on the edge of a finer level, it records the
 coarse flux and the sum of the fine fluxes through it, each times its area and time
 step. Fine levels may take several time steps for one of the coarse level
-(*subcycling*): their fluxes add up over the steps. :meth:`FluxRegister.reflux`
+(*subcycling*): their fluxes add up over the steps. `FluxRegister.reflux`
 then corrects the coarse cell by the difference, so that it sees the fine
 fluxes instead of its own, and gives the coarse cells under the finer patches
-the mean of their fine cells (:meth:`~patchwork.mesh.AMRHierarchy.restrict`).
+the mean of their fine cells (`AMRHierarchy.restrict`).
 Every face of the leaf cells then carries one flux, and the integral changes only
 through the faces of the domain: to round-off, in the Cartesian plane and in r–z.
 
@@ -59,6 +58,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import scope_profiler as sp
 from maybempi import MPI
+from methodcard import method
 
 from patchwork._profiling import PROFILE_TAGS
 from patchwork.cells import CompositeCells
@@ -74,6 +74,23 @@ if TYPE_CHECKING:
 Fluxes = Callable[["Patch"], tuple[Any, ...]]
 
 
+@method(
+    equations={
+        "balance": r"V_i\,\frac{u_i^{n+1} - u_i^n}{\Delta t} = -\sum_{f\in\partial i} A_f\,F_f\,n_{f,i}, \qquad n_{f,i} = \pm 1",
+        "register": r"\delta_f = \sum_{\text{fine steps}} \sum_{\text{fine faces}} s\,A F - s\,A_c F_c, \qquad s = \Delta t \text{ (default)}",
+        "reflux": r"u_c \mathrel{+}= \mp\frac{\delta_f}{V_c} \quad (- \text{ for the face above the cell, } + \text{ below}), \text{ then restrict}",
+    },
+    assumptions=(
+        "the fluxes are the caller's: flux densities along the axis, per block, from its own cells and halo",
+        "coarse-fine faces are those between leaf cells of different levels: proper nesting is not needed",
+        r"the integral then changes only through the domain's faces, to round-off, in the plane and in $(r, z)$",
+        r"subcycling: a finer level takes $r$ steps of $\Delta t / r$, then `reflux(level=)`; `scale` $= \Delta t / 2$ per stage of Heun",
+    ),
+    references=(
+        "[Berger and Colella, J. Comput. Phys. 82, 64 (1989)](https://doi.org/10.1016/0021-9991(89)90035-1)",
+    ),
+    components=("patchwork.halos.Restriction",),
+)
 class FluxRegister:
     """Matches the fluxes of coarse and fine levels at their interfaces (refluxing).
 
@@ -82,10 +99,10 @@ class FluxRegister:
     keeps what it records per field name. See the module docstring.
 
     The coarse–fine faces are the faces between two leaf cells of different
-    levels (:class:`~patchwork.cells.CompositeCells`): a level need not be
+    levels (`CompositeCells`): a level need not be
     properly nested in the one below, and periodic axes and domains that are not
     rectangles are covered. Under MPI the coarse and fine cells of a face may be
-    on different ranks: :meth:`reflux` sums the records over the hierarchy's
+    on different ranks: `reflux` sums the records over the hierarchy's
     communicator (one ``allreduce`` of a value per coarse face).
 
     Attributes:
@@ -179,9 +196,9 @@ class FluxRegister:
 
         For every patch this rank holds (of ``level`` only, if given), the
         cells of its block take ``u -= dt / V * sum(A F n)`` with the flux
-        densities ``fluxes(patch)`` (see :data:`Fluxes`). The fluxes through
+        densities ``fluxes(patch)`` (see `Fluxes`). The fluxes through
         coarse–fine faces are recorded times ``scale`` (default ``dt``) for
-        :meth:`reflux`. A multi-stage method records each stage with its
+        `reflux`. A multi-stage method records each stage with its
         weight: the two stages of Heun's method (SSP-RK2) with ``scale=dt / 2``.
 
         Local to this rank: no communication. The fluxes of a face that two

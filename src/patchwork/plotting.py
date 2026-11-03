@@ -17,7 +17,7 @@ def _plot_line(
     palette: Any,
     grid_alpha: float | None,
 ) -> None:
-    """:func:`plot_patches` of a 1D hierarchy."""
+    """`plot_patches` of a 1D hierarchy."""
     import numpy as np
     from matplotlib.lines import Line2D
 

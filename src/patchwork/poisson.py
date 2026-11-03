@@ -10,6 +10,7 @@ import numpy as np
 import scipy.sparse as sparse
 import scipy.sparse.linalg
 import scope_profiler as sp
+from methodcard import method
 
 from patchwork._profiling import PROFILE_TAGS
 
@@ -55,6 +56,18 @@ def _parents(
 
 
 @sp.profile("patchwork.solve_poisson", tags=PROFILE_TAGS)
+@method(
+    equations={
+        "balance": r"\sum_{\text{faces } f \text{ of } i} \kappa_f\,(\phi_i - \phi_{j(f)}) = |K_i|\, f_i",
+        "conductance": r"\kappa_f = \frac{\ell_\mathrm{overlap}}{\frac12 (h_a + h_b)} \ \text{(between leaf cells)}, \qquad \kappa_f = \frac{\ell_\mathrm{free}}{h/2} \ \text{(to the boundary value)}",
+        "covered": r"\phi_c = \frac{1}{r^2} \sum_{f \subset c} \phi_f",
+    },
+    assumptions=(
+        "2D, one constant Dirichlet value on the whole boundary (the rectangle's faces and the inner edges)",
+        "the solve is replicated on every rank",
+        "the legacy solve: `CellOperator` has variable coefficients, other conditions and 1D",
+    ),
+)
 def solve_poisson(
     hierarchy: AMRHierarchy,
     rhs: str,
@@ -77,7 +90,7 @@ def solve_poisson(
     The solution is written to a field named by ``potential`` on every patch.
     Covered coarse cells are filled by volume averaging their fine children.
     All ranks must call this function in the same order. 2D only: in 1D (and
-    for more than this) use :class:`~patchwork.cells.CellOperator`.
+    for more than this) use `CellOperator`.
     """
     if hierarchy.ndim != 2:
         raise NotImplementedError(

@@ -3,13 +3,13 @@
 Three steps, each usable on its own:
 
 1. **Tagging** marks the cells of each level that need the next finer level:
-   :func:`gradient_tags` where a field changes by more than a threshold across a
-   cell, :func:`function_tags` where a function of the position says so, or any
+   `gradient_tags` where a field changes by more than a threshold across a
+   cell, `function_tags` where a function of the position says so, or any
    boolean array of a level's shape.
-2. **Clustering** (:func:`cluster`, the Berger-Rigoutsos algorithm) covers the
+2. **Clustering** (`cluster`, the Berger-Rigoutsos algorithm) covers the
    tagged cells of a level with few boxes (intervals in 1D, rectangles in 2D), each at least ``efficiency``
    full of tagged cells and at most ``max_size`` cells long.
-3. :meth:`AMRHierarchy.regrid <patchwork.mesh.AMRHierarchy.regrid>` builds the
+3. `AMRHierarchy.regrid` builds the
    new hierarchy from the boxes, level by level from the coarsest, and moves the
    fields into it: copied where an old patch of the same level was, else
    interpolated from the new level below.
@@ -29,6 +29,7 @@ import mpiarray as mpa
 import numpy as np
 import scope_profiler as sp
 from maybempi import MPI
+from methodcard import method
 
 from patchwork._profiling import PROFILE_TAGS
 from patchwork.halos import (
@@ -92,6 +93,16 @@ def function_tags(
 
 
 @sp.profile("patchwork.gradient_tags", tags=PROFILE_TAGS)
+@method(
+    equations={
+        "cells": r"\text{tag } i \iff \max_{j \in N(i)} |u_i - u_j| > \tau \quad \text{(two neighbours in 1D, four in 2D)}",
+        "nodes": r"\text{tag } K \iff \max_{p \in K} \phi_p - \min_{p \in K} \phi_p > \tau",
+    },
+    assumptions=(
+        "the change per cell of each level: tagging stops once the cells resolve the field",
+        "only points of one patch are compared; the tags are combined over the ranks by `regrid`",
+    ),
+)
 def gradient_tags(
     hierarchy: AMRHierarchy, name: str, threshold: float
 ) -> dict[int, np.ndarray]:
@@ -108,7 +119,7 @@ def gradient_tags(
     only points of the same patch: where a patch is split over ranks, the halos
     between its blocks are filled first (``update_halos``, collective over the
     patch's ranks). The tags are combined over the ranks by
-    :meth:`~patchwork.mesh.AMRHierarchy.regrid`.
+    `AMRHierarchy.regrid`.
     """
     spec = hierarchy._field_specs.get(name)
     if spec is None:
@@ -332,6 +343,21 @@ def _chop(box: Box, max_size: int | None) -> list[Box]:
 # Clustering ----------------------------------------------------------------------------- #
 
 
+@method(
+    equations={
+        "efficiency": r"\text{keep } B \iff \frac{\#\{\text{tagged cells in } B\}}{|B|} \ge \texttt{efficiency} \text{ and } B \subset \mathcal{A}, \quad \text{chopped into } \lceil n / \texttt{max\_size} \rceil \text{ parts per axis}",
+        "signature": r"\Sigma_k = \#\{\text{tagged cells in row (or column) } k\}",
+        "inflection": r"\Delta^2_k = \Sigma_{k+2} - 2\Sigma_{k+1} + \Sigma_k, \qquad \text{cut at } k + 2 \text{ where } |\Delta^2_{k+1} - \Delta^2_k| \text{ is largest among sign changes}",
+    },
+    assumptions=(
+        "cut at an empty row or column nearest the middle, else at the strongest inflection (sides of at least 4 cells), else in the middle of the longest side",
+        "every part shrinks to its tagged cells; boxes shorter than `min_size` are widened into free allowed cells",
+        "the boxes are disjoint and cover every allowed tagged cell",
+    ),
+    references=(
+        "[Berger and Rigoutsos, IEEE Trans. Syst. Man Cybern. 21(5) (1991)](https://ieeexplore.ieee.org/document/120081/)",
+    ),
+)
 def cluster(
     tags: np.ndarray,
     efficiency: float = 0.7,
@@ -462,7 +488,7 @@ def new_boxes(
     """The boxes of every refined level, from the combined tags of each level.
 
     ``min_patch_size`` is in cells of the new level, ``forbid`` as for
-    :meth:`~patchwork.mesh.AMRHierarchy.regrid`.
+    `AMRHierarchy.regrid`.
     """
     ratio = hierarchy.refinement_ratio
     periodic = hierarchy.periodic
@@ -520,7 +546,7 @@ def transfer(old: AMRHierarchy, new: AMRHierarchy, name: str) -> None:
     A point of a new patch takes the value of an old patch of the same level
     that has it, else the bilinear interpolation of the new level below (for a
     conservative field, the conservative one of
-    :func:`~patchwork.halos.conservative_from_below`). Only the patches' own
+    `conservative_from_below`). Only the patches' own
     points are written; the halos stay zero.
     """
     spec = new._field_specs[name]

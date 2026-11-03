@@ -3,7 +3,7 @@
 The composite solvers (``NodalPoisson(backend="petsc")``) assemble on every
 rank only the rows of the unknowns that rank owns, in a global numbering in
 which each rank's unknowns are contiguous, and hand them to a
-:class:`PetscSystem`: a PETSc ``MPIAIJ`` matrix with exactly those rows and a
+`PetscSystem`: a PETSc ``MPIAIJ`` matrix with exactly those rows and a
 Krylov solver with an algebraic multigrid preconditioner (BoomerAMG from hypre
 when PETSc has it, PETSc's own GAMG otherwise). The solution is then gathered to
 every rank, as the gathered (SuperLU) path returns it.
@@ -27,6 +27,7 @@ import numpy as np
 import scipy.sparse as sparse
 import scope_profiler as sp
 from maybempi import petsc_comm
+from methodcard import method
 
 from patchwork._profiling import PROFILE_TAGS
 
@@ -69,6 +70,24 @@ def _has_package(PETSc: Any, name: str) -> bool:  # noqa: N803
         return False
 
 
+@method(
+    equations={
+        "krylov": r"\text{CG if symmetric, else GMRES}, \qquad \|r_k\| \le \texttt{rtol}\,\|b\| \ (10^{-10}), \quad \texttt{ksp\_max\_it} = 2000",
+        "preconditioner": r"M^{-1} = \text{BoomerAMG (hypre) if available, else GAMG}",
+        "fallback": r"\text{on divergence: GMRES}(100) + \text{block Jacobi with ILU per block, from } x_0 = 0, \ 10^4 \text{ iterations}",
+    },
+    assumptions=(
+        "each rank assembles the rows of the unknowns it owns, contiguous in the global numbering, into an `MPIAIJ` matrix",
+        "the previous solution is the initial guess (`reset()` zeroes it); the residual norm is PETSc's default for the method",
+        "options in code override the command line, which overrides the defaults; the solution is scattered to every rank",
+    ),
+    references=(
+        "[S. Balay et al., PETSc/TAO Users Manual, ANL-21/39](https://publications.anl.gov/anlpubs/2023/04/181821.pdf)",
+        "[Dalcin, Paz, Kler and Cosimo, Adv. Water Resour. 34, 1124 (2011)](https://doi.org/10.1016/j.advwatres.2011.04.013): petsc4py",
+        "[Henson and Yang, Appl. Numer. Math. 41, 155 (2002)](https://doi.org/10.1016/S0168-9274(01)00115-5): BoomerAMG",
+        "[PCGAMG](https://petsc.org/main/manualpages/PC/PCGAMG)",
+    ),
+)
 class PetscSystem:
     """Rows of a square sparse system on every rank, solved together with PETSc.
 
