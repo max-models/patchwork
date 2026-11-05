@@ -748,8 +748,10 @@ class CompositeNodes:
 
             charge = np.zeros(self.num_nodes)
             deposit_nodes(
-                np.ascontiguousarray(points),
-                np.ascontiguousarray(charges),
+                # a copy in C order: a (2, 1) slice is flagged C-contiguous but
+                # can keep F strides, which the compiled kernel refuses
+                np.array(points, order="C"),
+                np.array(charges, order="C"),
                 self._origin,
                 self._spacing,
                 self._cells,

@@ -197,3 +197,16 @@ def test_the_compiled_deposit_is_the_transposed_evaluation(
     assert np.allclose(charge, expected, rtol=0.0, atol=1e-12)
     if name != "periodic":  # some points are outside
         assert np.any(weights.sum(axis=1) == 0.0)
+
+
+def test_the_deposit_takes_a_single_point_with_any_strides() -> None:
+    """A fancy-indexed (2, 1) column of an F-ordered array deposits like a C copy."""
+    mesh = _meshes()["nested"]
+    nodes = CompositeNodes(mesh)
+    points = np.stack(_points(mesh))
+    points = points[:, ~np.isnan(points).any(axis=0)]
+    column = np.asfortranarray(np.vstack([points, points]))[:2, [3]]
+    assert column.strides != np.array(column, order="C").strides
+    expected = nodes.deposit(np.array(column, order="C"), [2.0])
+    assert np.array_equal(nodes.deposit(column, [2.0]), expected)
+    assert expected.sum() == 2.0
