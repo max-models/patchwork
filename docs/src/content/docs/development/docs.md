@@ -6,7 +6,11 @@ description: How this documentation site is built from Markdown pages, notebooks
 The site in `docs/` is built with [Astro](https://astro.build/) and
 [Starlight](https://starlight.astro.build/). It has three kinds of pages:
 
-- **Hand-written pages** in `docs/src/content/docs/`, as Markdown or MDX.
+- **Hand-written pages** in `docs/src/content/docs/`, as Markdown or MDX. An MDX page can
+  use a component from `docs/src/components/`: the [MPI communication](/patchwork/guides/mpi-communication/)
+  guide embeds `HaloExplorer.astro`, an interactive figure written in plain JavaScript, and
+  its static figures are drawn by `docs/mpi_figures.py` into `docs/public/figures/mpi/`
+  (`make docs-figures`).
 - **Examples**, converted from the Jupyter notebooks in `tutorials/` by `starlight-notebooks`
   (the `section` setting in `docs/package.json` publishes them under `examples/`). Each
   notebook is executed and its outputs (text, images, tables) are written into an MDX page.
@@ -29,6 +33,7 @@ change them there, and update the version in `docs/package.json` and
 ```bash
 make docs-install     # npm packages and the Python docs extra
 make docs-notebooks   # execute tutorials/*.ipynb and convert them to pages
+make docs-figures     # redraw the figures of the MPI communication guide
 make docs-dev         # live preview at http://localhost:4321/patchwork/
 make docs-build       # the static site in docs/dist, as in CI
 make docs-preview     # serve docs/dist
