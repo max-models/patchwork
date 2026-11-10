@@ -31,6 +31,7 @@ export default defineDocs({
 		{ label: 'Getting started', link: '/getting-started/installation/' },
 		{ label: 'Examples', link: '/examples/' },
 		{ label: 'Numerics', link: '/numerics/' },
+		{ label: 'Guides', link: '/guides/mpi-communication/' },
 		{ label: 'Development', link: '/development/docs/' },
 		{ label: 'API', link: '/api/patchwork/' },
 	],
@@ -45,6 +46,10 @@ export default defineDocs({
 		{
 			label: 'Examples',
 			items: [{ autogenerate: { directory: 'examples' } }],
+		},
+		{
+			label: 'Guides',
+			items: [{ label: 'MPI communication', slug: 'guides/mpi-communication' }],
 		},
 		{
 			label: 'Development',

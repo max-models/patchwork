@@ -30,7 +30,8 @@ module by module; this one shows how they fit together.
    [deposit accumulation](/patchwork/numerics/accumulate/).
 2. **[Halos and restriction](/patchwork/numerics/halos/).** A halo takes the values of the
    patches of its level, else the bilinear interpolation of the level below; restriction gives a
-   coarse cell the volume-weighted mean of its fine cells.
+   coarse cell the volume-weighted mean of its fine cells. How the values travel between the
+   ranks is the subject of the [MPI communication](/patchwork/guides/mpi-communication/) guide.
 3. **[Regridding](/patchwork/numerics/regrid/).** Cells are tagged where a field changes by more
    than a threshold, covered with boxes by the Berger-Rigoutsos clustering, and the fields moved
    to the new hierarchy, conservatively where they must be.

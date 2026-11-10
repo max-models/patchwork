@@ -1,0 +1,337 @@
+---
+title: MPI communication
+description: How patchwork moves data between ranks, step by step, with figures and an explorer - the communicators of the patches, the copy plan behind every exchange, the halos, the restriction, the deposit and its accumulation, regridding, refluxing and the composite solves.
+---
+
+import HaloExplorer from '../../../components/HaloExplorer.astro';
+
+patchwork runs the same way on one process and on many: without an MPI launcher, mpiarray hands
+it a serial stand-in of a communicator, and every call below does its local work and skips the
+messages. Under MPI, three ideas organise all of the communication:
+
+1. **The hierarchy is the same on every rank; the data is not.** Every rank builds the same
+   patches with the same calls in the same order, so each rank knows every patch, its level,
+   its box and its ranks. A patch's *field* lives only on the patch's ranks, as an mpiarray
+   array split over them.
+2. **Schedules, built once and executed as one `Alltoallv`.** Every exchange between patches
+   (halos, restriction, the transfer of a regrid) is a list of box copies between arrays on
+   different groups of ranks. mpiarray's copy plan turns the list into one `Alltoallv` over the
+   hierarchy's communicator, after a single `allgather` at the build. patchwork keeps the plans
+   per field until the patches change.
+3. **Two kinds of halo.** The halo at the *walls* of a patch is filled from the rest of the
+   hierarchy by patchwork; the halo *between the blocks* of one patch is mpiarray's business,
+   with point-to-point messages inside the patch's own communicator.
+
+The rest of this page goes through the operations one by one. The [explorer](#try-it) in the
+middle lets you change the number of ranks, the placement and the periodicity of a small
+hierarchy and shows what the halo exchange then sends. A [table](#summary) at the end lists
+every operation with its MPI calls, and a [checklist](#writing-code-that-runs-under-mpi) gives
+the rules for code that uses patchwork under MPI.
+
+## Ranks, patches and communicators
+
+![The patches of a hierarchy coloured by the rank that holds each block, and the tree of communicators: the hierarchy's communicator above, one per group of ranks below](/patchwork/figures/mpi/ranks.svg)
+
+`AMRHierarchy(..., comm=...)` takes the communicator of all ranks that take part (by default
+`MPI.COMM_WORLD`, or the serial stand-in). Each patch then lives on a *group* of those ranks:
+
+- `placement="all"` (the default) puts every patch on every rank;
+- `placement="balanced"` puts a patch on the one rank that holds the fewest cells so far
+  (ties go to the lower rank), and with `max_cells_per_rank=n` a patch of more than `n` cells is
+  split over as many of the least loaded ranks as it needs;
+- a function `placement(level, box)` returns the ranks, and `add_patch(..., ranks=...)` or
+  `base_ranks` name them outright.
+
+The placement is a pure function of the calls made so far, so every rank arrives at the same
+answer without a message. For each group of ranks the hierarchy makes **one communicator**, the
+first time the group is used, and keeps it in a cache that the patches share (and that the new
+hierarchy of a [regrid](#regridding) inherits):
+
+| group of ranks               | communicator                          | collective?                         |
+| ---------------------------- | ------------------------------------- | ----------------------------------- |
+| all ranks                    | the hierarchy's own `comm`            | no                                  |
+| one rank                     | `MPI.COMM_SELF` on that rank          | no                                  |
+| some ranks                   | `comm.Split(color, key=rank)`         | yes, over `comm`, once per group    |
+
+On a rank outside the group, `patch.comm` is `None`, `patch.is_local` is `False` and
+`patch.field(name)` raises: the patch exists there as a description only.
+`hierarchy.local_patches` lists the patches this rank holds a part of.
+
+`allocate_field(name, halo=h, split=0)` creates, on every patch this rank holds, an
+`mpiarray` array over the patch's communicator: split along the first axis over the patch's
+ranks (`split=0`, the default; a rank then needs at least one cell along that axis) or
+**replicated** on all of them (`split=None`, every rank holding all of it). Both carry `h`
+halo cells (or nodes) around the array. `gather(patch, name)` returns the whole array of one
+patch on every rank, or on `root` only: it is collective over the hierarchy, as the first rank
+of the patch broadcasts the array (`bcast`) or sends it to `root` (`send`/`recv`).
+
+## Blocks and the two kinds of halo
+
+![A 12 by 8 patch with halo 1 split over three ranks: the blocks, the halo at the patch walls filled by the copy plan, the halo between blocks filled by update_halos, and the storage of the middle rank](/patchwork/figures/mpi/blocks.svg)
+
+Within a patch, mpiarray gives each rank a **block**: a near-even share of the first axis (the
+first `nx mod size` blocks have one cell more), `layout.index_bounds` in the patch's indices.
+`local` is the block, `local_with_halos` the block with its halo. The halo cells of a block
+are of two kinds, and two different pieces of code fill them:
+
+- at the **walls of the patch**, where the block's halo lies outside the patch: patchwork
+  fills them from the other patches (see [below](#filling-the-halos)), through the copy plan;
+- along the **seams between blocks**: mpiarray's `update_halos` copies the neighbour's boundary
+  layer across, with one non-blocking send and receive per direction and per seam on the
+  patch's communicator (`Isend`/`Irecv` of a subarray datatype, in place; corners travel with
+  the faces because the layer spans the whole storage along the other axes).
+
+The copy plan writes halo cells at the walls on the rank whose block touches that wall: a
+rank's **receiving region** is its block, extended by the halo width where the block is at
+the start or the end of the patch along an axis. So the halo along the unsplit axis belongs to
+every block, and the halo along the split axis to the first and the last block only; the
+corners at the seams come with the second kind of halo.
+
+## The transport: mpiarray's copy plan
+
+![The build of a copy plan: the source box of an array on two ranks and the target box of another, their pieces by pair of ranks; and the execution: send buffers by destination, one Alltoallv, receive buffers by source, unpack](/patchwork/figures/mpi/copy_plan.svg)
+
+Every exchange between patches is a list of **copies**, each a
+`(source, source_box, target, target_box)`: two mpiarray arrays (or `None` on a rank that
+does not hold one) and a box of each, in its global indices, of the same extents. The target
+box may reach into the target's halo at its walls. `mpiarray.CopyPlan(copies, comm)` is
+built collectively over the hierarchy's communicator, with the same list on every rank:
+
+1. For each copy, a rank works out the **block it sends from** (its block of the source; a
+   replicated source sends from its first rank only) and the **region it receives into** (its
+   receiving region of the target; every rank of a replicated target receives all of it).
+2. One **`allgather`** tells every rank these blocks and regions of all the others. Their
+   overlaps, shifted from the source box to the target box, are the pieces: which cells of
+   which array go from which rank to which rank. Their sizes give the counts and offsets of
+   the `Alltoallv`, fixed from now on.
+3. An error (a box outside its array, boxes of different shapes, different numbers of copies
+   on different ranks, different dtypes) is raised on every rank, after the `allgather`, so no
+   rank is left waiting.
+
+`plan.execute()` then does the same thing every time: it **packs** its pieces into one send
+buffer, ordered by destination rank, makes one **`Alltoallv`**, and **unpacks** the receive
+buffer, piece by piece, into `target.local_with_halos`, in the order of the copies (where the
+target boxes of several copies overlap, the last copy wins). All sources are read before any
+target is written, so a copy from an array to itself is safe. On one rank the receive buffer
+is the send buffer and no MPI call is made. The arrays can be on the GPU: the buffers are the
+backend's, and the exchange goes through staging buffers where MPI is not CUDA-aware.
+
+patchwork builds these plans:
+
+| schedule                                 | built by                       | plans                                  |
+| ---------------------------------------- | ------------------------------ | -------------------------------------- |
+| `HaloExchange` (`exchange_halos`)        | first call for a field         | one                                    |
+| `Restriction` (`restrict`, `reflux`)     | first call for a field         | one per fine level                     |
+| `transfer` (`regrid`)                    | every regrid, for every field  | one per level                          |
+
+The schedules of a field are kept in the hierarchy under their kind and name, and dropped when
+a patch is added: the next call builds them again. The build has its own profiling region,
+`patchwork.build_schedule`.
+
+## Filling the halos
+
+`exchange_halos(name)` fills the halo of every patch of a field. The schedule it builds finds,
+for every halo cell (or node) of every patch, where the value comes from:
+
+![A hierarchy with a periodic x axis: the halo cells of one patch coloured by their source: a patch of the same level, its periodic image, the interpolation of the level below, the other block of the patch, or outside the domain](/patchwork/figures/mpi/halo_sources.svg)
+
+1. **A patch of the same level** that covers the halo cell, periodic images included (a
+   patch that spans a whole periodic axis takes its halo from itself): a copy of the cell.
+2. Otherwise, inside the domain and on a refined level, the **interpolation of the level
+   below**: bilinear (linear in 1D) for the halo exchange, with the weights of coarse points
+   on no patch dropped and the rest renormalised, and the two inside points extrapolated next
+   to a wall.
+3. **Outside the domain** the halo cell is left as it is, for the boundary conditions.
+4. The halo cells along the **seams between the blocks** of a patch are not in the schedule:
+   mpiarray fills them afterwards.
+
+The interpolation needs coarse values on the ranks of the fine patch, and those ranks may hold
+none of the coarse patch. For each fine patch, the schedule allocates a **buffer**: a
+replicated array (`split=None`) on the fine patch's communicator, of the bounding box of the
+coarse stencils of the uncovered halo cells. The copies that fill it, from every coarse patch
+that overlaps the box (across periodic faces too), go into the same plan as the copies of the
+first kind. Each rank of the fine patch receives the whole buffer and computes the weighted
+sums for the halo cells it stores, with no further message:
+
+![The coarse buffer of the interpolation: the halo cells of a fine patch, the two-by-two coarse stencils of two of them, one next to a wall and clipped, and the dashed buffer box that the plan fills](/patchwork/figures/mpi/interpolation.svg)
+
+So `execute` is three steps, in this order: the plan's one `Alltoallv`, the local
+interpolation from the buffers, then `update_halos` on every local patch's array. The
+`level=` and `below=` arguments of `exchange_halos` (the halos of one level only, or the
+level below taken from another field, for subcycling) are separate schedules, kept under their
+own keys.
+
+### Try it
+
+The explorer below runs the rules above in your browser on a small two-dimensional hierarchy:
+a 12 × 12 base level, two level-1 patches that touch, one of them at the right wall, and a
+level-2 patch inside the first. Choose the number of ranks and the placement, make the x axis
+periodic, and pick a patch to see where each of its halo cells comes from. The table on the
+right is the message matrix of the one `Alltoallv` of `exchange_halos` for all four patches, as
+the schedule would build it for this layout; the diagonal is what a rank copies to itself
+through the same buffers.
+
+Things to look for: with `placement="all"` every patch is split over all ranks and most halo
+cells travel between ranks; with `"balanced"` every patch sits on one rank, the buffers of the
+interpolation are sent to one rank each, and the only messages are between patches on
+different ranks. The level-2 patch takes its right halo from two different level-1 patches
+through one buffer. With a periodic x axis the base level fills its own halo from its other
+end, and patch 2, at the right wall, interpolates across the seam from the far side of the
+base level.
+
+<HaloExplorer />
+
+The explorer is a model of the schedule's geometry, checked against patchwork's own
+`HaloExchange` for this hierarchy; it does not run MPI.
+
+## Restriction
+
+![Restriction of a fine patch on one rank onto a coarse patch split over two ranks: the fine values go into a replicated buffer on the coarse patch's ranks, each of which averages the two-by-two groups and writes the cells of its own block](/patchwork/figures/mpi/restriction.svg)
+
+`restrict(name)` gives the coarse points under finer patches the fine values: the mean of the
+fine cells of each coarse cell (weighted by their volumes in $(r, z)$), or the coinciding fine
+node. It runs **finest level first**, with one plan per fine level, so that a level hands on
+what it received from the level above. For every fine patch and every coarse patch under it,
+the schedule allocates a replicated buffer on the *coarse* patch's communicator for the fine
+region, and one copy fills it. After the plan's `Alltoallv`, every rank of the coarse patch
+holds the fine values and averages them, but writes only the cells of its own block; the
+halos are left for `exchange_halos`. `restrict(name, level=L)` runs the plan of level
+$L + 1$ only.
+
+## Deposit, migration and accumulation
+
+A particle code keeps its markers on the ranks that hold their patches, deposits their charge
+patch by patch, and then sums the copies of every node. Three methods, with three kinds of
+communication:
+
+![Three panels: markers coloured by the rank that owns them with arrows for the ones that migrate; a marker next to a seam depositing into the halo nodes of its block; the copies of a node at a coarse-fine edge and across a periodic seam sending their charge to the owner copy](/patchwork/figures/mpi/deposit.svg)
+
+**Owners.** `owner(x, y, name)` gives the rank each marker belongs to: the rank that holds the
+block of field `name` in which the lower corner of the marker's cell lies, in the finest
+patch that holds it. The patch comes from the locator tables, built on every rank from the
+hierarchy alone; the block comes from a table of every rank's `index_bounds` for the field,
+gathered with **one `allgather`** the first time a field is used (kept as a schedule, like
+the others). The same points give the same owners on every rank.
+
+**Migration.** `migrate(x, y, *arrays, name=...)` sends each marker, with any per-marker
+arrays, to its owner, with `mpiarray.migrate`: an `alltoall` of the row counts, then **one
+`Alltoallv` per array**, as raw buffers without pickling. Markers outside the domain are
+counted with an `allreduce` and raise on every rank (or are dropped with `outside="drop"`).
+Call it again on the hierarchy a regrid returns, for the markers whose patch changed ranks.
+
+**Deposit.** `deposit(x, y, charge, name)` is local work: each marker spreads its charge over
+the corners of its cell with mpifield's compiled kernels, in this rank's block of the finest
+patch that holds it, halo nodes included. Its one collective call is the check that every
+marker is on its owner (an `allreduce` of a count), so that no deposit is silently lost.
+`interpolate` is the transpose and has the same check; it needs the halos filled first.
+
+**Accumulation.** After the deposit, a node's charge is spread over several copies: the halo
+nodes of the blocks, and the copies of a node that several patches hold (the corners that
+touch or nest, and the two copies of a node on a periodic seam). `accumulate_halos(name)`
+brings it all to one copy, in two steps:
+
+1. on every local patch, mpiarray's `accumulate_halos` adds the halo nodes of each block
+   into the neighbouring blocks and zeroes them (`Isend`/`Irecv` on the patch's communicator;
+   at the walls of the patch the halo is dropped);
+2. the charge of every copy of a node goes to the **owner copy**: the one in the finest patch
+   that holds the node (the last of that level in the order of the patches; on a periodic
+   seam, the upper copy). The owners come from one table of the finest lattice of the whole
+   domain, painted patch by patch from the coarsest, built on every rank without a message.
+   The moving charges, with their patch numbers and node indices, travel in **one
+   `mpiarray.migrate`** to the rank that holds the owner's block, and are added there.
+
+The other copies end up zero, the total is kept, and `CompositeNodes.from_patches` then reads
+the owner copies. On one rank the same paths are followed without MPI.
+
+## Regridding
+
+![Old and new level-1 patches of a regrid: the cells of the new patches that an old patch of the level covers are copied, the others interpolated from the new level below](/patchwork/figures/mpi/regrid.svg)
+
+`regrid(tags)` builds a new hierarchy and moves every field to it:
+
+1. **Tags.** Each rank tags from the data it holds; `combine_tags` combines them with one
+   **`Allreduce` (max)** per level, so every rank clusters the same cells.
+2. **The new hierarchy.** Every rank clusters the tags into the same boxes and adds the same
+   patches, placed by the hierarchy's `placement` (the largest first), so the new hierarchy
+   is again identical everywhere. It shares the cache of communicators, so a group of ranks
+   that already had one makes no new `Split`.
+3. **The transfer**, level by level from the coarsest: a point of a new patch takes the value
+   of an old patch of the same level that has it, else the interpolation of the *new* level
+   below (bilinear, or the conservative fill for a conservative field, which is first
+   restricted on the old hierarchy). The copies from the old patches and those into the
+   interpolation buffers make **one plan per level**, executed before the next level is
+   built, since that level interpolates from this one.
+
+Halos are not filled unless `fill_halos=True`; markers are moved with `migrate` on the new
+hierarchy by the caller.
+
+## Refluxing, integrals and the composite solves
+
+**Refluxing.** `FluxRegister.advance` is local: each rank advances its blocks and records
+the fluxes through the coarse-fine faces of its cells, times their weight. `reflux` sums the
+records of all ranks with **one `allreduce`** of a vector with one value per coarse face
+(the coarse and the fine side of a face can be on different ranks), corrects the coarse cells
+each rank holds, and then restricts.
+
+**Integrals.** `integral(name)` sums the leaf cells of this rank's blocks (a replicated field
+counts once, on the first rank of its patch) and **`allreduce`s** the total.
+
+**Composite solves.** `CompositeNodes` and `CompositeCells` are built from the description of
+the hierarchy, the same on every rank, without a message. `from_patches(name)` gathers the
+field of **every patch to every rank** (`gather`: one `bcast` per patch that is not on all
+ranks), so that the right-hand side of a solve is complete everywhere. With the `"lu"` and
+`"fft"` backends every rank then assembles and solves the whole system; `to_patches` writes the
+solution back into the blocks locally. With the `"petsc"` backend, each node has an owner,
+`node_ranks`: the lowest rank among those that hold the leaf cells around it. Every rank
+assembles **only the rows of the nodes it owns**, in a numbering in which each rank's unknowns
+are contiguous (an `allgather` of the row counts gives the offsets), into a PETSc `MPIAIJ`
+matrix over the hierarchy's communicator, and PETSc's Krylov solve and multigrid
+preconditioner do the rest; a `Scatter.toAll` brings the solution to every rank at the end.
+
+## Summary
+
+| operation                          | once                                                 | every call                                                          |
+| ---------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------- |
+| `AMRHierarchy`, `add_patch`        | `comm.Split` per new group of some ranks             | none (the same calls on every rank)                                 |
+| `allocate_field`                   | none                                                 | none                                                                |
+| `gather`                           | none                                                 | `bcast` from the first rank of the patch, or `send`/`recv` to root  |
+| `exchange_halos`                   | `allgather` (the plan)                               | one `Alltoallv`; `Isend`/`Irecv` inside each split patch            |
+| `restrict`                         | `allgather` per fine level                           | one `Alltoallv` per fine level                                      |
+| `owner`                            | `allgather` (the blocks of the field)                | none                                                                |
+| `migrate`                          | as `owner`                                           | `allreduce` (markers outside), `alltoall`, one `Alltoallv` per array |
+| `deposit`, `interpolate`           | as `owner`                                           | `allreduce` (the check of the owners)                               |
+| `accumulate_halos`                 | as `owner`                                           | `Isend`/`Irecv` inside each split patch; `alltoall` + `Alltoallv`s  |
+| `regrid`                           |                                                      | `Allreduce` per tagged level; `allgather` + `Alltoallv` per level   |
+| `FluxRegister.reflux`              | as `restrict`                                        | `allreduce` of the face records, then as `restrict`                 |
+| `integral`                         | none                                                 | `allreduce`                                                         |
+| `CompositeNodes.from_patches`      | none                                                 | `bcast` per patch                                                   |
+| `NodalPoisson(backend="petsc")`    | `allgather` of the row counts; PETSc's setup         | PETSc's solve; `Scatter.toAll`                                      |
+
+Every row is **collective**: all ranks of the hierarchy's communicator call it, whether they
+hold the patches involved or not.
+
+## Writing code that runs under MPI
+
+- Build the hierarchy with the **same calls in the same order** on every rank: `add_patch`,
+  `allocate_field`, `regrid` and the methods of the table above are collective. A rank that
+  skips one deadlocks the others.
+- Loop over `local_patches` for data and over `patches` for geometry; test `patch.is_local`
+  before `patch.field(name)`. Use `gather` for the whole array of a patch (every rank calls
+  it) and `local_node_coordinates` or `local_cell_centers` for the points of this rank's block.
+- Fields that markers are deposited into need `split=0` (the default): a replicated field has
+  no owner for a point. A replicated field is counted once by `integral`, `restrict` and the
+  flux register (its first rank).
+- Keep the hierarchy object: its schedules are built at the first call for each field and
+  reused until a patch is added. `regrid` returns a new hierarchy and leaves the old one
+  intact; move the markers with `migrate` afterwards.
+- Compute on `local`, read halos from `local_with_halos` after `exchange_halos`; write only
+  the block, the halos belong to the exchange.
+- Launch with `mpirun -n 4 python script.py` after `pip install patchwork-amr[mpi]`, and
+  profile the regions `patchwork.exchange_halos`, `patchwork.restrict`,
+  `patchwork.build_schedule`, `patchwork.migrate`, `patchwork.deposit`,
+  `patchwork.accumulate_halos`, `patchwork.regrid` and `patchwork.regrid_transfer` with
+  scope-profiler (`--enable-tag patchwork`).
+
+The figures of this page are drawn by `docs/mpi_figures.py` (`make docs-figures`); the cell
+classifications in them are computed with patchwork's own geometry and checked against the
+schedules it builds.

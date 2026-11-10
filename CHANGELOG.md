@@ -7,6 +7,16 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- A guide to the MPI communication in the docs (`guides/mpi-communication`, a Guides section
+  in the header and sidebar): the communicators of the patches, mpiarray's copy plan behind
+  every exchange, the sources of the halo cells, the interpolation buffers, restriction, the
+  deposit with its migration and accumulation, regridding, refluxing and the composite
+  solves, with eight figures (`docs/mpi_figures.py`, `make docs-figures`), a summary table of
+  the MPI calls of every operation and a checklist for code under MPI. An interactive
+  explorer (`docs/src/components/HaloExplorer.astro`) shows, for a chosen number of ranks,
+  placement and periodicity, where every halo cell comes from and the message matrix of the
+  halo exchange's `Alltoallv`.
+
 - Method cards (methodcard) on the numerical methods: the hierarchy and its $(r, z)$ metric,
   the marker deposit and its accumulation, halos, restriction and the conservative fill,
   tagging, clustering and regridding, the composite nodes and the nodal Poisson operator (with

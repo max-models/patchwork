@@ -1,0 +1,610 @@
+---
+// The halo exchange explorer of the MPI communication guide: a fixed four-patch hierarchy on
+// a chosen number of ranks and placement. It reproduces patchwork's rules in the browser: the
+// placement of the patches, mpiarray's split of each patch into blocks, the three sources of a
+// halo cell (a patch of the same level, the interpolation of the level below through a
+// replicated buffer, the neighbouring block) and the receiving region of every rank. From them
+// it shows what the schedule of `exchange_halos` moves: the cell counts of the one Alltoallv
+// between every pair of ranks and the point-to-point updates inside each patch.
+---
+
+<div class="halo-explorer" id="halo-explorer">
+	<div class="controls">
+		<fieldset>
+			<legend>Ranks</legend>
+			<div class="segmented" data-control="ranks">
+				<button type="button" data-value="1">1</button>
+				<button type="button" data-value="2">2</button>
+				<button type="button" data-value="3" class="active">3</button>
+				<button type="button" data-value="4">4</button>
+			</div>
+		</fieldset>
+		<fieldset>
+			<legend>Placement</legend>
+			<div class="segmented" data-control="placement">
+				<button type="button" data-value="all" class="active">all</button>
+				<button type="button" data-value="balanced">balanced</button>
+				<button type="button" data-value="limited">balanced, ≤ 48 cells</button>
+			</div>
+		</fieldset>
+		<fieldset>
+			<legend>Domain</legend>
+			<label class="check"><input type="checkbox" data-control="periodic" /> periodic in x</label>
+		</fieldset>
+		<fieldset>
+			<legend>Halo cells of</legend>
+			<div class="segmented" data-control="patch">
+				<button type="button" data-value="0">patch 0</button>
+				<button type="button" data-value="1">patch 1</button>
+				<button type="button" data-value="2" class="active">patch 2</button>
+				<button type="button" data-value="3">patch 3</button>
+			</div>
+		</fieldset>
+	</div>
+
+	<div class="panels">
+		<div class="drawing">
+			<svg viewBox="-1.5 -1.5 15 15" role="img" aria-label="The patches, their blocks by rank, and the halo cells of the chosen patch by source"></svg>
+			<div class="legend">
+				<span><i style="background: #2A9D8F"></i> same level</span>
+				<span><i class="hatched"></i> periodic image</span>
+				<span><i style="background: #E9C46A"></i> interpolated from below</span>
+				<span><i style="background: #B08BD6"></i> neighbouring block</span>
+				<span><i style="background: #E0E0E0"></i> outside the domain</span>
+			</div>
+			<p class="hint" data-role="hint">Hover a halo cell to see where it comes from; click a patch to select it.</p>
+		</div>
+		<div class="report">
+			<div>
+				<h4>Patches on the ranks</h4>
+				<table data-role="patches"></table>
+			</div>
+			<div>
+				<h4>The one <code>Alltoallv</code> of <code>exchange_halos</code></h4>
+				<p class="small">Cells from the rank of a row to the rank of a column, all patches together: the copies between patches of one level and those into the interpolation buffers.</p>
+				<table data-role="matrix" class="matrix"></table>
+			</div>
+			<div class="wide">
+				<h4>Inside each patch: <code>update_halos</code></h4>
+				<p class="small" data-role="seams"></p>
+				<h4>Collective calls</h4>
+				<p class="small" data-role="summary"></p>
+			</div>
+		</div>
+	</div>
+</div>
+
+<style>
+	.halo-explorer {
+		border: 1px solid var(--sl-color-hairline);
+		border-radius: 0.5rem;
+		padding: 1rem;
+		margin-block: 1.5rem;
+		background: var(--sl-color-bg-nav);
+		font-size: var(--sl-text-sm);
+	}
+	.controls {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.75rem 1.5rem;
+		margin-bottom: 1rem;
+	}
+	.controls fieldset {
+		border: none;
+		padding: 0;
+		margin: 0;
+	}
+	.controls legend {
+		font-size: var(--sl-text-xs);
+		color: var(--sl-color-gray-3);
+		padding: 0;
+		margin-bottom: 0.25rem;
+	}
+	.segmented {
+		display: inline-flex;
+		border: 1px solid var(--sl-color-hairline);
+		border-radius: 0.35rem;
+		overflow: hidden;
+	}
+	.segmented button {
+		border: none;
+		background: var(--sl-color-bg);
+		color: var(--sl-color-text);
+		padding: 0.25rem 0.65rem;
+		cursor: pointer;
+		font: inherit;
+		font-size: var(--sl-text-sm);
+		border-right: 1px solid var(--sl-color-hairline);
+	}
+	.segmented button:last-child {
+		border-right: none;
+	}
+	.segmented button.active {
+		background: var(--sl-color-accent);
+		color: var(--sl-color-black);
+		font-weight: 600;
+	}
+	.check {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.4rem;
+		padding-top: 0.3rem;
+	}
+	.panels {
+		display: grid;
+		grid-template-columns: 1fr;
+		gap: 1.25rem;
+	}
+	.report {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr));
+		gap: 0.5rem 1.5rem;
+		align-items: start;
+	}
+	.report .wide {
+		grid-column: 1 / -1;
+	}
+	.drawing svg {
+		width: 100%;
+		max-width: 36rem;
+		margin-inline: auto;
+		height: auto;
+		display: block;
+		background: var(--sl-color-bg);
+		border-radius: 0.35rem;
+	}
+	.legend {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 0.3rem 0.9rem;
+		margin-top: 0.5rem;
+		font-size: var(--sl-text-xs);
+	}
+	.legend i {
+		display: inline-block;
+		width: 0.85rem;
+		height: 0.85rem;
+		vertical-align: -0.1rem;
+		margin-right: 0.25rem;
+		border-radius: 2px;
+	}
+	.legend .hatched {
+		background: repeating-linear-gradient(135deg, #2a9d8f 0 2px, #ffffff 2px 4px);
+	}
+	.hint {
+		min-height: 3.2em;
+		margin-top: 0.5rem;
+		font-size: var(--sl-text-xs);
+		color: var(--sl-color-gray-2);
+	}
+	.report h4 {
+		font-size: var(--sl-text-sm);
+		margin: 0.75rem 0 0.25rem;
+	}
+	.report div > h4:first-child {
+		margin-top: 0;
+	}
+	.report table {
+		margin: 0;
+		font-size: var(--sl-text-xs);
+		border-collapse: collapse;
+		display: table;
+	}
+	.report td,
+	.report th {
+		padding: 0.15rem 0.5rem;
+		border: 1px solid var(--sl-color-hairline);
+		text-align: center;
+		white-space: nowrap;
+	}
+	.report th {
+		font-weight: 600;
+	}
+	.matrix td.zero {
+		color: var(--sl-color-gray-3);
+	}
+	.matrix td.self {
+		font-style: italic;
+	}
+	.small {
+		font-size: var(--sl-text-xs);
+		margin: 0.25rem 0;
+		color: var(--sl-color-gray-2);
+	}
+	.rank-chip {
+		display: inline-block;
+		min-width: 1.1rem;
+		padding: 0 0.25rem;
+		border-radius: 0.2rem;
+		color: #ffffff;
+		font-weight: 600;
+		font-size: var(--sl-text-xs);
+		text-align: center;
+		margin-inline: 0.12rem;
+	}
+	.cell-hover {
+		cursor: crosshair;
+	}
+</style>
+
+<script>
+	// --- the hierarchy --------------------------------------------------------------------
+	const RATIO = 2;
+	const BASE = [12, 12];
+	const HALO = 1;
+	const LIMIT = 48; // cells per rank of the "balanced, ≤ 48 cells" placement
+	const PATCHES = [
+		{ level: 0, box: [[0, 12], [0, 12]] },
+		{ level: 1, box: [[6, 18], [4, 16]] },
+		{ level: 1, box: [[18, 24], [8, 16]] },
+		{ level: 2, box: [[28, 36], [16, 28]] },
+	];
+	const RANK_COLOURS = ['#4C72B0', '#DD8452', '#55A868', '#8172B2'];
+	const SOURCE_COLOURS = { same: '#2A9D8F', periodic: '#2A9D8F', interpolated: '#E9C46A', neighbour: '#B08BD6', outside: '#E0E0E0' };
+
+	const levelShape = (level) => BASE.map((n) => n * RATIO ** level);
+	const scale = (level) => RATIO ** level; // level cells per base cell
+	const area = (box) => box.reduce((total, [lo, hi]) => total * (hi - lo), 1);
+
+	/** mpiarray's split of an axis: the first `length % count` chunks get one more. */
+	function chunks(length, count) {
+		const base = Math.floor(length / count);
+		const extra = length % count;
+		const bounds = [];
+		for (let i = 0; i < count; i++) {
+			const start = i * base + Math.min(i, extra);
+			bounds.push([start, start + base + (i < extra ? 1 : 0)]);
+		}
+		return bounds;
+	}
+
+	/** The ranks of every patch, as AMRHierarchy places them: "all", or the least loaded ranks. */
+	function placePatches(size, mode) {
+		const load = new Array(size).fill(0);
+		return PATCHES.map((patch) => {
+			const cells = area(patch.box);
+			let chosen;
+			if (mode === 'all') {
+				chosen = [...Array(size).keys()];
+			} else {
+				const wanted = mode === 'limited' ? Math.min(size, Math.max(1, Math.ceil(cells / LIMIT))) : 1;
+				const order = [...Array(size).keys()].sort((a, b) => load[a] - load[b] || a - b);
+				chosen = order.slice(0, wanted).sort((a, b) => a - b);
+			}
+			for (const rank of chosen) load[rank] += cells / chosen.length;
+			return chosen;
+		});
+	}
+
+	/** The blocks of a patch: its ranks and their x ranges in the patch's own indices. */
+	function blocksOf(patch, ranks) {
+		const nx = patch.box[0][1] - patch.box[0][0];
+		return chunks(nx, ranks.length).map(([x0, x1], k) => ({ rank: ranks[k], x0, x1 }));
+	}
+
+	/** The rank whose block holds a cell of the patch (patch-local indices). */
+	function holder(blocks, i) {
+		return blocks.find((block) => block.x0 <= i && i < block.x1).rank;
+	}
+
+	/** The rank whose receiving region holds a point (patch-local, possibly in the halo). */
+	function receiver(blocks, i) {
+		if (i < 0) return blocks[0].rank;
+		if (i >= blocks[blocks.length - 1].x1) return blocks[blocks.length - 1].rank;
+		return holder(blocks, i);
+	}
+
+	const overlap = (a, b) => {
+		const box = a.map(([a0, a1], axis) => [Math.max(a0, b[axis][0]), Math.min(a1, b[axis][1])]);
+		return box.every(([s, e]) => s < e) ? box : null;
+	};
+	const shiftBox = (box, by) => box.map(([s, e], axis) => [s + by[axis], e + by[axis]]);
+
+	/** patchwork's `_frame`: two boxes per axis around a box, the corners in those of the last axis. */
+	function frame(own, width) {
+		const boxes = [];
+		own.forEach(([lo, hi], axis) => {
+			for (const part of [[lo - width, lo], [hi, hi + width]]) {
+				boxes.push(own.map(([o0, o1], other) => (other === axis ? part : other < axis ? [o0 - width, o1 + width] : [o0, o1])));
+			}
+		});
+		return boxes;
+	}
+
+	/** The periodic images to look in: shifts by a period along the periodic axes. */
+	function shifts(level, periodic) {
+		const [nx] = levelShape(level);
+		const xs = periodic ? [-nx, 0, nx] : [0];
+		return xs.map((dx) => [dx, 0]);
+	}
+
+	function inDomain(level, i, j, periodic) {
+		const [nx, ny] = levelShape(level);
+		const okX = periodic ? true : i >= 0 && i < nx;
+		return okX && j >= 0 && j < ny;
+	}
+
+	/** The source of every halo cell of a patch, the copies they need and the buffer of the interpolation. */
+	function classify(number, placement, periodic) {
+		const patch = PATCHES[number];
+		const own = patch.box;
+		const cells = new Map(); // "i,j" -> {i, j, kind, ...}
+		for (const box of frame(own, HALO)) {
+			for (let i = box[0][0]; i < box[0][1]; i++) {
+				for (let j = box[1][0]; j < box[1][1]; j++) {
+					const inside = inDomain(patch.level, i, j, periodic);
+					cells.set(`${i},${j}`, { i, j, kind: inside && patch.level > 0 ? 'interpolated' : 'outside' });
+				}
+			}
+		}
+		const blocks = blocksOf(patch, placement[number]);
+		const messages = []; // {from, to, count, why}
+		PATCHES.forEach((other, otherNumber) => {
+			if (other.level !== patch.level) return;
+			const otherBlocks = blocksOf(other, placement[otherNumber]);
+			for (const shift of shifts(patch.level, periodic)) {
+				if (other === patch && shift[0] === 0) continue;
+				const theirs = shiftBox(other.box, shift);
+				for (const box of frame(own, HALO)) {
+					const part = overlap(box, theirs);
+					if (!part) continue;
+					for (let i = part[0][0]; i < part[0][1]; i++) {
+						for (let j = part[1][0]; j < part[1][1]; j++) {
+							const si = i - shift[0] - other.box[0][0];
+							const sj = j - shift[1] - other.box[1][0];
+							const from = holder(otherBlocks, si);
+							const to = receiver(blocks, i - own[0][0]);
+							cells.set(`${i},${j}`, { i, j, kind: shift[0] ? 'periodic' : 'same', source: otherNumber, si, sj, from, to });
+							messages.push({ from, to, count: 1 });
+						}
+					}
+				}
+			}
+		});
+		// the interpolation of the level below: a replicated buffer on the patch's ranks
+		let buffer = null;
+		const pending = [...cells.values()].filter((cell) => cell.kind === 'interpolated');
+		if (pending.length) {
+			const below = patch.level - 1;
+			const stencil = (value, axis) => {
+				const position = (value + 0.5) / RATIO - 0.5;
+				let lower = Math.floor(position);
+				const count = levelShape(below)[axis];
+				if (!(axis === 0 && periodic)) lower = Math.min(Math.max(lower, 0), count - 2);
+				return lower;
+			};
+			const lowers = pending.map((cell) => [stencil(cell.i, 0), stencil(cell.j, 1)]);
+			const bufferBox = [0, 1].map((axis) => {
+				const values = lowers.map((lower) => lower[axis]);
+				return [Math.min(...values), Math.max(...values) + 2];
+			});
+			const providers = [];
+			PATCHES.forEach((coarse, coarseNumber) => {
+				if (coarse.level !== below) return;
+				const coarseBlocks = blocksOf(coarse, placement[coarseNumber]);
+				for (const shift of shifts(below, periodic)) {
+					const part = overlap(bufferBox, shiftBox(coarse.box, shift));
+					if (!part) continue;
+					const count = area(part);
+					providers.push({ patch: coarseNumber, box: part, count, periodic: shift[0] !== 0 });
+					for (let i = part[0][0]; i < part[0][1]; i++) {
+						const from = holder(coarseBlocks, i - shift[0] - coarse.box[0][0]);
+						const rows = part[1][1] - part[1][0];
+						for (const to of placement[number]) messages.push({ from, to, count: rows });
+					}
+				}
+			});
+			pending.forEach((cell, k) => {
+				cell.lower = lowers[k];
+				cell.bufferBox = bufferBox;
+			});
+			buffer = { box: bufferBox, providers, ranks: placement[number] };
+		}
+		return { cells, messages, blocks, buffer };
+	}
+
+	/** The seams between the blocks of a patch: an `update_halos` each way of h × (ny + 2h) cells. */
+	function seamsOf(number, placement) {
+		const patch = PATCHES[number];
+		const blocks = blocksOf(patch, placement[number]);
+		const ny = patch.box[1][1] - patch.box[1][0];
+		const seams = [];
+		for (let k = 0; k + 1 < blocks.length; k++) {
+			seams.push({ patch: number, left: blocks[k].rank, right: blocks[k + 1].rank, at: blocks[k].x1, cells: HALO * (ny + 2 * HALO) });
+		}
+		return seams;
+	}
+
+	// --- the drawing ----------------------------------------------------------------------
+	const root = document.getElementById('halo-explorer');
+	if (root) {
+		const svg = root.querySelector('svg');
+		const hint = root.querySelector('[data-role="hint"]');
+		const state = { ranks: 3, placement: 'all', periodic: false, patch: 2 };
+		const NS = 'http://www.w3.org/2000/svg';
+		const H = BASE[1];
+		const el = (name, attributes) => {
+			const node = document.createElementNS(NS, name);
+			for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, value);
+			return node;
+		};
+		// a cell box (level indices) in drawing units: base cells, y upwards
+		const rectAttributes = (i0, j0, i1, j1, level) => {
+			const s = scale(level);
+			return { x: i0 / s, y: H - j1 / s, width: (i1 - i0) / s, height: (j1 - j0) / s };
+		};
+		const rankName = (rank) => `<span class="rank-chip" style="background:${RANK_COLOURS[rank]}" title="rank ${rank}">${rank}</span>`;
+
+		function draw() {
+			const placement = placePatches(state.ranks, state.placement);
+			svg.replaceChildren();
+			const defs = el('defs', {});
+			defs.innerHTML = `<pattern id="halo-hatch" width="0.25" height="0.25" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="0.25" height="0.25" fill="#2A9D8F"/><rect width="0.1" height="0.25" fill="#ffffff"/></pattern>`;
+			svg.append(defs);
+			svg.append(el('rect', { x: -1.5, y: -1.5, width: 15, height: 15, fill: 'var(--sl-color-bg)' }));
+			// the patches: blocks by rank, cell lines, outline
+			PATCHES.forEach((patch, number) => {
+				const s = scale(patch.level);
+				const group = el('g', { 'data-patch': number, style: 'cursor: pointer' });
+				for (const block of blocksOf(patch, placement[number])) {
+					const [[i0], [j0, j1]] = patch.box;
+					group.append(
+						el('rect', {
+							...rectAttributes(i0 + block.x0, j0, i0 + block.x1, j1, patch.level),
+							fill: RANK_COLOURS[block.rank],
+							'fill-opacity': 0.18 + 0.16 * patch.level,
+						})
+					);
+				}
+				const lines = el('path', { stroke: 'var(--sl-color-hairline)', 'stroke-width': 0.02 + 0.01 * (2 - patch.level), fill: 'none' });
+				let d = '';
+				const [[i0, i1], [j0, j1]] = patch.box;
+				for (let i = i0; i <= i1; i++) d += `M${i / s},${H - j0 / s}V${H - j1 / s}`;
+				for (let j = j0; j <= j1; j++) d += `M${i0 / s},${H - j / s}H${i1 / s}`;
+				lines.setAttribute('d', d);
+				group.append(lines);
+				const blocks = blocksOf(patch, placement[number]);
+				for (let k = 0; k + 1 < blocks.length; k++) {
+					const x = (i0 + blocks[k].x1) / s;
+					group.append(el('path', { d: `M${x},${H - j0 / s}V${H - j1 / s}`, stroke: 'var(--sl-color-text)', 'stroke-width': 0.05, 'stroke-dasharray': '0.15 0.1', fill: 'none' }));
+				}
+				group.append(el('rect', { ...rectAttributes(i0, j0, i1, j1, patch.level), fill: 'none', stroke: 'var(--sl-color-text)', 'stroke-width': number === state.patch ? 0.12 : 0.06 }));
+				const label = el('text', { x: i0 / s + 0.12, y: H - j1 / s + 0.42, 'font-size': 0.36, fill: 'var(--sl-color-text)' });
+				label.textContent = `patch ${number}`;
+				group.append(label);
+				group.addEventListener('click', () => select('patch', number));
+				svg.append(group);
+			});
+			// the seams of the chosen patch: the halo strips mpiarray fills
+			const chosen = PATCHES[state.patch];
+			const s = scale(chosen.level);
+			const [[i0], [j0, j1]] = chosen.box;
+			for (const seam of seamsOf(state.patch, placement)) {
+				const strip = el('rect', { ...rectAttributes(i0 + seam.at - HALO, j0, i0 + seam.at + HALO, j1, chosen.level), fill: SOURCE_COLOURS.neighbour, 'fill-opacity': 0.55, class: 'cell-hover' });
+				strip.addEventListener('mousemove', () => {
+					hint.innerHTML = `Between the blocks of patch ${state.patch}: ${rankName(seam.left)} and ${rankName(seam.right)} each send the other a layer of ${HALO} × ${seam.cells / HALO} cells (their halo along y included) with <code>update_halos</code>: non-blocking point-to-point messages on the patch's own communicator, after the Alltoallv.`;
+				});
+				svg.append(strip);
+			}
+			// the halo cells of the chosen patch, by source
+			const result = classify(state.patch, placement, state.periodic);
+			for (const cell of result.cells.values()) {
+				const attributes = rectAttributes(cell.i, cell.j, cell.i + 1, cell.j + 1, chosen.level);
+				const fill = cell.kind === 'periodic' ? 'url(#halo-hatch)' : SOURCE_COLOURS[cell.kind];
+				const rect = el('rect', { ...attributes, fill, stroke: 'var(--sl-color-bg)', 'stroke-width': 0.02, class: 'cell-hover' });
+				rect.addEventListener('mousemove', () => describe(cell, result));
+				svg.append(rect);
+			}
+			// the buffer box of the interpolation, on the level below
+			if (result.buffer) {
+				const [[b0, b1], [c0, c1]] = result.buffer.box;
+				svg.append(el('rect', { ...rectAttributes(b0, c0, b1, c1, chosen.level - 1), fill: 'none', stroke: '#B5891A', 'stroke-width': 0.06, 'stroke-dasharray': '0.2 0.12', 'pointer-events': 'none' }));
+			}
+			svg.append(el('rect', { x: 0, y: 0, width: BASE[0], height: BASE[1], fill: 'none', stroke: 'var(--sl-color-text)', 'stroke-width': 0.05, 'pointer-events': 'none' }));
+			if (state.periodic) {
+				for (const y of [3, 9]) {
+					svg.append(el('path', { d: `M0,${y}H-0.9M${BASE[0] + 0.9},${y}H${BASE[0]}`, stroke: '#2A9D8F', 'stroke-width': 0.08, fill: 'none', 'pointer-events': 'none' }));
+				}
+			}
+			report(placement);
+		}
+
+		function describe(cell, result) {
+			const number = state.patch;
+			const where = `Halo cell (${cell.i}, ${cell.j}) of patch ${number}`;
+			if (cell.kind === 'same' || cell.kind === 'periodic') {
+				const image = cell.kind === 'periodic' ? ' (its periodic image)' : '';
+				const move = cell.from === cell.to ? `${rankName(cell.from)} copies it to itself through the same buffers` : `${rankName(cell.from)} sends it to ${rankName(cell.to)}`;
+				hint.innerHTML = `${where}: a copy of cell (${cell.si}, ${cell.sj}) of patch ${cell.source}${image}; ${move} in the Alltoallv.`;
+			} else if (cell.kind === 'interpolated') {
+				const [li, lj] = cell.lower;
+				const [[b0, b1], [c0, c1]] = cell.bufferBox;
+				const ranks = result.buffer.ranks.map(rankName).join(', ');
+				const providers = result.buffer.providers.map((p) => `${p.count} cells of patch ${p.patch}${p.periodic ? ' (periodic image)' : ''}`).join(' and ');
+				hint.innerHTML = `${where}: bilinear interpolation of the level-${PATCHES[number].level - 1} cells (${li}, ${lj}) to (${li + 1}, ${lj + 1}). The Alltoallv fills the buffer box ((${b0}, ${b1}), (${c0}, ${c1})) (dashed) on ${ranks} with ${providers}; the weighted sum is then computed locally.`;
+			} else {
+				hint.innerHTML = `${where}: outside the domain, left as it is for the boundary condition.`;
+			}
+		}
+
+		function report(placement) {
+			const size = state.ranks;
+			// the patches
+			const table = root.querySelector('[data-role="patches"]');
+			let rows = '<tr><th>patch</th><th>level</th><th>cells</th><th>ranks</th><th>block widths</th></tr>';
+			PATCHES.forEach((patch, number) => {
+				const blocks = blocksOf(patch, placement[number]);
+				const widths = blocks.map((block) => `${block.x1 - block.x0}`).join(' | ');
+				rows += `<tr><td>${number}</td><td>${patch.level}</td><td>${area(patch.box)}</td><td>${placement[number].map(rankName).join('')}</td><td>${widths}</td></tr>`;
+			});
+			table.innerHTML = rows;
+			// the Alltoallv over all patches
+			const counts = Array.from({ length: size }, () => new Array(size).fill(0));
+			let moved = 0;
+			let between = 0;
+			let interpolatedPatches = 0;
+			PATCHES.forEach((_, number) => {
+				const result = classify(number, placement, state.periodic);
+				if (result.buffer) interpolatedPatches += 1;
+				for (const message of result.messages) {
+					counts[message.from][message.to] += message.count;
+					moved += message.count;
+					if (message.from !== message.to) between += message.count;
+				}
+			});
+			const matrix = root.querySelector('[data-role="matrix"]');
+			let html = '<tr><th>from \\ to</th>' + [...Array(size).keys()].map((rank) => `<th>to ${rankName(rank)}</th>`).join('') + '</tr>';
+			for (let from = 0; from < size; from++) {
+				html += `<tr><th>from ${rankName(from)}</th>`;
+				for (let to = 0; to < size; to++) {
+					const value = counts[from][to];
+					html += `<td class="${value ? '' : 'zero'}${from === to ? ' self' : ''}">${value}</td>`;
+				}
+				html += '</tr>';
+			}
+			matrix.innerHTML = html;
+			// the seams
+			const seams = PATCHES.flatMap((_, number) => seamsOf(number, placement));
+			const seamText = root.querySelector('[data-role="seams"]');
+			seamText.innerHTML = seams.length
+				? seams.map((seam) => `patch ${seam.patch}: ${rankName(seam.left)} ⇄ ${rankName(seam.right)}, ${seam.cells} cells each way`).join('; ') + '.'
+				: 'No patch is split over several ranks: nothing to exchange inside a patch.';
+			// the summary
+			const groups = new Set(placement.map((ranks) => ranks.join(',')));
+			let splits = 0;
+			for (const group of groups) {
+				const members = group.split(',').length;
+				if (members > 1 && members < size) splits += 1;
+			}
+			const summary = root.querySelector('[data-role="summary"]');
+			summary.innerHTML =
+				`<strong>Once:</strong> ${splits ? `${splits} <code>comm.Split</code> for the group${splits > 1 ? 's' : ''} of ranks that hold${splits > 1 ? '' : 's'} a patch together, ` : ''}` +
+				`one <code>allgather</code> to build the schedule. <strong>Every call:</strong> one <code>Alltoallv</code> over the ${size} rank${size > 1 ? 's' : ''} ` +
+				`(${moved} cells, ${between} of them between different ranks), the local interpolation on ${interpolatedPatches} patch${interpolatedPatches === 1 ? '' : 'es'}, ` +
+				`then ${seams.length ? `${2 * seams.length} <code>Isend</code>/<code>Irecv</code> pairs` : 'no point-to-point messages'} inside the patches.`;
+		}
+
+		function select(control, value) {
+			state[control] = value;
+			for (const button of root.querySelectorAll(`[data-control="${control}"] button`)) {
+				button.classList.toggle('active', String(button.dataset.value) === String(value));
+			}
+			draw();
+		}
+
+		for (const group of root.querySelectorAll('.segmented')) {
+			const control = group.dataset.control;
+			for (const button of group.querySelectorAll('button')) {
+				button.addEventListener('click', () => select(control, control === 'placement' ? button.dataset.value : Number(button.dataset.value)));
+			}
+		}
+		root.querySelector('[data-control="periodic"]').addEventListener('change', (event) => {
+			state.periodic = event.target.checked;
+			draw();
+		});
+		svg.addEventListener('mouseleave', () => {
+			hint.textContent = 'Hover a halo cell to see where it comes from; click a patch to select it.';
+		});
+		draw();
+	}
+</script>
