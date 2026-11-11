@@ -7,6 +7,11 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Examples "Multigrid over patches" (3D: the LU's setup grows much faster than the multigrid's,
+  1.7 s against 0.12 s at 32^3, a step with a new coefficient 11x faster; iterations do not
+  grow with the patches) and "Anisotropic coefficients" (a tensor turned against the grid: second
+  order with its off-diagonal terms, no convergence without them; multigrid iterations
+  independent of the mesh up to an anisotropy of about ten).
 - A variable coefficient for `NodalPoisson`: `-div(K grad phi)` with `K` per leaf cell (a
   number, a diagonal or a symmetric tensor, whose off-diagonal entries couple the edges of
   different axes) or per edge (`edge_coefficient`, e.g. a deposited susceptibility), lumped or
@@ -148,6 +153,8 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `stiffness_blocks` with batched products instead of one einsum: `set_coefficient` about 4x
+  faster (0.3 s instead of 1.7 s for 40^3 cells).
 - Three layers (`patchwork.mesh`, `patchwork.spaces`, `patchwork.solvers`), each importing
   only the ones below it when it loads (`test_layers.py`):
   - `patchwork.mesh`: `hierarchy` (was `patchwork.mesh`), `halos`, `regrid`, `accumulate`,

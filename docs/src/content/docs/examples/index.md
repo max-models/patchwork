@@ -26,6 +26,12 @@ Step by step, from a first hierarchy to stencils on patches:
 9. [Variable coefficients](/patchwork/examples/09-variable-coefficients/): the operator
    $-\nabla\cdot(\mathsf{K}\nabla\phi)$ of an implicit particle step, with a tensor per leaf
    cell, and the multigrid over the patches that solves it.
+10. [Multigrid over patches](/patchwork/examples/10-multigrid-over-patches/): what the multigrid
+    saves against the LU on a growing 3D mesh, its iterations as patches are added, and a
+    coefficient that changes in every step.
+11. [Anisotropic coefficients](/patchwork/examples/11-anisotropic-coefficients/): a tensor turned
+    against the grid (a magnetized plasma), with and without its off-diagonal terms, and how far
+    the multigrid carries the anisotropy.
 
 Every notebook in `tutorials/` is executed when the site is built and published here with its
 outputs. Download a notebook from its page to run the steps yourself.
