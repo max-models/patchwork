@@ -126,7 +126,7 @@ def _nodal_problem() -> ConvergenceProblem:
         "uniform": r"A_{pp} = \frac{2h_y}{h_x} + \frac{2h_x}{h_y}, \qquad A_{p,x\pm} = -\frac{h_y}{h_x}, \qquad A_{p,y\pm} = -\frac{h_x}{h_y}",
         "reduced": r"(T^\top A T)_{FF}\,\phi_F = T^\top V f - (T^\top A T)_{FD}\,\phi_D + T^\top b_N + W U, \qquad V = \mathrm{diag}(V_p)",
         "charge": r"T^\top V f \to T^\top q \quad (\texttt{solve(charge=q)})",
-        "consistent": r"A = T^\top G^\top M_1 G\, T, \qquad V \to M_0 \quad (\texttt{mass=\"consistent\"}\text{: the Q1 finite elements; lumped } M_1, V \text{: the stencil above})",
+        "consistent": r"A = T^\top G^\top M_1 G\, T, \qquad V \to M_0 \quad \text{(consistent mass: the Q1 elements; lumped } M_1 \text{ and } V \text{: the stencil above)}",
         "neumann": r"b_{N,p} \mathrel{+}= \tfrac12 |e|\, g \quad \text{for each end } p \text{ of a boundary edge } e",
         "cut_edge": r"A_{pp} \mathrel{+}= \frac{g}{\theta}, \qquad b_p \mathrel{+}= \frac{g}{\theta}\, U_k, \qquad \theta = \max(\theta_\mathrm{found}, \theta_\mathrm{min})",
         "shortley_weller": r"A_{pp} = h_x h_y \sum_\mathrm{axes} \Big(\frac{2}{a_-(a_- + a_+)} + \frac{2}{a_+(a_- + a_+)}\Big), \qquad A_{p,\pm} = -\,h_x h_y\,\frac{2}{a_\pm(a_- + a_+)}",
