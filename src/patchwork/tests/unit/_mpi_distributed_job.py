@@ -199,6 +199,36 @@ def main() -> None:
         f"second order: errors {errors}",
     )
 
+    # 8. 3D: patches on one rank, a pair and all ranks, BoomerAMG against SuperLU.
+    def box3d(comm, placed: bool) -> AMRHierarchy:
+        mesh = AMRHierarchy(base_shape=(12, 12, 12), comm=comm)
+        for level, box, ranks in (
+            (1, ((6, 18), (4, 16), (8, 20)), SIZE - 1),
+            (1, ((2, 6), (14, 22), (2, 10)), (0, 1)),
+            (2, ((14, 30), (12, 28), (18, 34)), None),
+        ):
+            mesh.add_patch(level=level, box=box, ranks=ranks if placed else None)
+        return mesh
+
+    faces3d = {"z_lower": Neumann(0.3), "x_upper": Dirichlet(lambda x, y, z: x + y * z)}
+
+    def source3d(x, y, z):
+        return np.exp(-((x - 0.4) ** 2 + (y - 0.55) ** 2 + (z - 0.5) ** 2) / 0.02)
+
+    distributed = NodalPoisson(
+        box3d(WORLD, placed=True), faces=faces3d, backend="petsc"
+    )
+    serial = NodalPoisson(box3d(MPI.COMM_SELF, placed=False), faces=faces3d)
+    x, y, z = serial.nodes.coordinates.T
+    error = np.abs(
+        distributed.solve(source3d(x, y, z)) - serial.solve(source3d(x, y, z))
+    )
+    check(error.max() < 1e-8, f"3D: differs from SuperLU by {error.max():.2e}")
+    check(
+        distributed.rows.size < distributed.free.size,
+        f"3D: rank {RANK} holds every row",
+    )
+
     if RANK == 0:
         print("MPI_JOB_OK", flush=True)
 

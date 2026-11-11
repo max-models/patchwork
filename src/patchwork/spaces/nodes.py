@@ -533,17 +533,23 @@ class CompositeNodes:
         ),
         components=("patchwork.spaces.mass.node_mass_blocks",),
     )
-    def mass(self, lumped: bool = True) -> sparse.csr_matrix:
+    def mass(
+        self, lumped: bool = True, weight: np.ndarray | float | None = None
+    ) -> sparse.csr_matrix:
         """The node mass matrix ``M0``: ``u^T M0 u`` is the integral of ``u_h**2``.
 
         ``u_h`` is the (bi)linear interpolant of the node values in every leaf
         cell. ``lumped`` takes the vertex quadrature: ``diag(volumes)``, the
         control volumes of the finite-difference scheme; otherwise the exact
         (consistent) Q1 mass. For values on the free nodes, use ``T^T M0 T``.
+        ``weight`` is a coefficient per leaf cell (a number or an array).
         """
-        if lumped:
+        if lumped and weight is None:
             return sparse.csr_matrix(sparse.diags(self.volumes))
-        blocks = node_mass_blocks(self.cell_size, lumped=False)
+        blocks = node_mass_blocks(self.cell_size, lumped=lumped)
+        if weight is not None:
+            weight = np.broadcast_to(np.asarray(weight), blocks.shape[:1])
+            blocks = blocks * weight[:, None, None]
         return scatter_blocks(
             blocks,
             self.cell_corners,

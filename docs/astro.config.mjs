@@ -27,6 +27,7 @@ export default defineDocs({
 			'patchwork.spaces.mass': 'Mass matrices',
 			'patchwork.solvers.nodal_poisson': 'Nodal Poisson',
 			'patchwork.solvers.cell_operator': 'Cell operator',
+			'patchwork.solvers.curl_curl': 'Curl–curl',
 			'patchwork.solvers.backends': 'Solver backends',
 			'patchwork.solvers.distributed': 'Distributed solve',
 			'patchwork.solvers.poisson': 'Legacy cell Poisson',

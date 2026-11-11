@@ -34,6 +34,7 @@ import scope_profiler as sp
 from methodcard import method
 
 from patchwork._profiling import PROFILE_TAGS
+from patchwork.spaces.edges import _weighted
 from patchwork.spaces.mass import (
     corner_bits,
     edge_corners,
@@ -313,11 +314,14 @@ class CompositeFaces:
         ),
         components=("patchwork.spaces.mass.face_mass_blocks",),
     )
-    def mass(self, lumped: bool = True) -> sparse.csr_matrix:
+    def mass(
+        self, lumped: bool = True, weight: np.ndarray | float | None = None
+    ) -> sparse.csr_matrix:
         """The face mass matrix ``M2``: ``f^T M2 f`` is the integral of ``|B|^2``.
 
         Summed over the leaf cells, each with the face interpolant of its own
-        faces. For a field on hanging faces, use ``T2^T M2 T2``.
+        faces. For a field on hanging faces, use ``T2^T M2 T2``. ``weight`` is
+        a coefficient per leaf cell (a number or an array), e.g. a reluctivity.
         """
         size = self.nodes.cell_size
         shape = (self.num_faces, self.num_faces)
@@ -325,7 +329,10 @@ class CompositeFaces:
         for axis in range(self.nodes.ndim):
             faces = self.cell_faces[:, [2 * axis, 2 * axis + 1]]
             mass = mass + scatter_blocks(
-                face_mass_blocks(size, axis, lumped), faces, faces, shape
+                _weighted(face_mass_blocks(size, axis, lumped), weight),
+                faces,
+                faces,
+                shape,
             )
         return sparse.csr_matrix(mass)
 

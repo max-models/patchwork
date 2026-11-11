@@ -54,7 +54,13 @@ module by module; this one shows how they fit together.
 
 <MethodCard name="patchwork.spaces.edges.CompositeEdges.deposit_paths" headingLevel={3} />
 
-7. **[Refluxing](/patchwork/numerics/mesh-reflux/).** For an explicit, conservative time step, the
+7. **[Face space](/patchwork/numerics/spaces-faces/).** The lowest-order Raviart–Thomas
+   faces (fluxes), with the divergence to the leaf cells and, in 3D, the curl from the edges:
+   `C G = 0` and `D C = 0` exactly, also across patch faces.
+8. **[Curl–curl](/patchwork/numerics/solvers-curl-curl/).** $\nabla\times(\nu\nabla\times\mathbf{A}) + \beta\mathbf{A} = \mathbf{J}$
+   on the edges, lumped or consistent, solved by LU or by conjugate gradients with hypre's
+   AMS.
+9. **[Refluxing](/patchwork/numerics/mesh-reflux/).** For an explicit, conservative time step, the
    coarse cells next to finer levels take the fine fluxes instead of their own (Berger and
    Colella), with or without subcycling.
 

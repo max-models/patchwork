@@ -51,6 +51,14 @@ if TYPE_CHECKING:
     from patchwork.spaces.nodes import CompositeNodes
 
 
+def _weighted(blocks: np.ndarray, weight: np.ndarray | float | None) -> np.ndarray:
+    """Per-cell blocks ``(m, a, b)`` times a coefficient per cell (none: one)."""
+    if weight is None:
+        return blocks
+    weight = np.broadcast_to(np.asarray(weight), blocks.shape[:1])
+    return blocks * weight[:, None, None]
+
+
 def _sides(ndim: int) -> list[tuple[int, int, int]]:
     """The edges of a cell, in the order of `CompositeEdges.cell_edges`.
 
@@ -400,7 +408,9 @@ class CompositeEdges:
         symbolic=_mass_rules,
         components=("patchwork.spaces.mass.edge_mass_blocks",),
     )
-    def mass(self, lumped: bool = True) -> sparse.csr_matrix:
+    def mass(
+        self, lumped: bool = True, weight: np.ndarray | float | None = None
+    ) -> sparse.csr_matrix:
         """The edge mass matrix ``M1``: ``e^T M1 e`` is the integral of ``|E|^2``.
 
         Summed over the leaf cells, each with the edge interpolant of its own
@@ -410,6 +420,8 @@ class CompositeEdges:
         integral, ``h_perp / h`` times ``[[1/3, 1/6], [1/6, 1/3]]`` for the two
         edges of a direction. Both are symmetric and positive definite on the
         free edges. For a field on hanging edges, use ``T1^T M1 T1``.
+        ``weight`` is a coefficient per leaf cell (a number, or an array in the
+        order of the leaf cells), e.g. a permittivity or a conductivity.
         """
         size = self.nodes.cell_size  # (m, ndim)
         ndim = self.nodes.ndim
@@ -419,7 +431,10 @@ class CompositeEdges:
             # the cell's edges along the axis, in the order of `edge_corners`
             edges = self.cell_edges[:, _axis_columns(ndim, axis)]
             mass = mass + scatter_blocks(
-                edge_mass_blocks(size, axis, lumped), edges, edges, shape
+                _weighted(edge_mass_blocks(size, axis, lumped), weight),
+                edges,
+                edges,
+                shape,
             )
         return sparse.csr_matrix(mass)
 
