@@ -23,7 +23,7 @@ IndexBox = tuple[tuple[int, int], ...]
 PhysicalBounds = tuple[tuple[float, float], ...]
 
 #: The numbers of dimensions a hierarchy may have.
-DIMENSIONS = (1, 2)
+DIMENSIONS = (1, 2, 3)
 
 #: The geometries of a hierarchy: a Cartesian plane ``(x, y)``, or the
 #: axisymmetric ``(r, z)`` plane of a body of revolution (``"cylindrical"``).
@@ -410,14 +410,14 @@ class AMRHierarchy:
         ndim = len(base_shape)
         if ndim not in DIMENSIONS or any(int(n) != n or n <= 0 for n in base_shape):
             raise ValueError(
-                "base_shape must contain one or two positive integer cell counts"
+                "base_shape must contain one to three positive integer cell counts"
             )
         if int(refinement_ratio) != refinement_ratio or refinement_ratio < 2:
             raise ValueError("refinement_ratio must be an integer of at least 2")
         if bounds is None:
             bounds = ((0.0, 1.0),) * ndim
         if len(bounds) != ndim or any(len(axis) != 2 for axis in bounds):
-            expected = ", ".join(f"({a}_lower, {a}_upper)" for a in "xy"[:ndim])
+            expected = ", ".join(f"({a}_lower, {a}_upper)" for a in "xyz"[:ndim])
             raise ValueError(f"bounds must be ({expected},), one pair per axis")
         if any(hi <= lo for lo, hi in bounds):
             raise ValueError("each physical upper bound must exceed its lower bound")
@@ -483,7 +483,7 @@ class AMRHierarchy:
 
     @property
     def ndim(self) -> int:
-        """Number of dimensions: 1 or 2."""
+        """Number of dimensions: 1, 2 or 3."""
         return len(self.base_shape)
 
     @property
@@ -967,8 +967,8 @@ class AMRHierarchy:
         Every level's table covers the bounding box of its patches and holds the
         index into `patches` of the patch over each cell, -1 where there is
         none. Returns the arguments of the ``locate_points`` kernel that describe
-        the hierarchy, always for two axes (a 1D hierarchy gets one cell along
-        ``y``): the domain's bounds and periodic axes, the spacing and cell count
+        the hierarchy, always for three axes (a 1D or 2D hierarchy gets one cell
+        along each missing axis): the domain's bounds and periodic axes, the spacing and cell count
         of the finest level, the span of a cell of each level on the finest one,
         each table's lower corner and shape, where it starts in the flat array of
         all tables, and that array. Built at the first call, kept until a patch is
@@ -977,7 +977,7 @@ class AMRHierarchy:
         import numpy as np
 
         if self._locators is None:
-            pad = 2 - self.ndim
+            pad = 3 - self.ndim
             finest = self.max_level
             corners, shapes, flat = [], [], []
             for level in range(finest + 1):
@@ -1041,12 +1041,12 @@ class AMRHierarchy:
         from patchwork.kernels.locate_points import kernel as locate_points
 
         size = coordinates[0].size
-        points = np.zeros((2, size))
+        points = np.zeros((3, size))
         for axis, values in enumerate(coordinates):
             points[axis] = values
         found = np.empty(size, dtype=np.int64)
-        cell = np.empty((2, size), dtype=np.int64)
-        wrapped = np.empty((2, size), dtype=float)
+        cell = np.empty((3, size), dtype=np.int64)
+        wrapped = np.empty((3, size), dtype=float)
         if size:  # the compiled kernel takes no empty arrays
             locate_points(points, *self._locator(), found, cell, wrapped)
         return found, tuple(cell[: self.ndim]), tuple(wrapped[: self.ndim])
@@ -1056,7 +1056,7 @@ class AMRHierarchy:
         import numpy as np
 
         if len(coordinates) != self.ndim:
-            names = ", ".join("xy"[: self.ndim])
+            names = ", ".join("xyz"[: self.ndim])
             raise ValueError(
                 f"a {self.ndim}D hierarchy takes {self.ndim} coordinate arrays "
                 f"({names}), got {len(coordinates)}"
@@ -1074,7 +1074,7 @@ class AMRHierarchy:
     def locate(self, *coordinates: Any) -> Any:
         """The finest patch that holds each point: its index in `patches`.
 
-        ``locate(x)`` in 1D, ``locate(x, y)`` in 2D: arrays of the same shape
+        ``locate(x)`` in 1D, ``locate(x, y)`` in 2D, ``locate(x, y, z)`` in 3D: arrays of the same shape
         (physical coordinates); the result has that shape and is -1 for a point
         outside the domain, such as one in the notch of an L. Cells are half
         open, so a point on the edge between two patches belongs to the one that

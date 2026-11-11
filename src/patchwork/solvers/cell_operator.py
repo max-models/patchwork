@@ -170,7 +170,7 @@ def _cell_problem() -> ConvergenceProblem:
     """Variable coefficients on two nested patches, in the volume-weighted L2 norm."""
 
     def error(spacing: float) -> float:
-        faces = {face: Dirichlet(_manufactured) for face in FACES}
+        faces = {face: Dirichlet(_manufactured) for face in faces_of(2)}
         solver = CellOperator(
             _refined(round(1.0 / spacing)),
             diffusion=_diffusion,
@@ -188,7 +188,7 @@ def _gradient_problem() -> ConvergenceProblem:
     """The gradient of the manufactured solution on two nested patches, maximum norm."""
 
     def error(spacing: float) -> float:
-        faces = {face: Dirichlet(_manufactured) for face in FACES}
+        faces = {face: Dirichlet(_manufactured) for face in faces_of(2)}
         solver = CellOperator(
             _refined(round(1.0 / spacing)), faces=faces, factorize=False
         )
@@ -894,6 +894,12 @@ class CellOperator:
         factorize: bool = True,
     ) -> None:
         """Assemble and factorize the operator."""
+        if hierarchy.ndim == 3:
+            raise NotImplementedError(
+                "CellOperator is 1D and 2D: its coarse-fine faces interpolate along "
+                "one tangential direction. In 3D use NodalPoisson (nodes) or the "
+                "edge space"
+            )
         if coarse_fine not in ("symmetric", "conservative"):
             raise ValueError(
                 f"coarse_fine must be 'symmetric' or 'conservative', got {coarse_fine!r}"

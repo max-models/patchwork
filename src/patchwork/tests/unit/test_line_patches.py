@@ -134,8 +134,8 @@ def test_patches_of_a_line_are_checked() -> None:
         AMRHierarchy(base_shape=(8,), periodic=(False, False))
     with pytest.raises(ValueError, match="r–z"):
         AMRHierarchy(base_shape=(8,), geometry="cylindrical")
-    with pytest.raises(ValueError, match="one or two"):
-        AMRHierarchy(base_shape=(4, 4, 4))
+    with pytest.raises(ValueError, match="one to three"):
+        AMRHierarchy(base_shape=(4, 4, 4, 4))
 
 
 def test_locate_on_a_line() -> None:

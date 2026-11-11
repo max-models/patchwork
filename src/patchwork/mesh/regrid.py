@@ -370,13 +370,13 @@ def cluster(
     A box is kept when at least ``efficiency`` of its cells are tagged, it
     holds no cell that ``allowed`` forbids, and it is at most ``max_size`` cells
     long on each axis. Otherwise it is cut: at a gap in the tagged cells (a
-    row or column without tags; a cell in 1D), else where the number of tagged
+    row, column or plane without tags; a cell in 1D), else where the number of tagged
     cells per row or column bends most (a zero crossing of its second
     difference), else in the middle of its longest side. Each part shrinks to
-    the tagged cells in it. In 1D the boxes are intervals.
+    the tagged cells in it. In 1D the boxes are intervals, in 3D boxes.
 
     Args:
-        tags: Booleans, one per cell: a 1D or 2D array.
+        tags: Booleans, one per cell: a 1D, 2D or 3D array.
         efficiency: The smallest fraction of tagged cells in a box, in (0, 1].
         max_size: The longest side of a box, in cells; default: no limit.
         allowed: Booleans of the shape of ``tags``: where boxes may go.
@@ -388,12 +388,13 @@ def cluster(
             allowed region is narrower).
 
     Returns:
-        Half-open boxes ``((i0, i1),)`` or ``((i0, i1), (j0, j1))`` that do not
-        overlap and cover every allowed tagged cell.
+        Half-open boxes ``((i0, i1),)``, ``((i0, i1), (j0, j1))`` or
+        ``((i0, i1), (j0, j1), (k0, k1))`` that do not overlap and cover every
+        allowed tagged cell.
     """
     tags = np.asarray(tags, dtype=bool)
-    if tags.ndim not in (1, 2):
-        raise ValueError("tags must be a 1D or 2D array")
+    if tags.ndim not in (1, 2, 3):
+        raise ValueError("tags must be a 1D, 2D or 3D array")
     if not 0.0 < efficiency <= 1.0:
         raise ValueError(f"efficiency must be in (0, 1], got {efficiency}")
     if max_size is not None and max_size < 1:

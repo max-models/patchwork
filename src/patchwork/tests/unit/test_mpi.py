@@ -47,6 +47,7 @@ def test_patches_on_some_ranks_give_what_one_rank_gives(ranks: int) -> None:
         "test_markers.py",
         "test_reflux.py",
         "test_line_patches.py",
+        "test_3d.py",
     ],
 )
 def test_halos_and_regridding_under_mpi(tests: str, ranks: int) -> None:

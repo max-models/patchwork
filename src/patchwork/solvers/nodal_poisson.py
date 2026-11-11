@@ -534,11 +534,12 @@ class NodalPoisson:
                 values[on_face] = _evaluate(condition.value, *coordinates[:, on_face])
                 decided[on_face] = True
             else:
-                # the gradient at the middle of every boundary edge, shared by its ends
-                first, second, length, midpoint = nodes.face_edges(face)
-                through = 0.5 * length * _evaluate(condition.gradient, *midpoint.T)
-                np.add.at(flux, first, through)
-                np.add.at(flux, second, through)
+                # the gradient at the middle of every boundary piece (an edge in
+                # 2D, a face in 3D), shared equally by its corners
+                corners, measure, midpoint = nodes.face_pieces(face)
+                share = corners.shape[1]
+                through = measure * _evaluate(condition.gradient, *midpoint.T) / share
+                np.add.at(flux, corners.reshape(-1), np.repeat(through, share))
         body_values = np.array([body.value for body in self._embedded] or [0.0])
         solid = self._owner >= 0
         values[solid] = body_values[self._owner[solid]]
