@@ -17,9 +17,17 @@ from typing import Any
 import numpy as np
 from methodcard import method
 
-#: The faces of the domain's bounding rectangle, as ``(axis, side)`` with side 0
-#: the lower one. A 1D domain has the two ``x`` faces (see `faces_of`).
-FACES = {"x_lower": (0, 0), "x_upper": (0, 1), "y_lower": (1, 0), "y_upper": (1, 1)}
+#: The faces of the domain's bounding box, as ``(axis, side)`` with side 0 the
+#: lower one. A 1D domain has the two ``x`` faces, a 2D one also the ``y`` faces
+#: (see `faces_of`).
+FACES = {
+    "x_lower": (0, 0),
+    "x_upper": (0, 1),
+    "y_lower": (1, 0),
+    "y_upper": (1, 1),
+    "z_lower": (2, 0),
+    "z_upper": (2, 1),
+}
 
 
 def faces_of(ndim: int) -> dict[str, tuple[int, int]]:
@@ -36,7 +44,7 @@ Value = float | Callable[..., Any]
 
 @dataclass(frozen=True)
 class Dirichlet:
-    """A prescribed potential on a domain face: a number, ``value(x)`` in 1D or ``value(x, y)``."""
+    """A prescribed potential on a domain face: a number or ``value(x, ...)``, one array per axis."""
 
     value: Value = 0.0
 

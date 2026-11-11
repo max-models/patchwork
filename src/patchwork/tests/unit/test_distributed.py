@@ -153,6 +153,22 @@ def test_the_distributed_solve_gives_what_one_rank_gives(ranks: int) -> None:
     assert "MPI_JOB_OK" in result.stdout, result.stdout[-2000:] + result.stderr[-2000:]
 
 
+@pytest.mark.parametrize("periodic", [(False, False, False), (True, False, True)])
+def test_boomeramg_in_3d_gives_what_superlu_gives(periodic) -> None:
+    mesh = AMRHierarchy(base_shape=(12, 12, 12), periodic=periodic)
+    mesh.add_patch(level=1, box=((6, 18), (4, 16), (8, 20)))
+    mesh.add_patch(level=2, box=((14, 30), (12, 28), (18, 34)))
+    faces = {"y_lower": Neumann(0.3), "y_upper": Dirichlet(lambda x, y, z: x + y * z)}
+    if not periodic[0]:
+        faces["x_lower"] = Dirichlet(1.0)
+    direct = NodalPoisson(mesh, faces=faces)
+    iterative = NodalPoisson(mesh, faces=faces, nodes=direct.nodes, backend="petsc")
+    x, y, z = direct.nodes.coordinates.T
+    rhs = np.exp(-((x - 0.4) ** 2 + (y - 0.55) ** 2 + (z - 0.5) ** 2) / 0.02)
+    assert np.abs(iterative.solve(rhs) - direct.solve(rhs)).max() < 1e-8
+    assert iterative.solver.iterations < 30
+
+
 @pytest.mark.parametrize("periodic", [False, True])
 def test_petsc_on_a_line_gives_what_superlu_gives(periodic: bool) -> None:
     mesh = AMRHierarchy(base_shape=(16,), periodic=(periodic,))

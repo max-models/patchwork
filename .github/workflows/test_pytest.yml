@@ -83,7 +83,7 @@ jobs:
           OMPI_MCA_osc: ^ucx
         run: |
           python -c "from petsc4py import PETSc; print(PETSc.Sys.getVersion())"
-          python -m pytest -ra src/patchwork/tests/unit/test_distributed.py src/patchwork/tests/unit/test_mpi.py
+          python -m pytest -ra src/patchwork/tests/unit/test_distributed.py src/patchwork/tests/unit/test_mpi.py src/patchwork/tests/unit/test_curl_curl.py
 
   # PyPI rejects a release whose metadata has a direct reference (name @ git+...), so a pull
   # request to main fails here instead of the release after the merge.

@@ -1,7 +1,8 @@
 """The solver layer: operators assembled on the spaces and their linear solves.
 
 `nodal_poisson` (`NodalPoisson` on the node space), `cell_operator`
-(`CellOperator` on the cell space), `backends` (the linear solvers behind them:
+(`CellOperator` on the cell space), `curl_curl` (`CurlCurl` on the edge space,
+with hypre's AMS), `backends` (the linear solvers behind them:
 LU, PETSc, FFT), `distributed` (the PETSc system distributed by rows) and
 `poisson` (the legacy cell-centred Poisson solve).
 """
@@ -15,6 +16,7 @@ from patchwork.solvers.backends import (
     PetscBackend,
 )
 from patchwork.solvers.cell_operator import CellOperator
+from patchwork.solvers.curl_curl import CurlCurl
 from patchwork.solvers.distributed import PetscSystem
 from patchwork.solvers.nodal_poisson import NodalPoisson, solve_nodal_poisson
 from patchwork.solvers.poisson import solve_poisson
@@ -23,6 +25,7 @@ __all__ = [
     "AutoBackend",
     "Backend",
     "CellOperator",
+    "CurlCurl",
     "FFTBackend",
     "LUBackend",
     "LinearSystem",

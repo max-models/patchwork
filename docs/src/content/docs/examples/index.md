@@ -21,6 +21,8 @@ Step by step, from a first hierarchy to stencils on patches:
 6. [Regridding](/patchwork/examples/06-regridding/): tagging cells, clustering them into
    patches, and patches that follow a moving feature.
 7. [Edge space](/patchwork/examples/07-edge-space/): the electric-field space on the edges of the leaf cells.
+8. [Three dimensions](/patchwork/examples/08-three-dimensions/): a refined box, the nodal
+   Poisson, the face space and the exact sequence, and the curl–curl equation with AMS.
 
 Every notebook in `tutorials/` is executed when the site is built and published here with its
 outputs. Download a notebook from its page to run the steps yourself.

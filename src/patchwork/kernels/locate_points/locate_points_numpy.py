@@ -27,7 +27,7 @@ def locate_points(
     count = points.shape[1]
     inside = np.ones(count, dtype=bool)
     fine = []
-    for axis in range(2):
+    for axis in range(3):
         values = points[axis].astype(float, copy=True)
         low, high = lower[axis], upper[axis]
         if periodic[axis]:
@@ -37,7 +37,7 @@ def locate_points(
             values[out] = low + (shifted - length * (shifted // length))
         wrapped[axis] = values
         inside &= (values >= low) & (values <= high)  # False for NaN
-    for axis in range(2):
+    for axis in range(3):
         index = np.zeros(count, dtype=np.int64)
         index[inside] = (
             (wrapped[axis, inside] - lower[axis]) / finest_spacing[axis]
@@ -49,18 +49,19 @@ def locate_points(
         pending = np.flatnonzero(inside & (found < 0))
         if pending.size == 0:
             break
-        index = [fine[axis][pending] // span[level] for axis in range(2)]
-        offset = [index[axis] - table_corner[level, axis] for axis in range(2)]
+        index = [fine[axis][pending] // span[level] for axis in range(3)]
+        offset = [index[axis] - table_corner[level, axis] for axis in range(3)]
         within = np.ones(pending.size, dtype=bool)
-        for axis in range(2):
+        for axis in range(3):
             within &= (offset[axis] >= 0) & (offset[axis] < table_shape[level, axis])
         owner = np.full(pending.size, -1, dtype=np.int64)
         owner[within] = tables[
             table_offset[level]
-            + offset[0][within] * table_shape[level, 1]
-            + offset[1][within]
+            + (offset[0][within] * table_shape[level, 1] + offset[1][within])
+            * table_shape[level, 2]
+            + offset[2][within]
         ]
         hit = owner >= 0
         found[pending[hit]] = owner[hit]
-        for axis in range(2):
+        for axis in range(3):
             cell[axis, pending[hit]] = index[axis][hit]

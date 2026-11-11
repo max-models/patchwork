@@ -159,9 +159,9 @@ def test_a_uniform_mesh_has_two_edges_per_node_and_no_hanging_edges() -> None:
     np.testing.assert_array_equal(edges.cell_edges.shape, (256, 4))
 
 
-def test_the_edge_space_is_two_dimensional() -> None:
+def test_the_edge_space_is_two_or_three_dimensional() -> None:
     nodes = CompositeNodes(AMRHierarchy(base_shape=(8,)))
-    with pytest.raises(NotImplementedError, match="two-dimensional"):
+    with pytest.raises(NotImplementedError, match="two- or three-dimensional"):
         CompositeEdges(nodes)
 
 

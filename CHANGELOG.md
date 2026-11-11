@@ -7,6 +7,27 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Three dimensions. Hierarchies, `locate` (the kernels take three axes), clustering and
+  regridding, halos and restriction, `CompositeNodes` (a hanging node on a coarse edge or in a
+  coarse face takes the multilinear interpolant of the coarse cell's corners), the node deposit
+  and `NodalPoisson` (faces `z_lower` and `z_upper`; Dirichlet, Neumann and bodies) in 3D; the
+  boundary of a 3D mesh is made of quads (`CompositeNodes.face_pieces`). BoomerAMG through
+  `backend="petsc"` solves the 3D nodal Poisson. `CellOperator` stays 1D and 2D and says so.
+  Tests in `test_3d.py`, also under `mpirun`.
+- The edge space in 3D: twelve Whitney edges per cell, hanging edges on coarse edges and inside
+  coarse faces, the gather, the mass and the charge-conserving path deposit (Simpson's rule
+  along each piece).
+- The face space `CompositeFaces` (lowest-order Raviart–Thomas, 2D and 3D): fluxes through the
+  faces of the leaf cells, hanging faces, the divergence to the leaf cells, the curl from the
+  edges (3D; `cell_curl` in 2D), the face interpolant and the lumped or consistent face mass
+  (`spaces.mass.face_mass_blocks`). `C G = 0`, `D C = 0` and `C T1 = T2 C T1` hold exactly.
+  The mass matrices take a coefficient per leaf cell (`mass(lumped, weight=...)`).
+- `CurlCurl`: `curl(nu curl A) + beta A = J` on the edges of a 2D or 3D hierarchy, electric
+  or magnetic faces, lumped or consistent mass, an optional weak Coulomb gauge, solved by
+  SuperLU (also complex `beta`) or by conjugate gradients with hypre's AMS
+  (`solver="ams"`, rows split over the ranks; also the singular magnetostatic problem). The
+  PETSc CI job runs its tests. Tutorial "Three dimensions".
+
 - Lumped or consistent mass per space, from one set of per-cell blocks
   (`patchwork.spaces.mass`: `node_mass_blocks`, `edge_mass_blocks`, in any dimension):
   `CompositeNodes.mass(lumped=...)` (lumped: the control volumes; consistent: the Q1 mass),

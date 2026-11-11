@@ -160,59 +160,80 @@ class CompositeNodes:
         self.num_nodes = int(self._keys.size)
 
     def _find_hanging_nodes(self) -> None:
-        """Find the nodes inside coarser cells' edges and their interpolation.
+        """Find the nodes on coarser cells' edges and faces and their interpolation.
 
-        In 1D a cell's faces are nodes, and no node hangs.
+        A node on the boundary of a coarser leaf cell (not one of its corners)
+        hangs: it takes the multilinear interpolant of that cell's corners, from
+        the coarsest such cell. In 2D that is the linear interpolant along the
+        coarse edge; in 3D also the bilinear one on a coarse face. In 1D a
+        cell's faces are nodes, and no node hangs.
         """
         if self.ndim == 1:
             self.hanging = np.zeros(self.num_nodes, dtype=bool)
             self.reduction = sparse.csr_matrix(sparse.identity(self.num_nodes))
             return
+        ndim = self.ndim
+        corners = _corner_offsets(ndim)  # (2**ndim, ndim)
         slaves, masters, weights, spans = [], [], [], []
-        ll, lr, ul, ur = (self.cell_corners[:, k] for k in range(4))
         for span in np.unique(self.cell_span):
             if span == 1:
                 continue
+            span = int(span)
+            # the lattice points on the cell's boundary that are not its corners
+            grid = np.stack(
+                np.meshgrid(*([np.arange(span + 1)] * ndim), indexing="ij"), axis=-1
+            ).reshape(-1, ndim)
+            ends = (grid == 0) | (grid == span)
+            offsets = grid[ends.any(axis=1) & ~ends.all(axis=1)]
+            # the multilinear weight of every corner at every such point
+            fraction = offsets / span  # (p, ndim)
+            weight = np.prod(
+                np.where(
+                    corners[None, :, :] == 1,
+                    fraction[:, None, :],
+                    1.0 - fraction[:, None, :],
+                ),
+                axis=2,
+            )  # (p, 2**ndim)
             cells = np.nonzero(self.cell_span == span)[0]
-            x0, y0 = self.cell_lower[cells, 0], self.cell_lower[cells, 1]
-            for k in range(1, int(span)):
-                for i, j, first, second in (
-                    (x0 + k, y0, ll, lr),
-                    (x0 + k, y0 + span, ul, ur),
-                    (x0, y0 + k, ll, ul),
-                    (x0 + span, y0 + k, lr, ur),
-                ):
-                    node = self._lookup(i, j)
-                    found = node >= 0
-                    slaves.append(node[found])
-                    masters.append(
-                        np.column_stack((first[cells][found], second[cells][found]))
-                    )
-                    weights.append(np.full(int(found.sum()), k / span))
-                    spans.append(np.full(int(found.sum()), span))
+            lower = self.cell_lower[cells]
+            for offset, row in zip(offsets, weight, strict=True):
+                point = lower + offset
+                node = self._lookup(*(point[:, axis] for axis in range(ndim)))
+                found = node >= 0
+                slaves.append(node[found])
+                masters.append(self.cell_corners[cells[found]])
+                weights.append(np.broadcast_to(row, (int(found.sum()), row.size)))
+                spans.append(np.full(int(found.sum()), span))
         self.hanging = np.zeros(self.num_nodes, dtype=bool)
         identity = sparse.csr_matrix(sparse.identity(self.num_nodes))
         if not slaves or not sum(part.size for part in slaves):
             self.reduction = identity
             return
         slave = np.concatenate(slaves)
-        master = np.concatenate(masters)
-        weight = np.concatenate(weights)
+        master = np.concatenate(masters)  # (k, 2**ndim)
+        weight = np.concatenate(weights)  # (k, 2**ndim)
         span = np.concatenate(spans)
-        # one constraint per node, from the coarsest edge it lies in
+        # one constraint per node, from the coarsest cell on whose boundary it lies
         order = np.lexsort((-span, slave))
         slave, master, weight = slave[order], master[order], weight[order]
         first = np.concatenate(([True], slave[1:] != slave[:-1]))
         slave, master, weight = slave[first], master[first], weight[first]
         self.hanging[slave] = True
         free = np.nonzero(~self.hanging)[0]
+        nonzero = weight != 0.0
         reduction = sparse.csr_matrix(
             sparse.coo_matrix(
                 (
-                    np.concatenate((np.ones(free.size), 1.0 - weight, weight)),
+                    np.concatenate((np.ones(free.size), weight[nonzero])),
                     (
-                        np.concatenate((free, slave, slave)),
-                        np.concatenate((free, master[:, 0], master[:, 1])),
+                        np.concatenate(
+                            (
+                                free,
+                                np.broadcast_to(slave[:, None], weight.shape)[nonzero],
+                            )
+                        ),
+                        np.concatenate((free, master[nonzero])),
                     ),
                 ),
                 shape=(self.num_nodes, self.num_nodes),
@@ -251,16 +272,16 @@ class CompositeNodes:
 
     # The boundary ----------------------------------------------------------------#
     def _find_boundary(self) -> None:
-        """Find the cell edges on the boundary of the domain and name their face.
+        """Find the sides of leaf cells on the boundary of the domain and name their face.
 
-        An edge of a leaf cell is on the boundary if there is no cell beyond
-        it: on a face of the bounding rectangle (``"x_lower"``, ...), or inside
-        the rectangle where the domain does not fill it (``"inner"``). In 1D
-        the "edge" is the cell's end node, of measure 1 (per unit area).
+        A side of a leaf cell (an edge in 2D, a face in 3D) is on the boundary if
+        there is no cell beyond it: on a face of the bounding box (``"x_lower"``,
+        ...), or inside the box where the domain does not fill it (``"inner"``).
+        In 1D the side is the cell's end node, of measure 1 (per unit area).
         """
         leaf = self._leaf_cells()
         faces = faces_of(self.ndim)
-        edges = {face: ([], [], [], []) for face in (*faces, INNER)}
+        edges = {face: ([], [], []) for face in (*faces, INNER)}
         offsets = _corner_offsets(self.ndim)
         centre = self.cell_lower + 0.5 * self.cell_span[:, None]
         for face, (axis, side) in faces.items():
@@ -274,27 +295,27 @@ class CompositeNodes:
             outside = at_rectangle | (leaf[tuple(where)] < 0)
             midpoint = centre.copy()
             midpoint[:, axis] += (0.5 if side else -0.5) * self.cell_span
-            # the corners on that side of a cell: its two ends (lower-left
-            # first), one node twice in 1D
+            # the corners on that side of a cell, the lowest first: its two ends
+            # in 2D (one node twice in 1D), the four corners of a face in 3D
             on_side = np.flatnonzero(offsets[:, axis] == side)
-            first, second = on_side[0], on_side[-1]
+            if self.ndim == 1:
+                on_side = np.repeat(on_side, 2)
             measure = np.prod(np.delete(self.cell_size, axis, axis=1), axis=1)
             for name, cells in (
                 (face, np.nonzero(outside & at_rectangle)[0]),
                 (INNER, np.nonzero(outside & ~at_rectangle)[0]),
             ):
-                edges[name][0].append(self.cell_corners[cells, first])
-                edges[name][1].append(self.cell_corners[cells, second])
-                edges[name][2].append(measure[cells])
-                edges[name][3].append(self._origin + midpoint[cells] * self._spacing)
+                edges[name][0].append(self.cell_corners[cells][:, on_side])
+                edges[name][1].append(measure[cells])
+                edges[name][2].append(self._origin + midpoint[cells] * self._spacing)
+        width = max(2, 2 ** (self.ndim - 1))
         self._boundary = {
             face: (
-                np.concatenate(first),
-                np.concatenate(second),
-                np.concatenate(length),
-                np.concatenate(midpoint),
+                np.concatenate(corners).reshape(-1, width),
+                np.concatenate(measure),
+                np.concatenate(midpoint).reshape(-1, self.ndim),
             )
-            for face, (first, second, length, midpoint) in edges.items()
+            for face, (corners, measure, midpoint) in edges.items()
         }
 
     @sp.profile("patchwork.composite_nodes", tags=PROFILE_TAGS)
@@ -458,31 +479,47 @@ class CompositeNodes:
             values[nodes] = data[index]
         return values
 
-    def face_edges(
-        self, face: str
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """The cell edges on a part of the boundary.
+    def face_pieces(self, face: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The sides of leaf cells on a part of the boundary.
 
-        ``face`` is a face of the bounding rectangle (``"x_lower"``, ...) or
-        ``"inner"``. Returns the two end nodes of every edge, its length and its
-        midpoint ``(k, ndim)``. In 1D an edge is a node: both ends are that
-        node and its length is 1.
+        ``face`` is a face of the bounding box (``"x_lower"``, ...) or
+        ``"inner"``. Returns the corner nodes of every piece, ``(k, 2**(ndim-1))``
+        (in 1D the node twice), its measure (length in 2D, area in 3D, 1 in 1D)
+        and its midpoint ``(k, ndim)``.
         """
         return self._boundary[face]
 
+    def face_edges(
+        self, face: str
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """The cell edges on a part of the boundary of a 1D or 2D mesh.
+
+        Returns the two end nodes of every edge, its length and its midpoint
+        ``(k, ndim)``. In 1D an edge is a node: both ends are that node and its
+        length is 1. In 3D the boundary is made of faces: see `face_pieces`.
+        """
+        if self.ndim == 3:
+            raise ValueError("a 3D boundary is made of faces: use face_pieces")
+        corners, measure, midpoint = self._boundary[face]
+        return corners[:, 0], corners[:, -1], measure, midpoint
+
     def face_nodes(self, face: str) -> np.ndarray:
-        """Node numbers of the nodes on a part of the boundary (see `face_edges`)."""
-        first, second, _, _ = self._boundary[face]
-        return np.unique(np.concatenate((first, second)))
+        """Node numbers of the nodes on a part of the boundary (see `face_pieces`)."""
+        return np.unique(self._boundary[face][0])
 
     def face_measure(self, face: str) -> np.ndarray:
-        """Length of a part of the boundary that belongs to every node: zero away from it."""
-        first, second, length, _ = self._boundary[face]
-        measure = np.zeros(self.num_nodes)
-        # the two ends of an edge share it
-        np.add.at(measure, first, 0.5 * length)
-        np.add.at(measure, second, 0.5 * length)
-        return measure
+        """Measure of a part of the boundary that belongs to every node: zero away from it.
+
+        Each piece's measure is shared equally by its corners.
+        """
+        corners, measure, _ = self._boundary[face]
+        share = np.zeros(self.num_nodes)
+        np.add.at(
+            share,
+            corners.reshape(-1),
+            np.repeat(measure / corners.shape[1], corners.shape[1]),
+        )
+        return share
 
     # Mass ------------------------------------------------------------------------#
     @method(
@@ -496,17 +533,23 @@ class CompositeNodes:
         ),
         components=("patchwork.spaces.mass.node_mass_blocks",),
     )
-    def mass(self, lumped: bool = True) -> sparse.csr_matrix:
+    def mass(
+        self, lumped: bool = True, weight: np.ndarray | float | None = None
+    ) -> sparse.csr_matrix:
         """The node mass matrix ``M0``: ``u^T M0 u`` is the integral of ``u_h**2``.
 
         ``u_h`` is the (bi)linear interpolant of the node values in every leaf
         cell. ``lumped`` takes the vertex quadrature: ``diag(volumes)``, the
         control volumes of the finite-difference scheme; otherwise the exact
         (consistent) Q1 mass. For values on the free nodes, use ``T^T M0 T``.
+        ``weight`` is a coefficient per leaf cell (a number or an array).
         """
-        if lumped:
+        if lumped and weight is None:
             return sparse.csr_matrix(sparse.diags(self.volumes))
-        blocks = node_mass_blocks(self.cell_size, lumped=False)
+        blocks = node_mass_blocks(self.cell_size, lumped=lumped)
+        if weight is not None:
+            weight = np.broadcast_to(np.asarray(weight), blocks.shape[:1])
+            blocks = blocks * weight[:, None, None]
         return scatter_blocks(
             blocks,
             self.cell_corners,

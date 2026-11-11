@@ -100,6 +100,28 @@ def edge_mass_blocks(size: np.ndarray, axis: int, lumped: bool) -> np.ndarray:
     return scale[:, None, None] * factor
 
 
+@method(
+    equations={
+        "faces": r"M_{2,K}^{(a)} = \frac{h_a}{\prod_{i \ne a} h_i}\, m",
+        "lumped_faces": r"M_{2,K}^{(a)} = \frac{h_a}{2 \prod_{i \ne a} h_i}\,I",
+    },
+    assumptions=(
+        "a face value is the flux through it (Raviart–Thomas faces): the normal component varies linearly between the cell's two faces normal to the axis",
+        "a tensor-product (box) cell; Cartesian measure",
+    ),
+)
+def face_mass_blocks(size: np.ndarray, axis: int, lumped: bool) -> np.ndarray:
+    """The mass block of every cell's two faces normal to ``axis``, ``(m, 2, 2)``.
+
+    Lower face first. ``f^T M f`` over a cell is the integral of the square of
+    the face interpolant's component along ``axis``; lumped,
+    ``h_axis / (2 prod(h_perp))`` on the diagonal.
+    """
+    size = np.asarray(size, dtype=float)
+    scale = size[:, axis] / np.prod(np.delete(size, axis, axis=1), axis=1)
+    return scale[:, None, None] * (_LUMPED if lumped else _CONSISTENT)[None]
+
+
 def scatter_blocks(
     blocks: np.ndarray, rows: np.ndarray, columns: np.ndarray, shape: tuple[int, int]
 ):
