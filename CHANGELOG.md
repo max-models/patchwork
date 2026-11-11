@@ -7,6 +7,17 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- A variable coefficient for `NodalPoisson`: `-div(K grad phi)` with `K` per leaf cell (a
+  number, a diagonal or a symmetric tensor, whose off-diagonal entries couple the edges of
+  different axes) or per edge (`edge_coefficient`, e.g. a deposited susceptibility), lumped or
+  consistent, in 1D, 2D and 3D; `set_coefficient` reassembles it for a new coefficient
+  (`spaces.mass.stiffness_blocks`, `edge_cross_blocks`). `CompositeNodes.cell_centers`.
+- `backend="multigrid"` (`MultigridBackend`, `CompositeMultigrid`): geometric multigrid over
+  the patches. The levels are the hierarchy without its finest levels, then its base level
+  coarsened by two; Galerkin operators, Chebyshev/Jacobi smoothing, CG (GMRES with bodies),
+  also the singular operators. 8-12 iterations independent of the refinement levels and the
+  cell count with a variable tensor coefficient; `set_coefficient` keeps the interpolations,
+  and one V-cycle is a preconditioner on its own. Tutorial "Variable coefficients".
 - Three dimensions. Hierarchies, `locate` (the kernels take three axes), clustering and
   regridding, halos and restriction, `CompositeNodes` (a hanging node on a coarse edge or in a
   coarse face takes the multilinear interpolant of the coarse cell's corners), the node deposit

@@ -20,6 +20,10 @@ give the same answer to round-off (or to the tolerance of an iterative one).
   both of its faces. Also the singular operators: all axes periodic or Neumann.
 - ``"auto"`` (`AutoBackend`): the tridiagonal LU on a line, the FFT
   where it applies, the LU elsewhere.
+- ``"multigrid"`` (`patchwork.solvers.multigrid.MultigridBackend`): geometric
+  multigrid over the refinement levels and a coarsened base level, preconditioning
+  CG, on every rank. Any mesh and conditions, also the singular operators;
+  the preconditioner of a variable-coefficient operator (`NodalPoisson.set_coefficient`).
 
 A backend states what it cannot solve (`Backend.unsupported`), and the
 solve refuses such a system with that reason. A new backend subclasses

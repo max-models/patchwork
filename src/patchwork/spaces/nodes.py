@@ -101,6 +101,9 @@ class CompositeNodes:
             upper-left, upper-right in 2D.
         cell_span: Edge length of every leaf cell on the finest lattice.
         cell_lower: Finest-lattice coordinates of the lower (lower-left) corners.
+        cell_size: Physical edge lengths of every leaf cell, ``(m, ndim)``.
+        cell_centers: Physical coordinates of the centre of every leaf cell,
+            ``(m, ndim)``: where a coefficient per leaf cell is evaluated.
         cell_ranks: The rank of the hierarchy's communicator that holds every
             leaf cell: one of its patch's ranks, the rows of a patch on several
             ranks split over them as its arrays are.
@@ -383,6 +386,7 @@ class CompositeNodes:
             self.cell_span[:, None] * self._spacing
         )  # (m, ndim) physical edge lengths
         self.cell_size = size
+        self.cell_centers = self._origin + self.cell_lower * self._spacing + size / 2
         self.node_ranks = np.full(self.num_nodes, np.iinfo(np.int64).max)
         np.minimum.at(
             self.node_ranks,

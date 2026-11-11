@@ -102,6 +102,47 @@ def edge_mass_blocks(size: np.ndarray, axis: int, lumped: bool) -> np.ndarray:
 
 @method(
     equations={
+        "cross": r"M_{1,K}^{(a,b)} = \frac{|K|}{h_a h_b}\,\frac14 \bigotimes_{i \ne a, b} m \quad (a \ne b)",
+    },
+    assumptions=(
+        "an edge value is the line integral of the field along it (Whitney edges)",
+        r"the same for the lumped and the consistent mass along $a$ and $b$: the vertex quadrature of a product of a hat and a constant is exact",
+        "a tensor-product (box) cell; Cartesian measure",
+    ),
+)
+def edge_cross_blocks(
+    size: np.ndarray, axis_a: int, axis_b: int, lumped: bool
+) -> np.ndarray:
+    """The coupling of every cell's edges along two different axes, ``(m, 2**(d-1), 2**(d-1))``.
+
+    Rows are the edges along ``axis_a``, columns those along ``axis_b``, each
+    in the order of `edge_corners`. ``e_a^T B e_b`` over a cell is the
+    integral of the product of the edge interpolant's components along the two
+    axes: what an off-diagonal coefficient ``K_ab`` multiplies in
+    ``int E . K E``. The edge along ``a`` is a hat across ``b`` and constant
+    along ``a``, the edge along ``b`` the reverse, so each of the two axes
+    gives a factor ``1/2``; a third axis gives the 1D block ``m`` (lumped or
+    consistent).
+    """
+    if axis_a == axis_b:
+        raise ValueError("the cross block couples two different axes")
+    size = np.asarray(size, dtype=float)
+    ndim = size.shape[1]
+    bits = corner_bits(ndim)
+    bits_a = bits[[start for start, _ in edge_corners(ndim, axis_a)]]
+    bits_b = bits[[start for start, _ in edge_corners(ndim, axis_b)]]
+    factor = np.full((bits_a.shape[0], bits_b.shape[0]), 0.25)
+    for other in range(ndim):
+        if other not in (axis_a, axis_b):
+            factor = factor * _hats(
+                lumped, bits_a[:, None, other], bits_b[None, :, other]
+            )
+    scale = np.prod(size, axis=1) / (size[:, axis_a] * size[:, axis_b])
+    return scale[:, None, None] * factor
+
+
+@method(
+    equations={
         "faces": r"M_{2,K}^{(a)} = \frac{h_a}{\prod_{i \ne a} h_i}\, m",
         "lumped_faces": r"M_{2,K}^{(a)} = \frac{h_a}{2 \prod_{i \ne a} h_i}\,I",
     },
@@ -141,3 +182,71 @@ def scatter_blocks(
             (blocks.reshape(-1)[keep], (row[keep], column[keep])), shape=shape
         )
     )
+
+
+def _cell_gradient(ndim: int, axis: int) -> np.ndarray:
+    """The differences of a cell's corners along its edges on ``axis``, ``(2**(d-1), 2**d)``."""
+    pairs = edge_corners(ndim, axis)
+    result = np.zeros((len(pairs), 2**ndim))
+    for k, (start, end) in enumerate(pairs):
+        result[k, start] = -1.0
+        result[k, end] = 1.0
+    return result
+
+
+@method(
+    equations={
+        "stiffness": r"S_K = \sum_{a, b} D_a^\top \big(K_{ab}\, M_{1,K}^{(a,b)}\big) D_b, \qquad M_{1,K}^{(a,a)} = M_{1,K}^{(a)}",
+        "edges": r"M_{1,K}^{(a,b)} \to \mathrm{diag}(\sqrt{\kappa_a})\, M_{1,K}^{(a,b)}\, \mathrm{diag}(\sqrt{\kappa_b}) \quad \text{(a coefficient per edge)}",
+        "energy": r"u^\top S_K u = \int_K \nabla u \cdot \mathsf{K}\, \nabla u \, dA \quad \text{(consistent mass, constant } \mathsf{K}\text{)}",
+    },
+    assumptions=(
+        r"$D_a$ the corner differences along the cell's edges on axis $a$ (the local discrete gradient)",
+        r"a symmetric coefficient $\mathsf{K}$ per cell; with the lumped mass the vertex quadrature of $\int \nabla u \cdot \mathsf{K} \nabla u$, positive for a positive definite $\mathsf{K}$",
+        r"a coefficient per edge $\kappa \geq 0$ scales the edge's rows and columns by $\sqrt{\kappa}$: on the lumped (diagonal) blocks the edge's conductance times $\kappa$",
+    ),
+    components=(
+        "patchwork.spaces.mass.edge_mass_blocks",
+        "patchwork.spaces.mass.edge_cross_blocks",
+    ),
+)
+def stiffness_blocks(
+    size: np.ndarray,
+    lumped: bool,
+    tensor: np.ndarray | None = None,
+    edge_scale: np.ndarray | None = None,
+) -> np.ndarray:
+    """The nodal stiffness block ``G^T M1(K) G`` of every cell, ``(m, 2**d, 2**d)``.
+
+    ``size`` holds the cells' edge lengths ``(m, d)``. ``tensor`` is a
+    symmetric coefficient per cell ``(m, d, d)`` (none: the identity), which
+    weights the edge mass blocks along each axis and couples the edges of
+    different axes (`edge_cross_blocks`). ``edge_scale`` ``(m, d 2**(d-1))``
+    holds the square roots of a coefficient per edge of each cell, the edges
+    along the first axis first, each axis's in the order of `edge_corners`.
+    With neither, the lumped blocks give the five-point (seven-point in 3D)
+    stencil and the consistent ones the Q1 stiffness.
+    """
+    size = np.asarray(size, dtype=float)
+    count, ndim = size.shape
+    per_axis = 2 ** (ndim - 1)
+    gradients = [_cell_gradient(ndim, axis) for axis in range(ndim)]
+    result = np.zeros((count, 2**ndim, 2**ndim))
+    for a in range(ndim):
+        for b in range(ndim):
+            if a == b:
+                block = edge_mass_blocks(size, a, lumped)
+            elif tensor is None:
+                continue
+            else:
+                block = edge_cross_blocks(size, a, b, lumped)
+            if tensor is not None:
+                block = block * tensor[:, a, b, None, None]
+            if edge_scale is not None:
+                block = (
+                    block
+                    * edge_scale[:, a * per_axis : (a + 1) * per_axis, None]
+                    * edge_scale[:, None, b * per_axis : (b + 1) * per_axis]
+                )
+            result += np.einsum("ki,mkl,lj->mij", gradients[a], block, gradients[b])
+    return result
