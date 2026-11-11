@@ -12,7 +12,7 @@ import pytest
 from maybempi import MPI
 
 from patchwork import AMRHierarchy, cluster, function_tags, gradient_tags
-from patchwork.nodal import CompositeNodes
+from patchwork.spaces.nodes import CompositeNodes
 
 WORLD = MPI.COMM_WORLD
 SIZE = WORLD.Get_size()

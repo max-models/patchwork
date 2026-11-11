@@ -18,7 +18,7 @@ from patchwork import (
     NodalPoisson,
     PetscBackend,
 )
-from patchwork.backends import FFTSolver, TridiagonalLU, backend_of
+from patchwork.solvers.backends import FFTSolver, TridiagonalLU, backend_of
 
 
 def _mesh(shape, periodic=None) -> AMRHierarchy:

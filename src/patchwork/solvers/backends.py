@@ -40,7 +40,8 @@ import scipy.sparse.linalg
 from methodcard import method
 
 if TYPE_CHECKING:
-    from patchwork.nodal import CompositeNodes, Dirichlet, Neumann
+    from patchwork.spaces.boundaries import Dirichlet, Neumann
+    from patchwork.spaces.nodes import CompositeNodes
 
 
 class Solver(Protocol):
@@ -68,6 +69,8 @@ class LinearSystem:
             body): the operator then has the constants as its null space.
         symmetric: Whether the matrix is symmetric.
         comm: The communicator of the hierarchy.
+        mass: The mass the operator was assembled with: ``"lumped"`` (the
+            finite-difference stencil) or ``"consistent"`` (the Q1 elements).
     """
 
     matrix: sparse.csr_matrix
@@ -79,6 +82,7 @@ class LinearSystem:
     singular: bool
     symmetric: bool
     comm: Any
+    mass: str = "lumped"
 
 
 class Backend:
@@ -220,7 +224,7 @@ class PetscBackend(Backend):
 
     def setup(self, system: LinearSystem) -> Solver:
         """Build the distributed matrix and the Krylov solver."""
-        from patchwork.distributed import PetscSystem
+        from patchwork.solvers.distributed import PetscSystem
 
         return PetscSystem(
             system.matrix,
@@ -238,7 +242,7 @@ class PetscBackend(Backend):
 
 def _axis_kind(system: LinearSystem, axis: int) -> str | None:
     """``"periodic"``, ``"dirichlet"`` or ``"neumann"``; ``None`` for mixed faces."""
-    from patchwork.nodal import FACES, Dirichlet
+    from patchwork.spaces.boundaries import FACES, Dirichlet
 
     hierarchy = system.nodes.hierarchy
     if hierarchy.periodic[axis]:
@@ -391,6 +395,10 @@ class FFTBackend(Backend):
         hierarchy = nodes.hierarchy
         if system.bodies:
             return "the 'fft' backend takes no embedded bodies"
+        if system.mass != "lumped" and nodes.ndim > 1:
+            return (
+                "the 'fft' backend diagonalizes the lumped (finite-difference) stencil"
+            )
         if hierarchy.max_level > 0:
             return "the 'fft' backend needs a uniform mesh: one level, no patches"
         if nodes.cell_span.size != int(np.prod(hierarchy.level_shape(0))):

@@ -329,7 +329,7 @@ hold the patches involved or not.
 - Launch with `mpirun -n 4 python script.py` after `pip install patchwork-amr[mpi]`, and
   profile the regions `patchwork.exchange_halos`, `patchwork.restrict`,
   `patchwork.build_schedule`, `patchwork.migrate`, `patchwork.deposit`,
-  `patchwork.accumulate_halos`, `patchwork.regrid` and `patchwork.regrid_transfer` with
+  `patchwork.accumulate_halos`, `patchwork.mesh.regrid` and `patchwork.regrid_transfer` with
   scope-profiler (`--enable-tag patchwork`).
 
 The figures of this page are drawn by `docs/mpi_figures.py` (`make docs-figures`); the cell

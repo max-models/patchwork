@@ -30,7 +30,7 @@ import numpy as np
 from methodcard import ConvergenceProblem, method
 
 if TYPE_CHECKING:
-    from patchwork.mesh import AMRHierarchy, Patch
+    from patchwork.mesh.hierarchy import AMRHierarchy, Patch
 
 Box = tuple[tuple[int, int], ...]
 
@@ -417,7 +417,7 @@ def apply_interpolations(interpolations: list) -> None:
 
 def _halo_problem() -> ConvergenceProblem:
     """A smooth cell field interpolated into the halo of a level-1 patch, maximum norm."""
-    from patchwork.mesh import AMRHierarchy
+    from patchwork.mesh.hierarchy import AMRHierarchy
 
     def function(x: np.ndarray, y: np.ndarray) -> np.ndarray:
         return np.sin(np.pi * x) * np.cos(1.3 * y)

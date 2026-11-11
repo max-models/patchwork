@@ -31,7 +31,7 @@ import numpy as np
 from methodcard import method
 
 if TYPE_CHECKING:
-    from patchwork.mesh import AMRHierarchy
+    from patchwork.mesh.hierarchy import AMRHierarchy
 
 
 @method(
@@ -87,7 +87,7 @@ class Accumulation:
                 axes.append(index % lattice[axis] if periodic[axis] else index)
             table[np.ix_(*axes)] = number
 
-        from patchwork.mesh import _gather_blocks
+        from patchwork.mesh.hierarchy import _gather_blocks
 
         blocks = hierarchy._schedule("blocks", name, _gather_blocks)
         # per local patch: the storage of the nodes that move, and where each goes

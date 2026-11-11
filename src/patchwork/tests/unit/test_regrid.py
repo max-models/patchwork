@@ -11,7 +11,7 @@ import pytest
 from maybempi import MPI
 
 from patchwork import AMRHierarchy, cluster, function_tags, gradient_tags
-from patchwork.regrid import _domain_cells, _shrink
+from patchwork.mesh.regrid import _domain_cells, _shrink
 
 WORLD = MPI.COMM_WORLD
 SIZE = WORLD.Get_size()
@@ -221,7 +221,7 @@ def test_gradient_tags_find_a_step_on_every_rank() -> None:
 
     fill(mesh, step)
     tags = gradient_tags(mesh, "c", 0.5)
-    from patchwork.regrid import combine_tags
+    from patchwork.mesh.regrid import combine_tags
 
     combined = combine_tags(mesh, tags)
     # level-1 cells of 1/64: the jump is between cells 32 and 33, both tagged

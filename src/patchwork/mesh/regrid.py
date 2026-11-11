@@ -32,7 +32,7 @@ from maybempi import MPI
 from methodcard import method
 
 from patchwork._profiling import PROFILE_TAGS
-from patchwork.halos import (
+from patchwork.mesh.halos import (
     _overlap,
     _Points,
     _shift,
@@ -44,7 +44,7 @@ from patchwork.halos import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
-    from patchwork.mesh import AMRHierarchy, IndexBox
+    from patchwork.mesh.hierarchy import AMRHierarchy, IndexBox
 
 Box = tuple[tuple[int, int], ...]
 

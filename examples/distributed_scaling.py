@@ -26,7 +26,7 @@ import numpy as np  # noqa: E402
 from maybempi import MPI  # noqa: E402
 
 from patchwork import AMRHierarchy, CompositeNodes, NodalPoisson  # noqa: E402
-from patchwork.distributed import petsc  # noqa: E402
+from patchwork.solvers.distributed import petsc  # noqa: E402
 
 WORLD = MPI.COMM_WORLD
 SIZE = WORLD.Get_size()

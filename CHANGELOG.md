@@ -7,6 +7,17 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Lumped or consistent mass per space, from one set of per-cell blocks
+  (`patchwork.spaces.mass`: `node_mass_blocks`, `edge_mass_blocks`, in any dimension):
+  `CompositeNodes.mass(lumped=...)` (lumped: the control volumes; consistent: the Q1 mass),
+  `CompositeEdges.mass` now assembled from the same blocks, and
+  `NodalPoisson(mass="lumped" | "consistent")`: the finite-difference five-point stencil or
+  the Q1 finite elements, both `T^T G^T M1 G T` with the edge mass of that kind and the source
+  integrated with the node mass of that kind. The consistent scheme is exact for bilinear
+  potentials across coarse–fine interfaces; it takes no embedded bodies, and the FFT backend
+  declines it (`LinearSystem.mass`; `"auto"` takes the LU). Section "Finite differences or
+  finite elements" in the edge-space tutorial.
+
 - A guide to the MPI communication in the docs (`guides/mpi-communication`, a Guides section
   in the header and sidebar): the communicators of the patches, mpiarray's copy plan behind
   every exchange, the sources of the halo cells, the interpolation buffers, restriction, the
@@ -104,6 +115,20 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the nodes, on refined lines too).
 
 ### Changed
+
+- Three layers (`patchwork.mesh`, `patchwork.spaces`, `patchwork.solvers`), each importing
+  only the ones below it when it loads (`test_layers.py`):
+  - `patchwork.mesh`: `hierarchy` (was `patchwork.mesh`), `halos`, `regrid`, `accumulate`,
+    `reflux`, `plotting`.
+  - `patchwork.spaces`: `nodes` (`CompositeNodes`, from `patchwork.nodal`), `edges`, `cells`
+    (`CompositeCells` and `cell_body`, from `patchwork.cells`) and `boundaries` (`Dirichlet`,
+    `Neumann`, `EmbeddedDirichlet`, `EmbeddedFloating`, the domain's faces and the surface
+    location on mesh edges).
+  - `patchwork.solvers`: `nodal_poisson` (`NodalPoisson`, `solve_nodal_poisson`, from
+    `patchwork.nodal`), `cell_operator` (`CellOperator`, from `patchwork.cells`), `backends`,
+    `distributed`, `poisson`.
+  The names exported by `patchwork` are unchanged; code that imported the old modules
+  (`patchwork.nodal`, `patchwork.cells`, `patchwork.backends`, ...) imports from the new ones.
 
 - `NodalPoisson`: `backend="superlu"` is now `"lu"`; `rtol=` and `petsc_options=` moved to
   `PetscBackend(rtol=, options=)`; `solver.system` is the `LinearSystem` and `solver.solver`

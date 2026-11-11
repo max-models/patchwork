@@ -15,7 +15,7 @@ from methodcard import method
 from patchwork._profiling import PROFILE_TAGS
 
 if TYPE_CHECKING:
-    from patchwork.mesh import AMRHierarchy, Patch
+    from patchwork.mesh.hierarchy import AMRHierarchy, Patch
 
 
 @dataclass(frozen=True)
