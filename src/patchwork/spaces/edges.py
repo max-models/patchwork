@@ -347,10 +347,11 @@ class CompositeEdges:
         # the cell's edges along each axis, in the order of `edge_corners`
         sides = {0: self.cell_edges[:, [0, 1]], 1: self.cell_edges[:, [2, 3]]}
         shape = (self.num_edges, self.num_edges)
-        return sum(
+        x_edges, y_edges = (
             scatter_blocks(edge_mass_blocks(size, axis, lumped), edges, edges, shape)
             for axis, edges in sides.items()
-        ).tocsr()
+        )
+        return sparse.csr_matrix(x_edges + y_edges)
 
     @method(
         equations={
