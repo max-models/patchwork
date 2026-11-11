@@ -141,6 +141,57 @@ def test_2d_curl_curl_converges() -> None:
     assert np.log2(errors[0] / errors[1]) > 1.6, errors
 
 
+# Material hooks ----------------------------------------------------------------------#
+def test_face_and_edge_masses_reproduce_the_cell_coefficients() -> None:
+    reference = CurlCurl(cube(4), reluctivity=2.0, beta=3.0)
+    edges, faces = reference.edges, reference.faces
+    given = CurlCurl(
+        cube(4),
+        face_mass=faces.mass(weight=2.0).diagonal(),
+        edge_mass=edges.mass(weight=3.0),
+        edges=edges,
+    )
+    assert abs(given.matrix - reference.matrix).max() < 1e-12
+    exact, load = manufactured(reference)
+    assert np.abs(given.solve(load) - reference.solve(load)).max() < 1e-12
+
+
+def test_fixed_edges_are_held_at_zero() -> None:
+    plain = CurlCurl(cube(4), beta=1.0)
+    edges = plain.edges
+    centre = edges.nodes.coordinates[edges.ends].mean(axis=1)
+    inside = np.all(np.abs(centre - 0.5) < 0.2, axis=1) & ~edges.hanging
+    held = CurlCurl(cube(4), beta=1.0, fixed=inside, edges=edges)
+    assert held.free.size == plain.free.size - np.count_nonzero(inside)
+    exact, load = manufactured(held)
+    assert not held.solve(load)[inside].any()
+
+
+def test_a_complex_face_mass_takes_the_lu() -> None:
+    plain = CurlCurl(cube(4), beta=1.0)
+    lossy = plain.faces.mass().diagonal() * (1.0 + 0.5j)
+    solver = CurlCurl(cube(4), beta=1.0, face_mass=lossy, edges=plain.edges)
+    exact, load = manufactured(solver)
+    assert abs(solver.solve(load.astype(complex)).imag).max() > 0
+    with pytest.raises(ValueError, match="real"):
+        CurlCurl(cube(4), beta=1.0, face_mass=lossy, solver="ams", edges=plain.edges)
+
+
+def test_an_edge_mass_alone_makes_the_operator_regular() -> None:
+    plain = CurlCurl(cube(4), beta=1.0)
+    solver = CurlCurl(cube(4), edge_mass=plain.edges.mass(), edges=plain.edges)
+    assert abs(solver.matrix - plain.matrix).max() < 1e-12
+
+
+def test_the_material_hooks_are_checked() -> None:
+    with pytest.raises(ValueError, match="face_mass must be"):
+        CurlCurl(cube(4), beta=1.0, face_mass=np.ones(3))
+    with pytest.raises(ValueError, match="diagonal"):
+        CurlCurl(cube(4), beta=1.0, edge_mass=np.ones((3, 3)))
+    with pytest.raises(ValueError, match="fixed"):
+        CurlCurl(cube(4), beta=1.0, fixed=np.ones(3, dtype=bool))
+
+
 # AMS -------------------------------------------------------------------------------#
 @needs_ams
 @pytest.mark.parametrize("mass", ["lumped", "consistent"])

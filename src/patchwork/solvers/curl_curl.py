@@ -25,6 +25,11 @@ periodic axes take none. ``C G = 0`` holds exactly, so the gradients are the
 null space of the curl term: without ``beta`` the operator is singular, and
 either a small ``gauge`` term (a weak Coulomb gauge) or hypre's AMS, which
 solves the singular system for a divergence-free current, makes it solvable.
+
+Material models the leaf-cell coefficients cannot express (cut cells, surface
+impedances, conductances per edge) enter through ``face_mass`` (in place of
+``M2(nu)``), ``edge_mass`` (an extra edge term) and ``fixed`` (more edges held
+at zero, e.g. inside a perfect conductor); they may be complex, for the LU.
 """
 
 from __future__ import annotations
@@ -53,6 +58,9 @@ Coefficient = float | complex | np.ndarray | Callable[..., Any]
 
 #: The conditions of a face of the domain.
 CONDITIONS = ("electric", "magnetic")
+
+#: A matrix, or the diagonal of one as an array.
+Operator = np.ndarray | sparse.spmatrix | sparse.sparray
 
 #: The ways `CurlCurl` solves its system.
 SOLVERS = ("lu", "ams", "auto")
@@ -179,10 +187,25 @@ class AmsSolver:
         return self._everywhere.getArray().copy()
 
 
+def _square(value: Operator, size: int, name: str) -> sparse.csr_matrix:
+    """A ``size x size`` sparse matrix from a matrix or a diagonal."""
+    if sparse.issparse(value):
+        matrix = sparse.csr_matrix(value)
+    else:
+        array = np.asarray(value)
+        if array.ndim != 1:
+            raise ValueError(f"{name} must be a sparse matrix or a diagonal")
+        matrix = sparse.csr_matrix(sparse.diags(array))
+    if matrix.shape != (size, size):
+        raise ValueError(f"{name} must be {size} x {size}, got {matrix.shape}")
+    return matrix
+
+
 @method(
     equations={
         "problem": r"\nabla\times(\nu\,\nabla\times\mathbf{A}) + \beta\,\mathbf{A} = \mathbf{J}, \qquad \mathbf{A}\times\mathbf{n} = 0 \ \text{(electric faces)}",
-        "operator": r"K = T_1^\top\big(C^\top M_2(\nu)\,C + M_1(\beta) + \epsilon\, M_1(\nu / h^2)\big)\,T_1",
+        "operator": r"K = T_1^\top\big(C^\top M_2(\nu)\,C + M_1(\beta) + \epsilon\, M_1(\nu / h^2) + M_e\big)\,T_1",
+        "materials": r"M_2(\nu) \to M_2' \ (\texttt{face\_mass}), \qquad M_e \ (\texttt{edge\_mass}), \qquad e_k = 0 \ (\texttt{fixed})",
         "load": r"b = T_1^\top \ell, \qquad \ell_e = \int \mathbf{J}\cdot\mathbf{w}_e\, dV \quad (\ell = M_1 j \text{ for edge values } j \text{ of } \mathbf{J})",
         "null_space": r"C\,G = 0: \quad K\,G_r = \beta\text{-term only}",
     },
@@ -190,6 +213,7 @@ class AmsSolver:
         "the domain fills its box; electric faces fix the tangential edges on them to zero",
         r"$\epsilon$ = `gauge`: a weak Coulomb gauge, needed by the LU when $\beta = 0$",
         r"AMS (hypre) for real coefficients; the LU also for complex $\beta = i\omega\sigma$",
+        r"`face_mass` and `edge_mass` on all faces and edges (hanging ones included), e.g. cut cells or surface impedances; real for AMS",
     ),
     references=(
         "[Hiptmair and Xu, SIAM J. Numer. Anal. 45, 2483 (2007)](https://doi.org/10.1137/060660588): the auxiliary space preconditioner",
@@ -216,6 +240,15 @@ class CurlCurl:
     ``"ams"`` (PETSc's conjugate gradients with hypre's AMS, rows split over
     the ranks; real coefficients) or ``"auto"`` (AMS where it applies, else
     the LU).
+
+    ``face_mass`` replaces the face mass ``M2(nu)`` (in 2D the per-cell
+    ``nu / area``) by a matrix, or its diagonal as an array, on all faces
+    (hanging ones included): the reluctance of cut faces, a surface
+    impedance. ``edge_mass``, likewise on all edges, is added to the
+    operator: conductances per edge, e.g. sampled below the cell size.
+    ``fixed`` marks more edges to hold at zero, e.g. those inside a
+    perfect or a surface-impedance conductor. ``face_mass`` and
+    ``edge_mass`` may be complex (with the LU).
 
     Attributes:
         edges: The `CompositeEdges`.
@@ -268,6 +301,9 @@ class CurlCurl:
         edges: CompositeEdges | None = None,
         rtol: float = 1.0e-10,
         options: Mapping[str, Any] | None = None,
+        face_mass: Operator | None = None,
+        edge_mass: Operator | None = None,
+        fixed: np.ndarray | None = None,
     ) -> None:
         """Assemble the operator and set up its solver."""
         if hierarchy.ndim not in (2, 3):
@@ -304,28 +340,41 @@ class CurlCurl:
         if np.iscomplexobj(nu) or np.any(np.real(nu) <= 0):
             raise ValueError("the reluctivity must be real and positive")
         edges, nodes = self.edges, self.nodes
-        if nodes.ndim == 3:
-            curl = self.faces.curl
+        curl = self.faces.curl if nodes.ndim == 3 else self.faces.cell_curl()
+        if face_mass is not None:
+            curl_mass = _square(face_mass, int(np.shape(curl)[0]), "face_mass")
+        elif nodes.ndim == 3:
             curl_mass = self.faces.mass(lumped, weight=nu)
         else:
-            curl = self.faces.cell_curl()
             area = np.prod(nodes.cell_size, axis=1)
             curl_mass = sparse.diags(nu / area)
         self.curl = curl
         operator = curl.T @ curl_mass @ curl
         self._edge_mass = edges.mass(lumped)
-        self._beta_zero = not np.any(beta_cells)
-        if not self._beta_zero:
+        extra = (
+            None
+            if edge_mass is None
+            else _square(edge_mass, edges.num_edges, "edge_mass")
+        )
+        self._beta_zero = not np.any(beta_cells) and (extra is None or not extra.nnz)
+        if np.any(beta_cells):
             operator = operator + edges.mass(lumped, weight=beta_cells)
+        if extra is not None:
+            operator = operator + extra
         if gauge:
             size = np.prod(nodes.cell_size, axis=1) ** (1.0 / nodes.ndim)
             operator = operator + edges.mass(lumped, weight=gauge * nu / size**2)
         reduction = edges.reduction
         self.fixed = self._fixed_edges()
+        if fixed is not None:
+            fixed = np.asarray(fixed, dtype=bool)
+            if fixed.shape != (edges.num_edges,):
+                raise ValueError(f"fixed must be a mask of the {edges.num_edges} edges")
+            self.fixed = self.fixed | fixed
         self.free = np.nonzero(~self.fixed & ~edges.hanging)[0]
         full = sparse.csr_matrix(reduction.T @ operator @ reduction)
         self.matrix = full[self.free][:, self.free].tocsr()
-        real = not (np.iscomplexobj(beta_cells) and np.any(np.imag(beta_cells)))
+        real = not (np.iscomplexobj(self.matrix) and np.any(self.matrix.data.imag))
         if solver == "auto":
             solver = "ams" if real and has_ams() else "lu"
         if solver == "ams":
