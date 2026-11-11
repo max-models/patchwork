@@ -16,9 +16,11 @@ is constant along every edge. Then
   (`CompositeEdges.reduction`), and the hanging nodes' interpolation
   commutes with the gradient (``G T = T1 G T``);
 - the edge mass matrix (`CompositeEdges.mass`) is the field energy
-  ``e^T M e`` of the cells (without ``eps0``); lumped, ``G^T M G`` is the
-  operator of `NodalPoisson` (its five-point stencil
-  inside a patch).
+  ``e^T M e`` of the cells (without ``eps0``); ``G^T M G`` is the operator of
+  `NodalPoisson`: its five-point stencil with the lumped mass (inside a patch),
+  the Q1 finite-element stiffness with the consistent one
+  (``NodalPoisson(mass="consistent")``). Both come from the per-cell blocks of
+  `patchwork.spaces.mass`.
 
 This is the space of the implicit, energy-conserving PIC: the field gather
 (`CompositeEdges.evaluation`) and the current deposit, its transpose
@@ -35,6 +37,7 @@ import scope_profiler as sp
 from methodcard import Rule, method
 
 from patchwork._profiling import PROFILE_TAGS
+from patchwork.spaces.mass import edge_mass_blocks, scatter_blocks
 
 if TYPE_CHECKING:
     from patchwork.spaces.nodes import CompositeNodes
@@ -161,7 +164,7 @@ def _continuity_rules() -> dict:
         "gradient": r"(G\phi)_e = \phi_{\mathrm{end}(e)} - \phi_{\mathrm{start}(e)}",
         "hanging_edges": r"(T_1 e)_f = \frac{s_f}{s_c}\, e_c \quad \text{for a fine edge of span } s_f \text{ in a coarse edge of span } s_c",
         "commuting": r"G\,T = T_1\,G\,T",
-        "nodal_operator": r"\big(T^\top G^\top M_\mathrm{lumped}\, G\, T\big)_{FF} = A_\mathrm{NodalPoisson}",
+        "nodal_operator": r"\big(T^\top G^\top M_1\, G\, T\big)_{FF} = A_\mathrm{NodalPoisson} \quad \text{(lumped: the five-point stencil; consistent: the Q1 stiffness)}",
     },
     assumptions=(
         "2D Cartesian only; edges addressed on the finest lattice",
@@ -327,6 +330,7 @@ class CompositeEdges:
             r"for a field on hanging edges use $T_1^\top M T_1$",
         ),
         symbolic=_mass_rules,
+        components=("patchwork.spaces.mass.edge_mass_blocks",),
     )
     def mass(self, lumped: bool = True) -> sparse.csr_matrix:
         """The edge mass matrix ``M1``: ``e^T M1 e`` is the integral of ``|E|^2``.
@@ -339,34 +343,14 @@ class CompositeEdges:
         edges of a direction. Both are symmetric and positive definite on the
         free edges. For a field on hanging edges, use ``T1^T M1 T1``.
         """
-        nodes = self.nodes
-        size = nodes.cell_size  # (m, 2)
-        rows, columns, entries = [], [], []
-        for direction, (low, high) in ((0, (0, 1)), (1, (2, 3))):
-            scale = size[:, 1 - direction] / size[:, direction]
-            a, b = self.cell_edges[:, low], self.cell_edges[:, high]
-            if lumped:
-                pairs = ((a, a, 0.5), (b, b, 0.5))
-            else:
-                pairs = (
-                    (a, a, 1.0 / 3.0),
-                    (b, b, 1.0 / 3.0),
-                    (a, b, 1.0 / 6.0),
-                    (b, a, 1.0 / 6.0),
-                )
-            for row, column, factor in pairs:
-                rows.append(row)
-                columns.append(column)
-                entries.append(factor * scale)
-        return sparse.csr_matrix(
-            sparse.coo_matrix(
-                (
-                    np.concatenate(entries),
-                    (np.concatenate(rows), np.concatenate(columns)),
-                ),
-                shape=(self.num_edges, self.num_edges),
-            )
-        )
+        size = self.nodes.cell_size  # (m, 2)
+        # the cell's edges along each axis, in the order of `edge_corners`
+        sides = {0: self.cell_edges[:, [0, 1]], 1: self.cell_edges[:, [2, 3]]}
+        shape = (self.num_edges, self.num_edges)
+        return sum(
+            scatter_blocks(edge_mass_blocks(size, axis, lumped), edges, edges, shape)
+            for axis, edges in sides.items()
+        ).tocsr()
 
     @method(
         equations={

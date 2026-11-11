@@ -44,10 +44,15 @@ from patchwork.spaces.boundaries import (
     _surface_crossing,
     faces_of,
 )
+from patchwork.spaces.mass import edge_corners, edge_mass_blocks
 from patchwork.spaces.nodes import CompositeNodes
 
 if TYPE_CHECKING:
     from patchwork.mesh.hierarchy import AMRHierarchy
+
+#: The mass matrices `NodalPoisson` assembles with: the finite-difference
+#: (lumped) or the finite-element (consistent) one.
+MASSES = ("lumped", "consistent")
 
 
 def _diagonal(solver: NodalPoisson, lattice: tuple[int, ...]) -> float:
@@ -121,6 +126,7 @@ def _nodal_problem() -> ConvergenceProblem:
         "uniform": r"A_{pp} = \frac{2h_y}{h_x} + \frac{2h_x}{h_y}, \qquad A_{p,x\pm} = -\frac{h_y}{h_x}, \qquad A_{p,y\pm} = -\frac{h_x}{h_y}",
         "reduced": r"(T^\top A T)_{FF}\,\phi_F = T^\top V f - (T^\top A T)_{FD}\,\phi_D + T^\top b_N + W U, \qquad V = \mathrm{diag}(V_p)",
         "charge": r"T^\top V f \to T^\top q \quad (\texttt{solve(charge=q)})",
+        "consistent": r"A = T^\top G^\top M_1 G\, T, \qquad V \to M_0 \quad (\texttt{mass=\"consistent\"}\text{: the Q1 finite elements; lumped } M_1, V \text{: the stencil above})",
         "neumann": r"b_{N,p} \mathrel{+}= \tfrac12 |e|\, g \quad \text{for each end } p \text{ of a boundary edge } e",
         "cut_edge": r"A_{pp} \mathrel{+}= \frac{g}{\theta}, \qquad b_p \mathrel{+}= \frac{g}{\theta}\, U_k, \qquad \theta = \max(\theta_\mathrm{found}, \theta_\mathrm{min})",
         "shortley_weller": r"A_{pp} = h_x h_y \sum_\mathrm{axes} \Big(\frac{2}{a_-(a_- + a_+)} + \frac{2}{a_+(a_- + a_+)}\Big), \qquad A_{p,\pm} = -\,h_x h_y\,\frac{2}{a_\pm(a_- + a_+)}",
@@ -128,6 +134,7 @@ def _nodal_problem() -> ConvergenceProblem:
     order=2,
     assumptions=(
         r"unlisted faces are grounded; no permittivity: for a charge pass $\rho / \varepsilon_0$",
+        "lumped and consistent mass share one assembly from the edge mass blocks (`patchwork.spaces.mass`); the consistent one takes no bodies and keeps the lumped Neumann load",
         "Cartesian control volumes and conductances, also on an $(r, z)$ hierarchy",
         r"the Shortley-Weller rows at regular cut nodes (four equal cells, not hanging), the diagonal-only cut elsewhere; they make the matrix unsymmetric",
         r"$\theta$ by 48 bisections of `inside`, or the body's `fraction`; $\theta_\mathrm{min}$ = `min_fraction` ($10^{-3}$)",
@@ -137,7 +144,11 @@ def _nodal_problem() -> ConvergenceProblem:
         "[Shortley and Weller, J. Appl. Phys. 9, 334 (1938)](https://doi.org/10.1063/1.1710426)",
         "[Gibou, Fedkiw, Cheng and Kang, J. Comput. Phys. 176, 205 (2002)](https://doi.org/10.1006/jcph.2001.6977): the diagonal-only cut edge",
     ),
-    components=(CompositeNodes,),
+    components=(
+        CompositeNodes,
+        "patchwork.spaces.mass.edge_mass_blocks",
+        "patchwork.spaces.nodes.CompositeNodes.mass",
+    ),
     symbolic=_nodal_rules,
     problem=_nodal_problem,
 )
@@ -170,6 +181,17 @@ class NodalPoisson:
     on a line, the FFT where it applies and the LU elsewhere. All give the
     potential on all nodes on every rank.
 
+    ``mass`` chooses the scheme: ``"lumped"`` (the default) is the finite
+    differences above, the five-point stencil with the control volumes;
+    ``"consistent"`` is the Q1 finite elements, the operator ``T^T G^T M1 G T``
+    of the consistent edge mass (`CompositeEdges.mass`) and the load
+    ``T^T M0`` of the consistent node mass (`CompositeNodes.mass`). Both are
+    assembled from the same per-cell blocks (`patchwork.spaces.mass`). The
+    consistent scheme is exact for bilinear potentials, also across
+    coarse–fine interfaces, takes no embedded bodies (their cut edges are
+    finite differences), and is solved by LU or PETSc (``"auto"`` takes the
+    LU): the FFT diagonalizes only the five-point stencil.
+
     Attributes:
         nodes: The `CompositeNodes` of the hierarchy.
         free: Node numbers of the unknowns: neither hanging nor fixed.
@@ -180,6 +202,7 @@ class NodalPoisson:
         matrix: This rank's rows of the operator, over the columns of the
             unknowns (in `free` order, or in the distributed order).
         backend: The `Backend`.
+        mass: ``"lumped"`` or ``"consistent"``.
         system: The `LinearSystem` it solves.
         solver: What the backend set up (an LU factorization, a
             `PetscSystem`, an `FFTSolver`),
@@ -300,6 +323,41 @@ class NodalPoisson:
             ),
         )
 
+    @staticmethod
+    def _consistent_couplings(
+        corners: np.ndarray, size: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The off-diagonal entries of the consistent edge mass in ``G^T M1 G``.
+
+        Two parallel edges ``(a0, a1)`` and ``(b0, b1)`` of a cell with mass
+        entry ``m`` add ``m (u_a1 - u_a0)(u_b1 - u_b0)`` to the energy (from
+        each of the two orderings): ``+m`` at ``(a1, b1)`` and ``(a0, b0)``,
+        ``-m`` at ``(a1, b0)`` and ``(a0, b1)``.
+        """
+        ndim = size.shape[1]
+        rows, columns, entries = [], [], []
+        for axis in range(ndim):
+            blocks = edge_mass_blocks(size, axis, lumped=False)
+            pairs = edge_corners(ndim, axis)
+            for i, (a0, a1) in enumerate(pairs):
+                for j, (b0, b1) in enumerate(pairs):
+                    if i == j:
+                        continue
+                    coupling = blocks[:, i, j]
+                    for row, column, sign in (
+                        (a1, b1, 1.0),
+                        (a0, b0, 1.0),
+                        (a1, b0, -1.0),
+                        (a0, b1, -1.0),
+                    ):
+                        rows.append(corners[:, row])
+                        columns.append(corners[:, column])
+                        entries.append(sign * coupling)
+        if not rows:  # 1D: one edge per cell
+            empty = np.zeros(0, dtype=np.int64)
+            return empty, empty, np.zeros(0)
+        return np.concatenate(rows), np.concatenate(columns), np.concatenate(entries)
+
     def _operator(
         self, cells: np.ndarray | None
     ) -> tuple[sparse.csr_matrix, sparse.csr_matrix]:
@@ -313,19 +371,20 @@ class NodalPoisson:
         solid = self._owner >= 0
 
         # Every leaf cell's edges (four in 2D, itself in 1D), each with its share
-        # of the stencil's conductance: half in 2D, the whole in 1D.
+        # of the stencil's conductance: the diagonal of the edge mass block
+        # (half in 2D, the whole in 1D, lumped). A consistent mass also couples
+        # the parallel edges of a cell (`_consistent_couplings`).
         ndim = nodes.ndim
         corners = nodes.cell_corners if cells is None else nodes.cell_corners[cells]
         size = nodes.cell_size if cells is None else nodes.cell_size[cells]
+        lumped = self.mass == "lumped"
         firsts, seconds, conductances, lengths = [], [], [], []
         for axis in range(ndim):
-            cross = np.prod(np.delete(size, axis, axis=1), axis=1) / 2 ** (ndim - 1)
-            for k in range(2**ndim):
-                if (k >> axis) & 1:
-                    continue
-                firsts.append(corners[:, k])
-                seconds.append(corners[:, k | (1 << axis)])
-                conductances.append(cross / size[:, axis])
+            blocks = edge_mass_blocks(size, axis, lumped)
+            for k, (start, end) in enumerate(edge_corners(ndim, axis)):
+                firsts.append(corners[:, start])
+                seconds.append(corners[:, end])
+                conductances.append(blocks[:, k, k])
                 lengths.append(size[:, axis])
         first = np.concatenate(firsts)
         second = np.concatenate(seconds)
@@ -385,6 +444,12 @@ class NodalPoisson:
         wall = sparse.csr_matrix(
             (wall_entries, (wall_rows, wall_columns)), shape=(n, max(num_bodies, 1))
         )
+        if not lumped:
+            extra = self._consistent_couplings(corners, size)
+            rows, columns, entries = (
+                np.concatenate((part, more))
+                for part, more in zip((rows, columns, entries), extra, strict=True)
+            )
         operator = sparse.csr_matrix((entries, (rows, columns)), shape=(n, n))
         return operator, wall
 
@@ -406,6 +471,7 @@ class NodalPoisson:
         self._fixed_nodes = fixed
 
         reduction = nodes.reduction
+        lumped = self.mass == "lumped"
         if self.backend.distributed:
             # the unknowns by owner: every rank's rows are contiguous
             comm = nodes.hierarchy.comm
@@ -428,7 +494,7 @@ class NodalPoisson:
         pick = sparse.csr_matrix(reduction[:, self.rows].T)
         reduced = sparse.csr_matrix(pick @ operator @ reduction)
         self._wall = sparse.csr_matrix(pick @ wall)
-        self._load = sparse.csr_matrix(pick @ sparse.diags(nodes.volumes))
+        self._load = sparse.csr_matrix(pick @ nodes.mass(lumped=lumped))
         # a source already integrated over the control volumes (a deposited charge)
         self._integral_load = pick
         self._lift = reduced[:, fixed].tocsr()
@@ -444,6 +510,7 @@ class NodalPoisson:
             singular=not self.fixed.any(),
             symmetric=not self._embedded,
             comm=nodes.hierarchy.comm,
+            mass=self.mass,
         )
         reason = self.backend.unsupported(self.system)
         if reason is not None:
@@ -491,13 +558,24 @@ class NodalPoisson:
         min_fraction: float = 1.0e-3,
         nodes: CompositeNodes | None = None,
         backend: str | Backend = "lu",
+        mass: str = "lumped",
     ) -> None:
         """Assemble the operator and set up its backend.
 
         ``min_fraction`` is the smallest fraction of an edge between a node and
         an embedded surface: a surface closer than that (through the node, up to
         round-off) is moved there, which bounds the size of that node's row.
+        ``mass`` is ``"lumped"`` (the finite-difference scheme) or
+        ``"consistent"`` (the Q1 finite elements; no embedded bodies).
         """
+        if mass not in MASSES:
+            raise ValueError(f"mass must be one of {MASSES}, got {mass!r}")
+        if mass == "consistent" and embedded:
+            raise ValueError(
+                "the embedded bodies' cut edges are finite differences: "
+                "they take mass='lumped'"
+            )
+        self.mass = mass
         self.backend = backend_of(backend)
         self.nodes = CompositeNodes(hierarchy) if nodes is None else nodes
         self._embedded = tuple(embedded)

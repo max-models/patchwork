@@ -26,6 +26,7 @@ from methodcard import Rule, method
 
 from patchwork._profiling import PROFILE_TAGS
 from patchwork.spaces.boundaries import INNER, faces_of
+from patchwork.spaces.mass import node_mass_blocks, scatter_blocks
 
 if TYPE_CHECKING:
     from patchwork.mesh.hierarchy import AMRHierarchy, Patch
@@ -482,6 +483,36 @@ class CompositeNodes:
         np.add.at(measure, first, 0.5 * length)
         np.add.at(measure, second, 0.5 * length)
         return measure
+
+    # Mass ------------------------------------------------------------------------#
+    @method(
+        equations={
+            "mass": r"u^\top M_0 u = \int u_h^2\, dV, \qquad M_0 = \sum_K P_K^\top M_{0,K} P_K",
+            "lumped": r"M_0 = \mathrm{diag}(V_p)",
+        },
+        assumptions=(
+            "on all nodes, hanging ones included: for the free nodes use $T^\\top M_0 T$",
+            "Cartesian measure, also on an $(r, z)$ hierarchy",
+        ),
+        components=("patchwork.spaces.mass.node_mass_blocks",),
+    )
+    def mass(self, lumped: bool = True) -> sparse.csr_matrix:
+        """The node mass matrix ``M0``: ``u^T M0 u`` is the integral of ``u_h**2``.
+
+        ``u_h`` is the (bi)linear interpolant of the node values in every leaf
+        cell. ``lumped`` takes the vertex quadrature: ``diag(volumes)``, the
+        control volumes of the finite-difference scheme; otherwise the exact
+        (consistent) Q1 mass. For values on the free nodes, use ``T^T M0 T``.
+        """
+        if lumped:
+            return sparse.csr_matrix(sparse.diags(self.volumes))
+        blocks = node_mass_blocks(self.cell_size, lumped=False)
+        return scatter_blocks(
+            blocks,
+            self.cell_corners,
+            self.cell_corners,
+            (self.num_nodes, self.num_nodes),
+        )
 
     # Interpolation ---------------------------------------------------------------#
     def level_shape(self, level: int) -> tuple[int, ...]:
