@@ -23,6 +23,7 @@ export default defineDocs({
 			'patchwork.spaces.nodes': 'Node space',
 			'patchwork.spaces.edges': 'Edge space',
 			'patchwork.spaces.cells': 'Cell space',
+			'patchwork.spaces.mass': 'Mass matrices',
 			'patchwork.solvers.nodal_poisson': 'Nodal Poisson',
 			'patchwork.solvers.cell_operator': 'Cell operator',
 			'patchwork.solvers.backends': 'Solver backends',

@@ -29,5 +29,5 @@ jobs:
         getting-started/installation/index.html
         examples/01-first-hierarchy/index.html
         numerics/index.html
-        numerics/nodal/index.html
+        numerics/solvers-nodal-poisson/index.html
         api/patchwork/index.html
