@@ -216,7 +216,7 @@ class _Level:
     equations={
         "spaces": r"V_0 \subset \dots \subset V_L: \ \text{the composite nodes of the hierarchy without its finest levels, then of its base level coarsened by } 2^k",
         "interpolation": r"P_k = E_{k}\big(\mathbf{x}^{(k+1)}_\mathrm{free}\big)\, T_k \Big|_{\mathrm{free}}, \qquad A_{k} = P_k^\top A_{k+1} P_k \ (\text{Galerkin})",
-        "cycle": r"\text{V-cycle: Chebyshev/Jacobi smoothing on } [0.1, 1.1]\,\lambda_\max(D^{-1}A), \text{ LU on } V_0; \ \text{CG (GMRES if } A \ne A^\top\text{)}, \ \|r\| \le \texttt{rtol}\,\|b\|",
+        "cycle": r"\text{V-cycle: Chebyshev/Jacobi smoothing on } [0.1, 1.1]\,\lambda_{\max}(D^{-1}A), \text{ LU on } V_0; \ \text{CG (GMRES if } A \ne A^\top\text{)}, \ \|r\| \le \texttt{rtol}\,\|b\|",
         "singular": r"b \to b - \bar b, \qquad \sum_p V_p (T\phi)_p = 0 \quad \text{(no Dirichlet face, no body; all nodes, the hanging ones too)}",
     },
     assumptions=(
