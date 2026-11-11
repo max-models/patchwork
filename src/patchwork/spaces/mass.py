@@ -248,5 +248,7 @@ def stiffness_blocks(
                     * edge_scale[:, a * per_axis : (a + 1) * per_axis, None]
                     * edge_scale[:, None, b * per_axis : (b + 1) * per_axis]
                 )
-            result += np.einsum("ki,mkl,lj->mij", gradients[a], block, gradients[b])
+            # D_a^T B D_b for every cell: two batched products (an einsum over
+            # the three indices at once is ten times slower)
+            result += gradients[a].T @ block @ gradients[b]
     return result
