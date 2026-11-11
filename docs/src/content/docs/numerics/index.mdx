@@ -39,7 +39,7 @@ module by module; this one shows how they fit together.
    cells: assembled cell by cell, with the hanging nodes of coarse-fine interfaces eliminated by
    their interpolation, and Shortley-Weller rows at embedded surfaces:
 
-<MethodCard name="patchwork.nodal.NodalPoisson" headingLevel={3} />
+<MethodCard name="patchwork.solvers.nodal_poisson.NodalPoisson" headingLevel={3} />
 
 5. **[Cell operator](/patchwork/numerics/cells/).** $-\nabla\cdot(a\nabla u) + c\,u = f$ on the
    leaf cells, assembled from an energy so that it stays symmetric (or, with conservative
@@ -49,7 +49,7 @@ module by module; this one shows how they fit together.
    the leaf cells, whose lumped mass matrix gives back the nodal operator, and the current
    deposit along straight paths that conserves the charge exactly:
 
-<MethodCard name="patchwork.edges.CompositeEdges.deposit_paths" headingLevel={3} />
+<MethodCard name="patchwork.spaces.edges.CompositeEdges.deposit_paths" headingLevel={3} />
 
 7. **[Refluxing](/patchwork/numerics/reflux/).** For an explicit, conservative time step, the
    coarse cells next to finer levels take the fine fluxes instead of their own (Berger and

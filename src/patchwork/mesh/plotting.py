@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from patchwork.mesh import AMRHierarchy
+    from patchwork.mesh.hierarchy import AMRHierarchy
 
 
 def _plot_line(

@@ -26,8 +26,8 @@ from matplotlib.lines import Line2D  # noqa: E402
 from matplotlib.patches import FancyBboxPatch, Patch, Rectangle  # noqa: E402
 
 from patchwork import AMRHierarchy  # noqa: E402
-from patchwork.halos import HaloExchange, _frame, _overlap, _Points, _shift  # noqa: E402
-from patchwork.regrid import transfer  # noqa: E402
+from patchwork.mesh.halos import HaloExchange, _frame, _overlap, _Points, _shift  # noqa: E402
+from patchwork.mesh.regrid import transfer  # noqa: E402
 
 OUTPUT = Path(__file__).parent / "public" / "figures" / "mpi"
 

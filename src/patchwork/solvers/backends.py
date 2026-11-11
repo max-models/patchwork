@@ -40,7 +40,8 @@ import scipy.sparse.linalg
 from methodcard import method
 
 if TYPE_CHECKING:
-    from patchwork.nodal import CompositeNodes, Dirichlet, Neumann
+    from patchwork.spaces.boundaries import Dirichlet, Neumann
+    from patchwork.spaces.nodes import CompositeNodes
 
 
 class Solver(Protocol):
@@ -220,7 +221,7 @@ class PetscBackend(Backend):
 
     def setup(self, system: LinearSystem) -> Solver:
         """Build the distributed matrix and the Krylov solver."""
-        from patchwork.distributed import PetscSystem
+        from patchwork.solvers.distributed import PetscSystem
 
         return PetscSystem(
             system.matrix,
@@ -238,7 +239,7 @@ class PetscBackend(Backend):
 
 def _axis_kind(system: LinearSystem, axis: int) -> str | None:
     """``"periodic"``, ``"dirichlet"`` or ``"neumann"``; ``None`` for mixed faces."""
-    from patchwork.nodal import FACES, Dirichlet
+    from patchwork.spaces.boundaries import FACES, Dirichlet
 
     hierarchy = system.nodes.hierarchy
     if hierarchy.periodic[axis]:

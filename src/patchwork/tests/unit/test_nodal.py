@@ -604,7 +604,7 @@ def test_a_charge_solve_is_the_source_solve_of_the_same_charge(layout) -> None:
 
 
 def _bisection(inside, start: np.ndarray, step: np.ndarray) -> np.ndarray:
-    """The plain bisection that :func:`patchwork.nodal._surface_crossing` replays."""
+    """The plain bisection that :func:`patchwork.spaces.boundaries._surface_crossing` replays."""
     low, high = np.zeros(start.shape[1]), np.ones(start.shape[1])
     for _ in range(48):
         middle = 0.5 * (low + high)
@@ -622,7 +622,7 @@ def test_the_surface_is_found_as_by_bisection_in_fewer_calls(
 
     Few edges take several bisection steps per call; very many take one.
     """
-    from patchwork.nodal import _surface_crossing
+    from patchwork.spaces.boundaries import _surface_crossing
 
     rng = np.random.default_rng(count)
     calls = []
@@ -648,7 +648,7 @@ def test_the_surface_is_found_as_by_bisection_in_fewer_calls(
 
 def test_numbering_by_a_table_and_by_sorting_agree(monkeypatch) -> None:
     """The lattice table and the sort of the corners give the same mesh and operator."""
-    from patchwork import nodal
+    from patchwork.spaces import nodes as nodal
 
     _, body = _disc(0.15)
 

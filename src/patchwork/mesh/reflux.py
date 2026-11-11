@@ -61,10 +61,10 @@ from maybempi import MPI
 from methodcard import method
 
 from patchwork._profiling import PROFILE_TAGS
-from patchwork.cells import CompositeCells
 
 if TYPE_CHECKING:
-    from patchwork.mesh import AMRHierarchy, Patch
+    from patchwork.mesh.hierarchy import AMRHierarchy, Patch
+    from patchwork.spaces.cells import CompositeCells
 
 #: Face fluxes of a patch: ``fluxes(patch)`` returns the flux densities through
 #: the faces normal to each axis of this rank's block of the patch, positive
@@ -89,7 +89,7 @@ Fluxes = Callable[["Patch"], tuple[Any, ...]]
     references=(
         "[Berger and Colella, J. Comput. Phys. 82, 64 (1989)](https://doi.org/10.1016/0021-9991(89)90035-1)",
     ),
-    components=("patchwork.halos.Restriction",),
+    components=("patchwork.mesh.halos.Restriction",),
 )
 class FluxRegister:
     """Matches the fluxes of coarse and fine levels at their interfaces (refluxing).
@@ -135,7 +135,10 @@ class FluxRegister:
     def __init__(self, hierarchy: AMRHierarchy, cells: CompositeCells | None = None):
         """Find the coarse–fine faces of ``hierarchy`` (``cells``: its leaf cells)."""
         self.hierarchy = hierarchy
-        cells = CompositeCells(hierarchy) if cells is None else cells
+        if cells is None:
+            from patchwork.spaces.cells import CompositeCells
+
+            cells = CompositeCells(hierarchy)
         # a key per coarse face: (coarse cell, axis, side of the cell)
         per_cell = 2 * hierarchy.ndim
         keys, fine_cells, fine_axes, fine_sides = [], [], [], []
@@ -257,7 +260,7 @@ class FluxRegister:
                     value[on] = through[normal][tuple(at.T)]
                 np.add.at(records, entry[mine], sign * weight * value)
 
-    @sp.profile("patchwork.reflux", tags=PROFILE_TAGS)
+    @sp.profile("patchwork.mesh.reflux", tags=PROFILE_TAGS)
     def reflux(self, name: str, *, level: int | None = None) -> None:
         """Correct the coarse cells next to finer levels, and restrict onto them.
 

@@ -762,7 +762,7 @@ class AMRHierarchy:
         takes several time steps for one of the level below (subcycling), a
         field that holds the level below at the time in between.
         """
-        from patchwork.halos import HaloExchange
+        from patchwork.mesh.halos import HaloExchange
 
         if level is None and below is None:
             self._schedule("halo", name, HaloExchange).execute()
@@ -789,11 +789,11 @@ class AMRHierarchy:
         call `exchange_halos` after it for the halos. See
         `Restriction`.
         """
-        from patchwork.halos import Restriction
+        from patchwork.mesh.halos import Restriction
 
         self._schedule("restrict", name, Restriction).execute(level=level)
 
-    @sp.profile("patchwork.regrid", tags=PROFILE_TAGS)
+    @sp.profile("patchwork.mesh.regrid", tags=PROFILE_TAGS)
     @method(
         equations={
             "grow": r"\tilde T_L = \mathrm{grow}_{b}\Big(T_L \cup \mathrm{coarsen}_r\big(\mathrm{grow}_{m}(\tilde T_{L+1})\big)\Big) \cap \Omega_L, \qquad L = L_\mathrm{max}, \dots, 0",
@@ -811,8 +811,8 @@ class AMRHierarchy:
             "[Berger and Rigoutsos, IEEE Trans. Syst. Man Cybern. 21(5) (1991)](https://ieeexplore.ieee.org/document/120081/)",
         ),
         components=(
-            "patchwork.regrid.cluster",
-            "patchwork.halos.conservative_from_below",
+            "patchwork.mesh.regrid.cluster",
+            "patchwork.mesh.halos.conservative_from_below",
         ),
     )
     def regrid(
@@ -869,7 +869,7 @@ class AMRHierarchy:
         the largest first. Collective over ``comm``; this hierarchy is left as
         it is, except for the restriction of conservative fields.
         """
-        from patchwork.regrid import combine_tags, new_boxes, transfer
+        from patchwork.mesh.regrid import combine_tags, new_boxes, transfer
 
         combined = combine_tags(self, tags)
         boxes = new_boxes(
@@ -925,7 +925,7 @@ class AMRHierarchy:
                 raise NotImplementedError(
                     "the integral of a node-centered field in r–z is not implemented"
                 )
-            from patchwork.nodal import CompositeNodes
+            from patchwork.spaces.nodes import CompositeNodes
 
             nodes = CompositeNodes(self)
             return float(nodes.volumes @ nodes.from_patches(name))
@@ -1280,7 +1280,7 @@ class AMRHierarchy:
             "a marker gathers the field of its own patch, which may jump at a coarse-fine edge",
             "the halos and the copies of shared nodes are summed afterwards (`accumulate_halos`)",
         ),
-        components=("patchwork.accumulate.Accumulation",),
+        components=("patchwork.mesh.accumulate.Accumulation",),
     )
     def deposit(
         self, *arguments: Any, name: str | None = None, reset: bool = True
@@ -1401,7 +1401,7 @@ class AMRHierarchy:
             raise NotImplementedError(
                 "accumulate_halos is for node-centered fields (the scatter-add of a deposit)"
             )
-        from patchwork.accumulate import Accumulation
+        from patchwork.mesh.accumulate import Accumulation
 
         self._schedule("accumulate", name, Accumulation).execute()
 

@@ -8,7 +8,7 @@ import pytest
 
 from patchwork import AMRHierarchy
 from patchwork.kernels.locate_points import kernel as locate_points
-from patchwork.nodal import CompositeNodes
+from patchwork.spaces.nodes import CompositeNodes
 
 ELL = [((0, 8), (0, 16)), ((8, 16), (8, 16))]
 

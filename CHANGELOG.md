@@ -105,6 +105,20 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Three layers (`patchwork.mesh`, `patchwork.spaces`, `patchwork.solvers`), each importing
+  only the ones below it when it loads (`test_layers.py`):
+  - `patchwork.mesh`: `hierarchy` (was `patchwork.mesh`), `halos`, `regrid`, `accumulate`,
+    `reflux`, `plotting`.
+  - `patchwork.spaces`: `nodes` (`CompositeNodes`, from `patchwork.nodal`), `edges`, `cells`
+    (`CompositeCells` and `cell_body`, from `patchwork.cells`) and `boundaries` (`Dirichlet`,
+    `Neumann`, `EmbeddedDirichlet`, `EmbeddedFloating`, the domain's faces and the surface
+    location on mesh edges).
+  - `patchwork.solvers`: `nodal_poisson` (`NodalPoisson`, `solve_nodal_poisson`, from
+    `patchwork.nodal`), `cell_operator` (`CellOperator`, from `patchwork.cells`), `backends`,
+    `distributed`, `poisson`.
+  The names exported by `patchwork` are unchanged; code that imported the old modules
+  (`patchwork.nodal`, `patchwork.cells`, `patchwork.backends`, ...) imports from the new ones.
+
 - `NodalPoisson`: `backend="superlu"` is now `"lu"`; `rtol=` and `petsc_options=` moved to
   `PetscBackend(rtol=, options=)`; `solver.system` is the `LinearSystem` and `solver.solver`
   what the backend set up (a factorization, a `PetscSystem`, an `FFTSolver`).

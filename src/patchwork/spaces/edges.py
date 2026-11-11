@@ -37,7 +37,7 @@ from methodcard import Rule, method
 from patchwork._profiling import PROFILE_TAGS
 
 if TYPE_CHECKING:
-    from patchwork.nodal import CompositeNodes
+    from patchwork.spaces.nodes import CompositeNodes
 
 #: The sides of a leaf cell, in the order of `CompositeEdges.cell_edges`:
 #: direction of the edge, offset of its lower end from the cell's lower corner
@@ -52,8 +52,8 @@ _SIDES = (
 
 def _uniform_edges(hx: float, hy: float, cells: int = 4) -> CompositeEdges:
     """The edges of ``cells`` by ``cells`` uniform cells of ``hx`` by ``hy``."""
-    from patchwork.mesh import AMRHierarchy
-    from patchwork.nodal import CompositeNodes
+    from patchwork.mesh.hierarchy import AMRHierarchy
+    from patchwork.spaces.nodes import CompositeNodes
 
     bounds = ((0.0, cells * hx), (0.0, cells * hy))
     mesh = AMRHierarchy(base_shape=(cells, cells), bounds=bounds)
@@ -127,8 +127,8 @@ def _continuity_rules() -> dict:
     """The SymPy rule of `CompositeEdges.deposit_paths` (for the tests)."""
     import sympy
 
-    from patchwork.mesh import AMRHierarchy
-    from patchwork.nodal import CompositeNodes
+    from patchwork.mesh.hierarchy import AMRHierarchy
+    from patchwork.spaces.nodes import CompositeNodes
 
     x0, y0, q = sympy.symbols("x0 y0 q", real=True)
     mesh = AMRHierarchy(base_shape=(8, 8))
@@ -171,7 +171,7 @@ def _continuity_rules() -> dict:
         "H. Whitney, Geometric Integration Theory, Princeton University Press (1957)",
         "[Bossavit, IEE Proc. A 135, 493 (1988)](https://doi.org/10.1049/ip-a-1.1988.0077)",
     ),
-    components=("patchwork.nodal.CompositeNodes",),
+    components=("patchwork.spaces.nodes.CompositeNodes",),
 )
 class CompositeEdges:
     """The edges of the leaf cells of a 2D hierarchy, and the operators on them.
@@ -479,7 +479,7 @@ class CompositeEdges:
         references=(
             "[Villasenor and Buneman, Comput. Phys. Commun. 69, 306 (1992)](https://doi.org/10.1016/0010-4655(92)90169-Y)",
         ),
-        components=("patchwork.nodal.CompositeNodes.deposit",),
+        components=("patchwork.spaces.nodes.CompositeNodes.deposit",),
         symbolic=_continuity_rules,
     )
     def deposit_paths(
