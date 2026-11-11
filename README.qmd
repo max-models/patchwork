@@ -36,6 +36,11 @@ storage, plotting, and composite linear solves:
   what a particle-in-cell code needs. With `backend="petsc"` (the `petsc`
   extra) every rank assembles only the rows of its patches' nodes and PETSc
   solves them together (a Krylov method with algebraic multigrid).
+  With `coefficient=` it is `-div(K grad phi)`, a scalar or a symmetric
+  tensor per leaf cell (the implicit particle step's permittivity plus
+  susceptibility), and `backend="multigrid"` solves it by geometric multigrid
+  over the patches, in a number of iterations that does not grow with the
+  refinement levels or the cell count.
 - `CellOperator`: cell-centered, `-div(a grad u) + c u = f` with a variable
   diffusion coefficient and a real or complex reaction (a skin layer, an
   inductive field), the same faces, periodic axes and bodies, quadratic

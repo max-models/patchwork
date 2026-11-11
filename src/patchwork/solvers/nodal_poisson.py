@@ -44,11 +44,17 @@ from patchwork.spaces.boundaries import (
     _surface_crossing,
     faces_of,
 )
-from patchwork.spaces.mass import edge_corners, edge_mass_blocks
+from patchwork.spaces.mass import (
+    edge_corners,
+    edge_mass_blocks,
+    scatter_blocks,
+    stiffness_blocks,
+)
 from patchwork.spaces.nodes import CompositeNodes
 
 if TYPE_CHECKING:
     from patchwork.mesh.hierarchy import AMRHierarchy
+    from patchwork.spaces.edges import CompositeEdges
 
 #: The mass matrices `NodalPoisson` assembles with: the finite-difference
 #: (lumped) or the finite-element (consistent) one.
@@ -358,6 +364,23 @@ class NodalPoisson:
             return empty, empty, np.zeros(0)
         return np.concatenate(rows), np.concatenate(columns), np.concatenate(entries)
 
+    def _weighted_operator(
+        self, cells: np.ndarray | None
+    ) -> tuple[sparse.csr_matrix, sparse.csr_matrix]:
+        """The operator with a coefficient, cell by cell (`stiffness_blocks`); no bodies."""
+        nodes = self.nodes
+        n = nodes.num_nodes
+        pick = slice(None) if cells is None else cells
+        corners = nodes.cell_corners[pick]
+        blocks = stiffness_blocks(
+            nodes.cell_size[pick],
+            self.mass == "lumped",
+            None if self._tensor is None else self._tensor[pick],
+            None if self._edge_scale is None else self._edge_scale[pick],
+        )
+        operator = scatter_blocks(blocks, corners, corners, (n, n))
+        return operator, sparse.csr_matrix((n, 1))
+
     def _operator(
         self, cells: np.ndarray | None
     ) -> tuple[sparse.csr_matrix, sparse.csr_matrix]:
@@ -368,6 +391,8 @@ class NodalPoisson:
         """
         nodes = self.nodes
         n = nodes.num_nodes
+        if self._tensor is not None or self._edge_scale is not None:
+            return self._weighted_operator(cells)
         solid = self._owner >= 0
 
         # Every leaf cell's edges (four in 2D, itself in 1D), each with its share
@@ -453,42 +478,17 @@ class NodalPoisson:
         operator = sparse.csr_matrix((entries, (rows, columns)), shape=(n, n))
         return operator, wall
 
-    def _assemble(self) -> None:
-        """Build this rank's rows of the operator, the solver and the right-hand-side maps."""
+    def _assemble_matrix(self) -> None:
+        """This rank's rows of the operator and the right-hand-side maps; set up the backend.
+
+        A solver that can take a new operator of the same structure
+        (``update``, as the multigrid's) keeps what it built from the mesh.
+        """
         nodes = self.nodes
-        n = nodes.num_nodes
-        self._classify_bodies()
-        solid = self._owner >= 0
-
-        self.fixed = np.zeros(n, dtype=bool)
-        for face, condition in self._faces.items():
-            if isinstance(condition, Dirichlet):
-                self.fixed[nodes.face_nodes(face)] = True
-        self.fixed |= solid
-        self.fixed &= ~nodes.hanging
-        self.free = np.nonzero(~self.fixed & ~nodes.hanging)[0]
-        fixed = np.nonzero(self.fixed)[0]
-        self._fixed_nodes = fixed
-
+        fixed = self._fixed_nodes
         reduction = nodes.reduction
         lumped = self.mass == "lumped"
-        if self.backend.distributed:
-            # the unknowns by owner: every rank's rows are contiguous
-            comm = nodes.hierarchy.comm
-            owner = nodes.node_ranks[self.free]
-            self._unknowns = self.free[np.argsort(owner, kind="stable")]
-            self.rows = self.free[owner == comm.Get_rank()]
-            # the rows of the reduced operator of these unknowns take the rows
-            # of the nodes that hang from them too, which need every leaf cell
-            # around those nodes
-            support = np.zeros(n, dtype=bool)
-            support[sparse.csc_matrix(reduction[:, self.rows]).indices] = True
-            cells = np.nonzero(support[nodes.cell_corners].any(axis=1))[0]
-        else:
-            self._unknowns = self.free
-            self.rows = self.free
-            cells = None
-        operator, wall = self._operator(cells)
+        operator, wall = self._operator(self._cells)
 
         # rows of T^T A T for the unknowns this rank holds
         pick = sparse.csr_matrix(reduction[:, self.rows].T)
@@ -515,7 +515,50 @@ class NodalPoisson:
         reason = self.backend.unsupported(self.system)
         if reason is not None:
             raise ValueError(reason)
-        self.solver = self.backend.setup(self.system) if self.free.size else None
+        if not self.free.size:
+            self.solver = None
+        elif callable(update := getattr(self.solver, "update", None)):
+            update(self.system)
+        else:
+            self.solver = self.backend.setup(self.system)
+
+    def _assemble(self) -> None:
+        """Build this rank's rows of the operator, the solver and the right-hand-side maps."""
+        nodes = self.nodes
+        n = nodes.num_nodes
+        self._classify_bodies()
+        solid = self._owner >= 0
+
+        self.fixed = np.zeros(n, dtype=bool)
+        for face, condition in self._faces.items():
+            if isinstance(condition, Dirichlet):
+                self.fixed[nodes.face_nodes(face)] = True
+        self.fixed |= solid
+        self.fixed &= ~nodes.hanging
+        self.free = np.nonzero(~self.fixed & ~nodes.hanging)[0]
+        fixed = np.nonzero(self.fixed)[0]
+        self._fixed_nodes = fixed
+
+        reduction = nodes.reduction
+        if self.backend.distributed:
+            # the unknowns by owner: every rank's rows are contiguous
+            comm = nodes.hierarchy.comm
+            owner = nodes.node_ranks[self.free]
+            self._unknowns = self.free[np.argsort(owner, kind="stable")]
+            self.rows = self.free[owner == comm.Get_rank()]
+            # the rows of the reduced operator of these unknowns take the rows
+            # of the nodes that hang from them too, which need every leaf cell
+            # around those nodes
+            support = np.zeros(n, dtype=bool)
+            support[sparse.csc_matrix(reduction[:, self.rows]).indices] = True
+            cells = np.nonzero(support[nodes.cell_corners].any(axis=1))[0]
+        else:
+            self._unknowns = self.free
+            self.rows = self.free
+            cells = None
+        self._cells = cells
+        self.solver = None
+        self._assemble_matrix()
 
     # Boundary values ---------------------------------------------------------------#
     def _update_values(self) -> None:
@@ -549,6 +592,63 @@ class NodalPoisson:
         constant -= self._lift @ values[self._fixed_nodes]
         self._constant = constant
 
+    def _coefficients(
+        self,
+        coefficient: float | np.ndarray | None,
+        edge_coefficient: np.ndarray | None,
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """The tensor per leaf cell and the square roots of the edge coefficient per cell edge."""
+        if coefficient is None and edge_coefficient is None:
+            return None, None
+        if self._embedded:
+            raise ValueError(
+                "a coefficient takes no embedded bodies: their cut edges and "
+                "Shortley-Weller rows are those of the Laplacian"
+            )
+        nodes = self.nodes
+        count, ndim = nodes.cell_size.shape
+        tensor = None
+        if coefficient is not None:
+            value = np.asarray(coefficient, dtype=float)
+            if value.ndim == 0:
+                value = np.full(count, float(value))
+            if value.shape == (count,):
+                tensor = value[:, None, None] * np.eye(ndim)
+            elif value.shape == (count, ndim):
+                tensor = value[:, :, None] * np.eye(ndim)
+            elif value.shape == (count, ndim, ndim):
+                tensor = value.copy()
+                if not np.allclose(tensor, np.swapaxes(tensor, 1, 2)):
+                    raise ValueError("the coefficient tensor must be symmetric")
+            else:
+                raise ValueError(
+                    f"expected a coefficient per leaf cell: a number, ({count},), "
+                    f"({count}, {ndim}) or ({count}, {ndim}, {ndim}); got {value.shape}"
+                )
+        scale = None
+        if edge_coefficient is not None:
+            value = np.asarray(edge_coefficient, dtype=float)
+            if ndim == 1:  # the edges are the cells
+                cell_edges = np.arange(count)[:, None]
+                num_edges = count
+            else:
+                if self._edges is None:
+                    from patchwork.spaces.edges import CompositeEdges
+
+                    self._edges = CompositeEdges(nodes)
+                elif self._edges.nodes is not nodes:
+                    raise ValueError("edges must be the CompositeEdges of these nodes")
+                cell_edges = self._edges.cell_edges
+                num_edges = self._edges.num_edges
+            if value.shape != (num_edges,):
+                raise ValueError(
+                    f"expected a coefficient on the {num_edges} edges, got {value.shape}"
+                )
+            if (value < 0.0).any():
+                raise ValueError("the edge coefficient must not be negative")
+            scale = np.sqrt(value)[cell_edges]
+        return tensor, scale
+
     @sp.profile("patchwork.nodal_poisson_setup", tags=PROFILE_TAGS)
     def __init__(
         self,
@@ -560,14 +660,21 @@ class NodalPoisson:
         nodes: CompositeNodes | None = None,
         backend: str | Backend = "lu",
         mass: str = "lumped",
+        coefficient: float | np.ndarray | None = None,
+        edge_coefficient: np.ndarray | None = None,
+        edges: CompositeEdges | None = None,
     ) -> None:
-        """Assemble the operator and set up its backend.
+        r"""Assemble the operator and set up its backend.
 
         ``min_fraction`` is the smallest fraction of an edge between a node and
         an embedded surface: a surface closer than that (through the node, up to
         round-off) is moved there, which bounds the size of that node's row.
         ``mass`` is ``"lumped"`` (the finite-difference scheme) or
         ``"consistent"`` (the Q1 finite elements; no embedded bodies).
+        ``coefficient`` and ``edge_coefficient`` make the operator
+        $-\nabla\cdot(\mathsf{K}\nabla\phi)$ (see `set_coefficient`; no
+        embedded bodies); ``edges`` is the `CompositeEdges` of ``nodes``
+        that ``edge_coefficient`` is given on (built if needed).
         """
         if mass not in MASSES:
             raise ValueError(f"mass must be one of {MASSES}, got {mass!r}")
@@ -581,6 +688,10 @@ class NodalPoisson:
         self.nodes = CompositeNodes(hierarchy) if nodes is None else nodes
         self._embedded = tuple(embedded)
         self._min_fraction = float(min_fraction)
+        self._edges = edges
+        self._tensor, self._edge_scale = self._coefficients(
+            coefficient, edge_coefficient
+        )
         known = faces_of(hierarchy.ndim)
         unknown = set(faces or ()) - set(known) - {INNER}
         if unknown:
@@ -599,6 +710,36 @@ class NodalPoisson:
         # after the faces of the rectangle, which decide the nodes they share
         self._faces[INNER] = (faces or {}).get(INNER, Dirichlet(0.0))
         self._assemble()
+        self._update_values()
+
+    @sp.profile("patchwork.nodal_poisson_set_coefficient", tags=PROFILE_TAGS)
+    def set_coefficient(
+        self,
+        coefficient: float | np.ndarray | None = None,
+        edge_coefficient: np.ndarray | None = None,
+    ) -> None:
+        r"""Assemble $-\nabla\cdot(\mathsf{K}\nabla\phi)$ for a new coefficient; set the backend up again.
+
+        ``coefficient`` is per leaf cell (in the order of the leaf cells of
+        `nodes`): a number, an array ``(m,)`` (isotropic), ``(m, d)`` (a
+        diagonal tensor) or ``(m, d, d)`` (a symmetric tensor, whose
+        off-diagonal entries couple the edges of different axes, a nine-point
+        stencil in 2D). ``edge_coefficient`` ``(n1,)`` is a factor per edge of
+        `CompositeEdges` (per leaf cell in 1D), e.g. a susceptibility
+        deposited on the edges: it multiplies the edge's conductance (rows and
+        columns of the edge mass by its square root). Given both, they
+        multiply; given neither, the operator is the Laplacian again. For the
+        implicit PIC step $\mathsf{K} = \varepsilon_0 + \Delta t\,\chi$.
+
+        The operator is $T^\top G^\top M_1(\mathsf{K})\, G\, T$ (`stiffness_blocks`); a
+        `Neumann` value is then the flux $\mathbf{n}\cdot\mathsf{K}\nabla\phi$. The
+        mesh, the conditions and what the backend built from the mesh (the
+        multigrid's interpolations) are kept.
+        """
+        self._tensor, self._edge_scale = self._coefficients(
+            coefficient, edge_coefficient
+        )
+        self._assemble_matrix()
         self._update_values()
 
     def set_conditions(
