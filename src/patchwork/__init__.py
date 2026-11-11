@@ -35,6 +35,7 @@ from patchwork.solvers import (
 from patchwork.spaces import (
     CompositeCells,
     CompositeEdges,
+    CompositeFaces,
     CompositeNodes,
     Dirichlet,
     EmbeddedDirichlet,
@@ -55,6 +56,7 @@ __all__ = [
     "CellOperator",
     "CompositeCells",
     "CompositeEdges",
+    "CompositeFaces",
     "CompositeNodes",
     "Dirichlet",
     "EmbeddedDirichlet",
