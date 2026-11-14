@@ -1,7 +1,8 @@
-"""Tests for the lowest-order edge space of a 2D hierarchy."""
+"""Tests for the lowest-order edge space of a 1D and 2D hierarchy."""
 
 from __future__ import annotations
 
+import cunumpy as xp
 import numpy as np
 import pytest
 
@@ -13,6 +14,7 @@ from patchwork import (
     Neumann,
     NodalPoisson,
 )
+from patchwork.tests.unit.test_kernels import IMPLEMENTATIONS
 
 #: Patch layouts on a 16 x 16 base mesh, as in the nodal tests: none, nested, a
 #: level-2 patch that touches its parent's edge, and two separate patches.
@@ -159,10 +161,29 @@ def test_a_uniform_mesh_has_two_edges_per_node_and_no_hanging_edges() -> None:
     np.testing.assert_array_equal(edges.cell_edges.shape, (256, 4))
 
 
-def test_the_edge_space_is_two_or_three_dimensional() -> None:
-    nodes = CompositeNodes(AMRHierarchy(base_shape=(8,)))
-    with pytest.raises(NotImplementedError, match="two- or three-dimensional"):
-        CompositeEdges(nodes)
+def _line(periodic: bool = False) -> CompositeEdges:
+    """A line of 16 cells on (0, 2), refined twice over part of it."""
+    mesh = AMRHierarchy(base_shape=(16,), bounds=((0.0, 2.0),), periodic=(periodic,))
+    mesh.add_patch(level=1, box=((4, 20),))
+    mesh.add_patch(level=2, box=((12, 28),))
+    return CompositeEdges(CompositeNodes(mesh))
+
+
+def test_on_a_line_the_edges_are_the_leaf_cells() -> None:
+    edges = _line()
+    nodes = edges.nodes
+    assert edges.num_edges == nodes.cell_span.size == nodes.num_nodes - 1
+    assert not edges.hanging.any()
+    assert edges.cell_edges.shape == (nodes.cell_span.size, 1)
+    np.testing.assert_allclose(edges.length.sum(), 2.0)
+    # G of a linear potential is its difference along every edge
+    (x,) = nodes.coordinates.T
+    np.testing.assert_allclose(edges.gradient @ (3.0 * x), 3.0 * edges.length)
+    # the mass of a cell's edge is 1 / h, lumped or consistent
+    for lumped in (True, False):
+        mass = edges.mass(lumped=lumped)
+        np.testing.assert_allclose(mass.diagonal(), 1.0 / edges.length)
+        assert mass.nnz == edges.num_edges
 
 
 def _continuity_error(edges: CompositeEdges, start, end, charges) -> float:
@@ -174,6 +195,38 @@ def _continuity_error(edges: CompositeEdges, start, end, charges) -> float:
         nodes.deposit(end, charges) - nodes.deposit(start, charges)
     )
     return float(np.abs(divergence - change).max() / np.abs(charges).max())
+
+
+@pytest.mark.parametrize("implementation", IMPLEMENTATIONS)
+@pytest.mark.parametrize("periodic", [False, True])
+def test_the_compiled_line_path_deposit_is_the_piecewise_one(
+    periodic: bool, implementation: str
+) -> None:
+    """deposit_paths on a line (a kernel) against the NumPy pieces of 2D and 3D."""
+    edges = _line(periodic)
+    rng = np.random.default_rng(3)
+    start = rng.uniform(-0.3, 2.3, size=(1, 400))
+    end = start + rng.normal(scale=0.4, size=start.shape)
+    # paths that start, end or stay on lattice nodes, and paths that stay put
+    start[0, :40] = rng.integers(0, 65, 40) / 32.0
+    end[0, 40:80] = rng.integers(0, 65, 40) / 32.0
+    end[0, 80:90] = start[0, 80:90]
+    if not periodic:  # and some out of the domain
+        end[0, 90:100] = 2.5
+    charges = rng.normal(size=400)
+    expected = edges._deposit_pieces(start, end, charges)
+
+    with xp.kernels.use_host_kernel_implementation(implementation):
+        current = edges.deposit_paths(start, end, charges)
+        assert not edges.deposit_paths(start[:, :0], end[:, :0], charges[:0]).any()
+
+    np.testing.assert_allclose(current, expected, rtol=0.0, atol=1e-12)
+    if periodic:
+        assert _continuity_error(edges, start, end, charges) < 1e-12
+    else:
+        inside = (np.abs(start[0] - 1.0) <= 1.0) & (np.abs(end[0] - 1.0) <= 1.0)
+        args = start[:, inside], end[:, inside], charges[inside]
+        assert _continuity_error(edges, *args) < 1e-12
 
 
 @pytest.mark.parametrize(

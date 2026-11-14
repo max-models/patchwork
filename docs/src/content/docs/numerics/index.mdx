@@ -81,11 +81,10 @@ fill its rectangle); an unlisted face is grounded.
 ## Not in the model
 
 - No time integration or particle push: the fluxes of refluxing and the markers are the caller's.
-- No multigrid over the patches; the only multigrid is PETSc's algebraic preconditioner. The
-  cell operator has the LU only, on every rank.
-- No three dimensions, no per-axis or per-level refinement ratios, no non-rectangular patches.
-- The edge space is 2D Cartesian only; the nodal Poisson solve uses Cartesian control volumes
-  also on an $(r, z)$ hierarchy.
+- The cell operator has the LU only, on every rank, and is 1D and 2D only.
+- No per-axis or per-level refinement ratios, no non-rectangular patches.
+- The edge space is Cartesian only (1D, 2D, 3D); the nodal Poisson solve uses Cartesian control
+  volumes also on an $(r, z)$ hierarchy.
 - The Shortley-Weller rows are used only at regular nodes; elsewhere, and for the cell operator,
   an embedded surface is a two-point flux (about first order in the maximum norm).
 

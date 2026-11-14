@@ -7,6 +7,13 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Compiled kernels for the node deposit in 1D and 3D (`deposit_nodes_1d`,
+  `deposit_nodes_3d`; only 2D had one): `CompositeNodes.deposit` of 1e5 markers on a line
+  5.0 → 0.59 ms, in 3D 21 → 7.5 ms. The deposit no longer copies points and charges that are
+  already C-ordered (the copies cost as much as the kernel).
+- The edge space on a line: `CompositeEdges` takes 1D hierarchies (the edges are the leaf
+  cells; none hangs), and `deposit_paths` walks each path in a compiled kernel there
+  (`deposit_paths_1d`): 1e5 paths 50 → 3.1 ms.
 - Examples "Multigrid over patches" (3D: the LU's setup grows much faster than the multigrid's,
   1.7 s against 0.12 s at 32^3, a step with a new coefficient 11x faster; iterations do not
   grow with the patches) and "Anisotropic coefficients" (a tensor turned against the grid: second
