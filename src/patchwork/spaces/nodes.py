@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import scipy.sparse as sparse
@@ -43,6 +43,32 @@ def _corner_offsets(ndim: int) -> np.ndarray:
         [[(k >> axis) & 1 for axis in range(ndim)] for k in range(2**ndim)],
         dtype=np.int64,
     )
+
+
+def _c_order(array: np.ndarray) -> np.ndarray:
+    """``array`` with C strides, copied only when it has other strides.
+
+    A ``(2, 1)`` slice is flagged C-contiguous but can keep F strides, which the
+    compiled kernels refuse; a copy of a large array costs as much as the deposit.
+    """
+    strides, step = [], array.itemsize
+    for size in reversed(array.shape):
+        strides.append(step)
+        step *= size
+    if array.flags.c_contiguous and array.strides == tuple(reversed(strides)):
+        return array
+    return np.array(array, order="C")
+
+
+def _deposit_kernel(ndim: int) -> Any:
+    """The compiled deposit kernel of a mesh of ``ndim`` axes."""
+    if ndim == 1:
+        from patchwork.kernels.deposit_nodes_1d import kernel
+    elif ndim == 2:
+        from patchwork.kernels.deposit_nodes import kernel
+    else:
+        from patchwork.kernels.deposit_nodes_3d import kernel
+    return kernel
 
 
 def _deposit_rules() -> dict:
@@ -674,23 +700,21 @@ class CompositeNodes:
         itself through the coupling. Hanging nodes receive charge like any
         other; `NodalPoisson.solve` with ``charge=`` hands it to the
         nodes they hang from with the transposed interpolation, so the total
-        charge is kept. Points outside the domain deposit nothing. In 2D a compiled
-        kernel (``deposit_nodes``) makes one pass over the points.
+        charge is kept. Points outside the domain deposit nothing. A compiled
+        kernel (``deposit_nodes_1d``, ``deposit_nodes``, ``deposit_nodes_3d``) makes one
+        pass over the points.
         """
         points = np.asarray(points, dtype=float)
         charges = np.asarray(charges, dtype=float).reshape(-1)
         if charges.shape[0] != points.shape[1]:
             raise ValueError(f"{points.shape[1]} points but {charges.shape[0]} charges")
-        if self.ndim == 2 and points.shape[1]:
+        charge = np.zeros(self.num_nodes)
+        if points.shape[1]:
             # one pass of the compiled kernel, the same cells and weights
-            from patchwork.kernels.deposit_nodes import kernel as deposit_nodes
-
-            charge = np.zeros(self.num_nodes)
+            deposit_nodes = _deposit_kernel(self.ndim)
             deposit_nodes(
-                # a copy in C order: a (2, 1) slice is flagged C-contiguous but
-                # can keep F strides, which the compiled kernel refuses
-                np.array(points, order="C"),
-                np.array(charges, order="C"),
+                _c_order(points),
+                _c_order(charges),
                 self._origin,
                 self._spacing,
                 self._cells,
@@ -701,13 +725,7 @@ class CompositeNodes:
                 self.cell_span,
                 charge,
             )
-            return charge
-        corners, weights = self.cell_weights(points)
-        return np.bincount(
-            corners.reshape(-1),
-            weights=(weights * charges[:, None]).reshape(-1),
-            minlength=self.num_nodes,
-        )
+        return charge
 
     def point_cells(
         self, points: np.ndarray

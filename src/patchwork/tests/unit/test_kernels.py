@@ -45,7 +45,27 @@ def _meshes() -> dict[str, AMRHierarchy]:
     line = AMRHierarchy(base_shape=(20,), bounds=((1.0, 3.0),), periodic=(True,))
     line.add_patch(level=1, box=((0, 12),))
     line.add_patch(level=2, box=((4, 16),))
-    return {"nested": nested, "periodic": periodic, "ell": ell, "line": line}
+    bounded = AMRHierarchy(base_shape=(12,), bounds=((-1.0, 0.5),))
+    bounded.add_patch(level=1, box=((0, 12),))  # at the lower face
+    bounded.add_patch(level=2, box=((8, 20),))
+    box = AMRHierarchy(
+        base_shape=(6, 6, 4),
+        base_boxes=[((0, 3), (0, 6), (0, 4)), ((3, 6), (3, 6), (0, 4))],
+        bounds=((0.0, 1.5), (-1.0, 0.5), (0.0, 1.0)),
+    )
+    box.add_patch(level=1, box=((2, 8), (6, 12), (2, 6)))  # over both base boxes
+    box_periodic = AMRHierarchy(base_shape=(4, 6, 4), periodic=(True, False, True))
+    box_periodic.add_patch(level=1, box=((0, 8), (2, 8), (4, 8)))  # the periodic axis
+    box_periodic.add_patch(level=2, box=((8, 12), (8, 16), (12, 16)))
+    return {
+        "nested": nested,
+        "periodic": periodic,
+        "ell": ell,
+        "line": line,
+        "bounded line": bounded,
+        "box": box,
+        "periodic box": box_periodic,
+    }
 
 
 def _points(mesh: AMRHierarchy) -> list[np.ndarray]:
@@ -59,8 +79,10 @@ def _points(mesh: AMRHierarchy) -> list[np.ndarray]:
         lines = low + length * rng.integers(0, finest[axis] + 1, 200) / finest[axis]
         faces = np.array([low, high, low - length, high + length, np.nan, high])
         coordinates.append(np.concatenate([random, lines, faces]))
-    if mesh.ndim == 2:  # the lines along one axis only, the other one random
+    if mesh.ndim >= 2:  # the lines along one axis only, the other one random
         coordinates[1][600:700] = coordinates[1][:100]
+    if mesh.ndim == 3:  # on lines along two axes, on planes along one
+        coordinates[2][650:750] = coordinates[2][50:150]
     return coordinates
 
 
@@ -173,11 +195,14 @@ def test_patch_nodes_are_kept_and_read_only(name: str) -> None:
 
 
 @pytest.mark.parametrize("implementation", IMPLEMENTATIONS)
-@pytest.mark.parametrize("name", ["nested", "periodic", "ell"])
+@pytest.mark.parametrize(
+    "name",
+    ["nested", "periodic", "ell", "line", "bounded line", "box", "periodic box"],
+)
 def test_the_compiled_deposit_is_the_transposed_evaluation(
     name: str, implementation: str
 ) -> None:
-    """CompositeNodes.deposit (a kernel in 2D) against the weights of cell_weights."""
+    """CompositeNodes.deposit (a kernel in 1D, 2D, 3D) against the weights of cell_weights."""
     mesh = _meshes()[name]
     nodes = CompositeNodes(mesh)
     points = np.stack(_points(mesh))
@@ -195,7 +220,7 @@ def test_the_compiled_deposit_is_the_transposed_evaluation(
         assert np.array_equal(nodes.deposit(points[:, :0], charges[:0]), 0 * charge)
 
     assert np.allclose(charge, expected, rtol=0.0, atol=1e-12)
-    if name != "periodic":  # some points are outside
+    if not all(mesh.periodic):  # some points are outside
         assert np.any(weights.sum(axis=1) == 0.0)
 
 

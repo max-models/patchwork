@@ -203,12 +203,12 @@ def _continuity_rules() -> dict:
     components=("patchwork.spaces.nodes.CompositeNodes",),
 )
 class CompositeEdges:
-    """The edges of the leaf cells of a 2D or 3D hierarchy, and the operators on them.
+    """The edges of the leaf cells of a 1D, 2D or 3D hierarchy, and the operators on them.
 
     Edges are addressed on the finest lattice, as the nodes are: an edge is its
     direction (0 along x, 1 along y), the lattice point of its lower end and its
     span. A coarse edge and the fine edges that halve it are different edges;
-    the fine ones hang.
+    the fine ones hang. On a line the edges are the leaf cells, and none hangs.
 
     Attributes:
         nodes: The `CompositeNodes` of the hierarchy.
@@ -350,8 +350,10 @@ class CompositeEdges:
     @sp.profile("patchwork.composite_edges", tags=PROFILE_TAGS)
     def __init__(self, nodes: CompositeNodes) -> None:
         """Number the edges of the leaf cells of ``nodes`` and find the hanging ones."""
-        if nodes.ndim not in (2, 3):
-            raise NotImplementedError("the edge space is two- or three-dimensional")
+        if nodes.ndim not in (1, 2, 3):
+            raise NotImplementedError(
+                "the edge space is one-, two- or three-dimensional"
+            )
         self.nodes = nodes
         ndim = nodes.ndim
         offsets = corner_bits(ndim)
@@ -524,6 +526,14 @@ class CompositeEdges:
             np.zeros(self.num_edges),
         )
 
+    def _line_edges(self) -> np.ndarray:
+        """The edge of each leaf cell of a line, C-ordered (the kernels' argument)."""
+        if getattr(self, "_line_edge", None) is None:
+            self._line_edge = np.ascontiguousarray(
+                self.cell_edges[:, 0], dtype=np.int64
+            )
+        return self._line_edge
+
     def _pieces(
         self, start: np.ndarray, end: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -563,6 +573,42 @@ class CompositeEdges:
             start[:, path] + finish * step[:, path],
         )
 
+    def _deposit_pieces(
+        self, start: np.ndarray, end: np.ndarray, charges: np.ndarray
+    ) -> np.ndarray:
+        """`deposit_paths` in NumPy, in any dimension: one pass over all pieces."""
+        nodes = self.nodes
+        path, a, b = self._pieces(start, end)
+        leaf, fraction, inside = nodes.point_cells(0.5 * (a + b))
+        size = nodes.cell_size[leaf]
+        charge = np.where(inside, charges[path], 0.0)
+        step = b - a
+        # the fractions at the piece's ends, in the leaf cell of its midpoint
+        half = [0.5 * step[axis] / size[:, axis] for axis in range(nodes.ndim)]
+        at_start = [fraction[axis] - half[axis] for axis in range(nodes.ndim)]
+        at_end = [fraction[axis] + half[axis] for axis in range(nodes.ndim)]
+        # along a piece an edge function is a product of linear functions, of
+        # degree ndim - 1: Simpson's rule integrates it exactly
+        weights = [
+            (w0 + 4.0 * w1 + w2) / 6.0
+            for w0, w1, w2 in zip(
+                self._weights(leaf, at_start),
+                self._weights(leaf, fraction),
+                self._weights(leaf, at_end),
+                strict=True,
+            )
+        ]
+        current = np.zeros(self.num_edges)
+        for axis, weight in enumerate(weights):
+            along = charge * step[axis] / size[:, axis]
+            columns = self.cell_edges[leaf][:, _axis_columns(nodes.ndim, axis)]
+            current += np.bincount(
+                columns.reshape(-1),
+                weights=(weight * along[:, None]).reshape(-1),
+                minlength=self.num_edges,
+            )
+        return current
+
     @method(
         equations={
             "pieces": r"j_\mathrm{lower} \mathrel{+}= q\,\frac{\Delta x}{h_x}(1 - \eta_\mathrm{mid}), \qquad j_\mathrm{upper} \mathrel{+}= q\,\frac{\Delta x}{h_x}\,\eta_\mathrm{mid}, \qquad \text{likewise for the } y\text{-edges}",
@@ -594,8 +640,9 @@ class CompositeEdges:
         charge on the nodes, ``T^T`` of `CompositeNodes.deposit` at the ends minus at the
         starts, and ``j @ e`` is the work of the field ``e`` on the charges. The
         current density times the time step, summed over a step's paths, is
-        ``j``. Pieces outside the domain deposit nothing. A NumPy reference,
-        one pass over all pieces.
+        ``j``. Pieces outside the domain deposit nothing. On a line a compiled
+        kernel (``deposit_paths_1d``) walks each path; in 2D and 3D a NumPy
+        reference, one pass over all pieces.
         """
         start = np.asarray(start, dtype=float)
         end = np.asarray(end, dtype=float)
@@ -604,34 +651,25 @@ class CompositeEdges:
             raise ValueError(
                 f"paths from {start.shape} to {end.shape} for {charges.size} charges"
             )
-        path, a, b = self._pieces(start, end)
         nodes = self.nodes
-        leaf, fraction, inside = nodes.point_cells(0.5 * (a + b))
-        size = nodes.cell_size[leaf]
-        charge = np.where(inside, charges[path], 0.0)
-        step = b - a
-        # the fractions at the piece's ends, in the leaf cell of its midpoint
-        half = [0.5 * step[axis] / size[:, axis] for axis in range(nodes.ndim)]
-        at_start = [fraction[axis] - half[axis] for axis in range(nodes.ndim)]
-        at_end = [fraction[axis] + half[axis] for axis in range(nodes.ndim)]
-        # along a piece an edge function is a product of linear functions, of
-        # degree ndim - 1: Simpson's rule integrates it exactly
-        weights = [
-            (w0 + 4.0 * w1 + w2) / 6.0
-            for w0, w1, w2 in zip(
-                self._weights(leaf, at_start),
-                self._weights(leaf, fraction),
-                self._weights(leaf, at_end),
-                strict=True,
-            )
-        ]
-        current = np.zeros(self.num_edges)
-        for axis, weight in enumerate(weights):
-            along = charge * step[axis] / size[:, axis]
-            columns = self.cell_edges[leaf][:, _axis_columns(nodes.ndim, axis)]
-            current += np.bincount(
-                columns.reshape(-1),
-                weights=(weight * along[:, None]).reshape(-1),
-                minlength=self.num_edges,
-            )
-        return current
+        if nodes.ndim == 1:
+            from patchwork.kernels.deposit_paths_1d import kernel as deposit_paths_1d
+            from patchwork.spaces.nodes import _c_order
+
+            current = np.zeros(self.num_edges)
+            if charges.size:
+                deposit_paths_1d(
+                    _c_order(start),
+                    _c_order(end),
+                    _c_order(charges),
+                    nodes._origin,
+                    nodes._spacing,
+                    nodes._cells,
+                    np.asarray(nodes._periodic, dtype=np.int64),
+                    nodes._leaf_cells(),
+                    nodes.cell_span,
+                    self._line_edges(),
+                    current,
+                )
+            return current
+        return self._deposit_pieces(start, end, charges)
