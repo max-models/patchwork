@@ -60,6 +60,9 @@ if TYPE_CHECKING:
 #: (lumped) or the finite-element (consistent) one.
 MASSES = ("lumped", "consistent")
 
+#: The metrics of `NodalPoisson`: the plane, or the rings of an r–z hierarchy.
+METRICS = ("cartesian", "cylindrical")
+
 
 def _diagonal(solver: NodalPoisson, lattice: tuple[int, ...]) -> float:
     """The diagonal entry of the operator at the node of a finest-lattice point."""
@@ -136,12 +139,15 @@ def _nodal_problem() -> ConvergenceProblem:
         "neumann": r"b_{N,p} \mathrel{+}= \tfrac12 |e|\, g \quad \text{for each end } p \text{ of a boundary edge } e",
         "cut_edge": r"A_{pp} \mathrel{+}= \frac{g}{\theta}, \qquad b_p \mathrel{+}= \frac{g}{\theta}\, U_k, \qquad \theta = \max(\theta_\mathrm{found}, \theta_\mathrm{min})",
         "shortley_weller": r"A_{pp} = h_x h_y \sum_\mathrm{axes} \Big(\frac{2}{a_-(a_- + a_+)} + \frac{2}{a_+(a_- + a_+)}\Big), \qquad A_{p,\pm} = -\,h_x h_y\,\frac{2}{a_\pm(a_- + a_+)}",
+        "cylindrical": r"g = 2\pi\,\bar r\,\frac{h_\perp}{2 h_a}, \quad \bar r = \tfrac12(r_e + r_K), \qquad V_p = \sum_{K \ni p} 2\pi\,\tfrac12(r_p + r_K)\,\frac{|K|}{4}, \qquad A_{p,r\pm} = -V_p\Big(\frac{2}{a_\pm(a_- + a_+)} \pm \frac{1}{r_p (a_- + a_+)}\Big)",
+        "reaction": r"(A + T^\top \mathrm{diag}(V c)\, T)\,\phi = \ldots",
     },
     order=2,
     assumptions=(
         r"unlisted faces are grounded; no permittivity: for a charge pass $\rho / \varepsilon_0$",
         "lumped and consistent mass share one assembly from the edge mass blocks (`patchwork.spaces.mass`); the consistent one takes no bodies and keeps the lumped Neumann load",
-        "Cartesian control volumes and conductances, also on an $(r, z)$ hierarchy",
+        r"Cartesian control volumes and conductances by default, also on an $(r, z)$ hierarchy; `metric='cylindrical'` weights each conductance by $2\pi$ times the mean radius of its half cell and each control volume by $2\pi$ times that of its quarter cells (the finite volumes of $-\frac1r\partial_r(r\partial_r\phi) - \partial_z^2\phi$, lumped), with the $\frac{1}{r}\,\partial_r\phi$ term in the Shortley-Weller rows",
+        r"a reaction $c\,\phi$ (`set_reaction`) adds the lumped $V_p\, c_p$ to the diagonal, e.g. a Newton Jacobian",
         r"the Shortley-Weller rows at regular cut nodes (four equal cells, not hanging), the diagonal-only cut elsewhere; they make the matrix unsymmetric",
         r"$\theta$ by 48 bisections of `inside`, or the body's `fraction`; $\theta_\mathrm{min}$ = `min_fraction` ($10^{-3}$)",
         r"the order is in the volume-weighted $L_2$ norm; in the maximum norm about 1.86 on nested patches (an $O(1)$ truncation error on the interface nodes)",
@@ -275,6 +281,8 @@ class NodalPoisson:
         np.minimum.at(smallest, flat, spans)
         np.maximum.at(largest, flat, spans)
         regular = (count == corners) & (smallest == largest) & ~nodes.hanging
+        if self.metric == "cylindrical":
+            regular &= nodes.coordinates[:, 0] > 0.0
         cut_nodes = np.unique(outside[regular[outside]])
         if not cut_nodes.size:
             return None
@@ -305,12 +313,20 @@ class NodalPoisson:
         rows, columns, entries = [], [], []
         wall_rows, wall_columns, wall_entries = [], [], []
         volume = np.prod(spacing, axis=1)
+        radius = None
+        if self.metric == "cylindrical":
+            # the ring's volume, and the 1/r d/dr term on the radial arms
+            radius = nodes.coordinates[cut_nodes, 0]
+            volume = 2.0 * np.pi * radius * volume
         diagonal = np.zeros(cut_nodes.size)
         for axis in range(ndim):
             total = arm[axis, 0] + arm[axis, 1]
             for side in range(2):
-                coefficient = volume * 2.0 / (arm[axis, side] * total)
-                diagonal += coefficient
+                second = volume * 2.0 / (arm[axis, side] * total)
+                diagonal += second
+                coefficient = second
+                if radius is not None and axis == 0:
+                    coefficient = second + (2 * side - 1) * volume / (radius * total)
                 to_node = body[axis, side] < 0
                 rows.append(cut_nodes[to_node])
                 columns.append(neighbour[axis, side][to_node])
@@ -404,12 +420,24 @@ class NodalPoisson:
         size = nodes.cell_size if cells is None else nodes.cell_size[cells]
         lumped = self.mass == "lumped"
         firsts, seconds, conductances, lengths = [], [], [], []
+        centre_radius = None
+        if self.metric == "cylindrical":
+            pick = slice(None) if cells is None else cells
+            centre_radius = nodes.cell_centers[pick, 0]
         for axis in range(ndim):
             blocks = edge_mass_blocks(size, axis, lumped)
             for k, (start, end) in enumerate(edge_corners(ndim, axis)):
                 firsts.append(corners[:, start])
                 seconds.append(corners[:, end])
-                conductances.append(blocks[:, k, k])
+                conductance = blocks[:, k, k]
+                if centre_radius is not None:
+                    # 2 pi times the mean radius of the half cell next to the edge
+                    edge_radius = 0.5 * (
+                        nodes.coordinates[corners[:, start], 0]
+                        + nodes.coordinates[corners[:, end], 0]
+                    )
+                    conductance = conductance * np.pi * (edge_radius + centre_radius)
+                conductances.append(conductance)
                 lengths.append(size[:, axis])
         first = np.concatenate(firsts)
         second = np.concatenate(seconds)
@@ -478,23 +506,28 @@ class NodalPoisson:
         operator = sparse.csr_matrix((entries, (rows, columns)), shape=(n, n))
         return operator, wall
 
-    def _assemble_matrix(self) -> None:
-        """This rank's rows of the operator and the right-hand-side maps; set up the backend.
-
-        A solver that can take a new operator of the same structure
-        (``update``, as the multigrid's) keeps what it built from the mesh.
-        """
+    def _reduce(self) -> None:
+        """Reduce the assembled operator (with the reaction) to this rank's rows; set up the backend."""
         nodes = self.nodes
         fixed = self._fixed_nodes
         reduction = nodes.reduction
         lumped = self.mass == "lumped"
-        operator, wall = self._operator(self._cells)
+        operator, wall = self._operator_and_wall
 
         # rows of T^T A T for the unknowns this rank holds
         pick = sparse.csr_matrix(reduction[:, self.rows].T)
         reduced = sparse.csr_matrix(pick @ operator @ reduction)
+        self.stiffness = reduced[:, self._unknowns].tocsr()
+        if self._reaction is not None:
+            reaction = sparse.diags(self.volumes * self._reaction)
+            reduced = sparse.csr_matrix(reduced + pick @ reaction @ reduction)
         self._wall = sparse.csr_matrix(pick @ wall)
-        self._load = sparse.csr_matrix(pick @ nodes.mass(lumped=lumped))
+        mass = (
+            sparse.csr_matrix(sparse.diags(self.volumes))
+            if lumped
+            else nodes.mass(lumped=False)
+        )
+        self._load = sparse.csr_matrix(pick @ mass)
         # a source already integrated over the control volumes (a deposited charge)
         self._integral_load = pick
         self._lift = reduced[:, fixed].tocsr()
@@ -507,10 +540,12 @@ class NodalPoisson:
             nodes=nodes,
             faces=dict(self._faces),
             bodies=len(self._embedded),
-            singular=not self.fixed.any(),
+            singular=not self.fixed.any()
+            and (self._reaction is None or not (self._reaction > 0.0).any()),
             symmetric=not self._embedded,
             comm=nodes.hierarchy.comm,
             mass=self.mass,
+            reaction=self._reaction is not None,
         )
         reason = self.backend.unsupported(self.system)
         if reason is not None:
@@ -521,6 +556,15 @@ class NodalPoisson:
             update(self.system)
         else:
             self.solver = self.backend.setup(self.system)
+
+    def _assemble_matrix(self) -> None:
+        """This rank's rows of the operator and the right-hand-side maps; set up the backend.
+
+        A solver that can take a new operator of the same structure
+        (``update``, as the multigrid's) keeps what it built from the mesh.
+        """
+        self._operator_and_wall = self._operator(self._cells)
+        self._reduce()
 
     def _assemble(self) -> None:
         """Build this rank's rows of the operator, the solver and the right-hand-side maps."""
@@ -581,6 +625,8 @@ class NodalPoisson:
                 # 2D, a face in 3D), shared equally by its corners
                 corners, measure, midpoint = nodes.face_pieces(face)
                 share = corners.shape[1]
+                if self.metric == "cylindrical":
+                    measure = 2.0 * np.pi * midpoint[:, 0] * measure
                 through = measure * _evaluate(condition.gradient, *midpoint.T) / share
                 np.add.at(flux, corners.reshape(-1), np.repeat(through, share))
         body_values = np.array([body.value for body in self._embedded] or [0.0])
@@ -649,6 +695,36 @@ class NodalPoisson:
             scale = np.sqrt(value)[cell_edges]
         return tensor, scale
 
+    def _control_volumes(self) -> np.ndarray:
+        """The control volume of every node: Cartesian, or the rings' with the cylindrical metric."""
+        nodes = self.nodes
+        if self.metric != "cylindrical":
+            return nodes.volumes
+        corners = 2**nodes.ndim
+        quarter = np.prod(nodes.cell_size, axis=1) / corners
+        # 2 pi times the mean radius of the part of the cell at each corner
+        radius = 0.5 * (
+            nodes.coordinates[nodes.cell_corners, 0] + nodes.cell_centers[:, 0, None]
+        )
+        return np.bincount(
+            nodes.cell_corners.reshape(-1),
+            weights=(2.0 * np.pi * radius * quarter[:, None]).reshape(-1),
+            minlength=nodes.num_nodes,
+        )
+
+    def _reaction_of(self, reaction: np.ndarray | float | None) -> np.ndarray | None:
+        """The reaction coefficient on all nodes, or None."""
+        if reaction is None:
+            return None
+        value = np.asarray(reaction, dtype=float)
+        if value.ndim == 0:
+            value = np.full(self.nodes.num_nodes, float(value))
+        if value.shape != (self.nodes.num_nodes,):
+            raise ValueError(
+                f"expected a reaction on the {self.nodes.num_nodes} nodes, got {value.shape}"
+            )
+        return value.copy()
+
     @sp.profile("patchwork.nodal_poisson_setup", tags=PROFILE_TAGS)
     def __init__(
         self,
@@ -663,6 +739,8 @@ class NodalPoisson:
         coefficient: float | np.ndarray | None = None,
         edge_coefficient: np.ndarray | None = None,
         edges: CompositeEdges | None = None,
+        metric: str = "cartesian",
+        reaction: np.ndarray | float | None = None,
     ) -> None:
         r"""Assemble the operator and set up its backend.
 
@@ -675,9 +753,31 @@ class NodalPoisson:
         $-\nabla\cdot(\mathsf{K}\nabla\phi)$ (see `set_coefficient`; no
         embedded bodies); ``edges`` is the `CompositeEdges` of ``nodes``
         that ``edge_coefficient`` is given on (built if needed).
+
+        ``metric="cylindrical"`` solves the axisymmetric problem on an r–z
+        hierarchy (``geometry="cylindrical"``, the radius the first axis):
+        $-\frac1r\partial_r(r\partial_r\phi) - \partial_z^2\phi = f$ by
+        finite volumes over the rings, so a source integrated over a control
+        volume (``solve(charge=...)``, `volumes`) is a total over its ring.
+        Lumped mass only, no coefficient; on the axis (``r = 0``) there is no
+        condition, the radial flux vanishing there. ``reaction`` adds
+        $c\,\phi$ to the operator (see `set_reaction`).
         """
         if mass not in MASSES:
             raise ValueError(f"mass must be one of {MASSES}, got {mass!r}")
+        if metric not in METRICS:
+            raise ValueError(f"metric must be one of {METRICS}, got {metric!r}")
+        if metric == "cylindrical":
+            if not hierarchy.cylindrical:
+                raise ValueError(
+                    "metric='cylindrical' needs an r-z hierarchy "
+                    "(AMRHierarchy(geometry='cylindrical'))"
+                )
+            if mass != "lumped":
+                raise ValueError("metric='cylindrical' takes mass='lumped'")
+            if coefficient is not None or edge_coefficient is not None:
+                raise ValueError("metric='cylindrical' takes no coefficient")
+        self.metric = metric
         if mass == "consistent" and embedded:
             raise ValueError(
                 "the embedded bodies' cut edges are finite differences: "
@@ -692,7 +792,15 @@ class NodalPoisson:
         self._tensor, self._edge_scale = self._coefficients(
             coefficient, edge_coefficient
         )
+        self.volumes = self._control_volumes()
+        self._reaction = self._reaction_of(reaction)
         known = faces_of(hierarchy.ndim)
+        axis_face = metric == "cylindrical" and hierarchy.on_axis
+        if axis_face and isinstance((faces or {}).get("x_lower"), Dirichlet):
+            raise ValueError(
+                "x_lower is the axis of the cylindrical domain: it takes no "
+                "Dirichlet condition"
+            )
         unknown = set(faces or ()) - set(known) - {INNER}
         if unknown:
             raise ValueError(
@@ -706,11 +814,39 @@ class NodalPoisson:
                         f"{face} is on a periodic axis: it takes no condition"
                     )
                 continue
+            if axis_face and face == "x_lower":
+                continue  # the axis: no flux through it, no condition
             self._faces[face] = (faces or {}).get(face, Dirichlet(0.0))
         # after the faces of the rectangle, which decide the nodes they share
         self._faces[INNER] = (faces or {}).get(INNER, Dirichlet(0.0))
         self._assemble()
         self._update_values()
+
+    @sp.profile("patchwork.nodal_poisson_set_reaction", tags=PROFILE_TAGS)
+    def set_reaction(self, reaction: np.ndarray | float | None) -> None:
+        r"""Add $c\,\phi$ to the operator, ``reaction`` $c$ on all nodes; set the backend up again.
+
+        The problem becomes $-\nabla^2\phi + c\,\phi = f$, the reaction lumped:
+        $V_p c_p$ on the diagonal, through the hanging nodes' interpolation.
+        With $c$ the derivative of a source that depends on the potential it is
+        the Jacobian of a Newton step: solve it with `solve_reduced` (or the
+        `solver`) for the residual, `stiffness` being the operator without the
+        reaction. ``None`` removes it. The mesh and the conditions are kept, and
+        nothing is assembled again but the reduction.
+        """
+        self._reaction = self._reaction_of(reaction)
+        self._reduce()
+        self._update_values()
+
+    @property
+    def values(self) -> np.ndarray:
+        """The prescribed values on all nodes (faces and bodies; zero elsewhere)."""
+        return self._values
+
+    @property
+    def unknowns(self) -> np.ndarray:
+        """Node numbers of the unknowns in the order of the columns of `matrix`."""
+        return self._unknowns
 
     @sp.profile("patchwork.nodal_poisson_set_coefficient", tags=PROFILE_TAGS)
     def set_coefficient(

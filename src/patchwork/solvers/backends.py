@@ -75,6 +75,7 @@ class LinearSystem:
         comm: The communicator of the hierarchy.
         mass: The mass the operator was assembled with: ``"lumped"`` (the
             finite-difference stencil) or ``"consistent"`` (the Q1 elements).
+        reaction: Whether the operator has a reaction term (`NodalPoisson.set_reaction`).
     """
 
     matrix: sparse.csr_matrix
@@ -87,6 +88,7 @@ class LinearSystem:
     symmetric: bool
     comm: Any
     mass: str = "lumped"
+    reaction: bool = False
 
 
 class Backend:
@@ -399,6 +401,10 @@ class FFTBackend(Backend):
         hierarchy = nodes.hierarchy
         if system.bodies:
             return "the 'fft' backend takes no embedded bodies"
+        if system.reaction:
+            return (
+                "the 'fft' backend diagonalizes the Laplacian alone: no reaction term"
+            )
         if system.mass != "lumped" and nodes.ndim > 1:
             return (
                 "the 'fft' backend diagonalizes the lumped (finite-difference) stencil"
