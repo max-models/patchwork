@@ -7,6 +7,17 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `NodalPoisson(metric="cylindrical")`: the axisymmetric Poisson problem on an r–z hierarchy,
+  finite volumes over the rings (each conductance weighted by 2π times the mean radius of its
+  half cell, each control volume by its quarter cells', the 1/r term in the Shortley–Weller
+  rows), second order also across coarse–fine interfaces and with embedded bodies; the axis
+  takes no condition. `NodalPoisson.volumes` are the control volumes in the metric. Lumped
+  mass only, no coefficient. Example "Axisymmetric potential around a rod".
+- `NodalPoisson(reaction=...)` and `set_reaction(c)`: a lumped reaction term `c phi`, e.g. the
+  Jacobian of a Newton step for a Boltzmann species; only the reduction is redone.
+  `stiffness` is the operator without it, `unknowns` the order of the columns and `values`
+  the prescribed values. The FFT backend refuses a reaction (`"auto"` takes the LU).
+
 - Compiled kernels for the node deposit in 1D and 3D (`deposit_nodes_1d`,
   `deposit_nodes_3d`; only 2D had one): `CompositeNodes.deposit` of 1e5 markers on a line
   5.0 → 0.59 ms, in 3D 21 → 7.5 ms. The deposit no longer copies points and charges that are
