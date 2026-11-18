@@ -338,3 +338,65 @@ def test_a_singular_3d_box_with_the_compiled_cycle() -> None:
     assert np.linalg.norm(residual) < 1e-8 * np.linalg.norm(right)
     solver.set_coefficient(2.0)  # not only the diagonal: a full update
     assert solver.solver._diagonal_map is None
+
+
+def _independent(matrix, groups) -> bool:
+    """Whether the colours cover every row once and no two coupled rows share one."""
+    import scipy.sparse as sparse
+
+    size = matrix.shape[0]
+    colour = np.full(size, -1)
+    for number, group in enumerate(groups):
+        colour[group] = number
+    coo = sparse.coo_matrix(matrix)
+    off = coo.row != coo.col
+    return (
+        sum(g.size for g in groups) == size
+        and (colour >= 0).all()
+        and not np.any(colour[coo.row[off]] == colour[coo.col[off]])
+    )
+
+
+def test_colours_are_parities_on_lattices_and_independent_sets_elsewhere() -> None:
+    from patchwork.solvers.multigrid import _colour_groups
+
+    backend = MultigridBackend(
+        smoother="gauss-seidel", smoothing_steps=1, coarsest_unknowns=50
+    )
+    box = _box_3d((24, 13, 11), backend=backend).solver
+    assert len(box._groups[0]) <= 2  # red-black on the seven-point stencil
+    assert all(len(groups) <= 8 for groups in box._groups[1:])  # 27 points: parities
+    for level, groups in zip(box.levels, box._groups, strict=True):
+        assert _independent(level.matrix, groups)
+    # refined patches: no lattice parity works on the composite level, the general colours do
+    nested = NodalPoisson(
+        _nested(32, 2), backend=MultigridBackend(smoother="gauss-seidel")
+    )
+    for level, groups in zip(nested.solver.levels, nested.solver._groups, strict=True):
+        assert _independent(level.matrix, groups)
+    matrix = nested.solver.levels[0].matrix
+    assert _independent(matrix, _colour_groups(matrix))  # without coordinates
+    assert _colour_groups(matrix[:0, :0]) == []
+
+
+def test_the_compiled_cycle_does_not_depend_on_the_threads() -> None:
+    backend = MultigridBackend(
+        smoother="gauss-seidel", smoothing_steps=1, coarsest_unknowns=50
+    )
+    multigrid = _box_3d((25, 13, 11), backend=backend).solver
+    b = np.random.default_rng(4).standard_normal(multigrid.matrix.shape[0])
+    results = []
+    for threads in (1, 3):
+        multigrid.num_threads = threads
+        results.append(multigrid.cycle(b))
+    assert np.array_equal(results[0], results[1])
+    system = _box_3d((8, 8, 8)).system
+    assert MultigridBackend(num_threads=2).setup(system).num_threads == 2
+
+
+def test_the_interpolation_has_no_round_off_weights() -> None:
+    from patchwork.solvers.multigrid import ROUND_OFF_WEIGHT
+
+    solver = NodalPoisson(AMRHierarchy(base_shape=(32, 16, 16)), backend="multigrid")
+    for interpolation in solver.solver.interpolations:
+        assert np.abs(interpolation.data).min() >= ROUND_OFF_WEIGHT

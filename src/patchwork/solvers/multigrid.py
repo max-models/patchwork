@@ -70,11 +70,25 @@ COARSEST_UNKNOWNS = 1000
 #: Power iterations for the largest eigenvalue of the Jacobi-preconditioned operator.
 POWER_ITERATIONS = 20
 
+#: Interpolation weights below this are round-off and dropped (`prolongation`).
+ROUND_OFF_WEIGHT = 1.0e-12
+
 #: The smoothers of `CompositeMultigrid`.
 SMOOTHERS = ("chebyshev", "gauss-seidel")
 
 #: The compiled V-cycle inverts the coarsest operator densely up to this size.
 DENSE_COARSEST = 2000
+
+
+def _num_threads() -> int:
+    """The compiled V-cycle's OpenMP threads: ``OMP_NUM_THREADS``, else the usable cores."""
+    import os
+
+    value = os.environ.get("OMP_NUM_THREADS", "").split(",")[0].strip()
+    if value.isdigit() and int(value) > 0:
+        return int(value)
+    affinity = getattr(os, "sched_getaffinity", None)
+    return len(affinity(0)) if affinity is not None else os.cpu_count() or 1
 
 
 def _rebuilt(
@@ -180,6 +194,8 @@ def prolongation(
     points = fine.coordinates[fine_unknowns].T
     matrix = coarse.evaluation(points) @ coarse.reduction[:, coarse_unknowns]
     matrix = sparse.csr_matrix(matrix)
+    # the round-off weights of a fine node on a coarse one would widen the stencils
+    matrix.data[np.abs(matrix.data) < ROUND_OFF_WEIGHT] = 0.0
     matrix.eliminate_zeros()
     return matrix
 
@@ -213,7 +229,7 @@ def _lattice_prolongations(
     fine_unknowns: np.ndarray,
     system: LinearSystem,
     unknowns: int,
-) -> list[sparse.csr_matrix]:
+) -> tuple[list[sparse.csr_matrix], list[np.ndarray]]:
     """Interpolations coarsening a structured node lattice, from ``shape`` down.
 
     For base levels that `_halved` cannot coarsen (an odd number of cells): the
@@ -221,11 +237,13 @@ def _lattice_prolongations(
     ``fine_unknowns`` (flat C-order indices into ``shape``) to the coarse nodes
     neither on a Dirichlet face of ``system`` nor without a fine unknown to
     interpolate to (inside a body). Stops once a level has at most ``unknowns``
-    nodes or no axis shrinks. Returns the interpolations, the finest first.
+    nodes or no axis shrinks. Returns the interpolations, the finest first, and the
+    lattice coordinates of each coarse level's unknowns.
     """
     from patchwork.spaces.boundaries import faces_of
 
     result = []
+    coordinates: list[np.ndarray] = []
     shape = tuple(int(n) for n in shape)
     while int(np.prod(shape)) > unknowns:
         factors = [_linear_1d(n) for n in shape]
@@ -248,8 +266,11 @@ def _lattice_prolongations(
         if not coarse_unknowns.size:
             break
         result.append(sparse.csr_matrix(matrix[:, used]))
+        coordinates.append(
+            np.column_stack(np.unravel_index(coarse_unknowns, coarse_shape))
+        )
         shape, fine_unknowns = coarse_shape, coarse_unknowns
-    return result
+    return result, coordinates
 
 
 def _concatenated(
@@ -318,6 +339,100 @@ def _galerkin_of_diagonal(
     return pattern, mapping
 
 
+def _colour_groups(
+    matrix: sparse.csr_matrix, coordinates: np.ndarray | None = None
+) -> list[np.ndarray]:
+    """The rows of ``matrix`` in colours that do not couple (for Gauss--Seidel).
+
+    With the lattice ``coordinates`` of the rows, the parity colourings come
+    first: red-black (the sum of the coordinates) and then one colour per parity
+    of every coordinate, the first that leaves no two coupled rows in one colour.
+    They keep the rows of a colour in lattice order, close in memory. Otherwise each colour is a maximal independent set of the remaining rows in the
+    graph of ``matrix + matrix^T``: rows whose (fixed, pseudo-random) weight is
+    the largest among their remaining neighbours join it, round after round,
+    until no row next to none of the colour is left (Jones and Plassmann's
+    method, vectorised). Returns the rows of each colour, in increasing order.
+    """
+    size = int(np.shape(matrix)[0])
+    graph = sparse.csr_matrix(abs(matrix) + abs(matrix.T))
+    graph.setdiag(0.0)
+    graph.eliminate_zeros()
+    graph.sort_indices()
+    indptr, indices = graph.indptr, graph.indices
+    if coordinates is not None and len(coordinates) == size:
+        lattice = np.asarray(coordinates, dtype=np.int64) % 2
+        rows = np.repeat(np.arange(size), np.diff(indptr))
+        weights = 2 ** np.arange(lattice.shape[1])
+        for colour in (lattice.sum(axis=1) % 2, lattice @ weights):
+            if not np.any(colour[rows] == colour[indices]):
+                return [
+                    g
+                    for g in (np.flatnonzero(colour == c) for c in np.unique(colour))
+                    if g.size
+                ]
+    weights = 1.0 + np.random.default_rng(0).random(size)
+    remaining = np.ones(size, dtype=bool)
+    nonempty = np.diff(indptr) > 0
+    starts = indptr[:-1][nonempty]
+    groups = []
+    while remaining.any():
+        candidate = remaining.copy()
+        colour = np.zeros(size, dtype=bool)
+        while candidate.any():
+            active = np.where(candidate, weights, 0.0)
+            largest = np.zeros(size)
+            if indices.size:
+                largest[nonempty] = np.maximum.reduceat(active[indices], starts)
+            chosen = candidate & (active > largest)
+            colour |= chosen
+            touched = np.zeros(size, dtype=bool)
+            if indices.size:
+                hits = np.zeros(size)
+                hits[nonempty] = np.add.reduceat(chosen[indices].astype(float), starts)
+                touched = hits > 0
+            candidate &= ~chosen & ~touched
+        groups.append(np.flatnonzero(colour))
+        remaining &= ~colour
+    return groups
+
+
+def _colour_bounds(groups: list[list[np.ndarray]]) -> tuple[np.ndarray, np.ndarray]:
+    """The colour ranges of the levels, numbered colour by colour, for the kernel.
+
+    Returns the bounds of the colours within their level (one more than the colours
+    per level) and where each level's bounds begin (one more than the levels).
+    """
+    starts: list[int] = []
+    levels = [0]
+    for level in groups:
+        starts.extend(int(b) for b in np.cumsum([0, *(g.size for g in level)]))
+        levels.append(len(starts))
+    return np.asarray(starts, dtype=np.int64), np.asarray(levels, dtype=np.int64)
+
+
+def _renumbered(
+    matrix: sparse.csr_matrix, order: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``matrix[order][:, order]``'s pattern and where its values come from.
+
+    Returns the row pointers, the columns and the positions in ``matrix.data`` of
+    the renumbered matrix's values, so that a matrix of the same pattern is
+    renumbered by indexing its values.
+    """
+    positions = sparse.csr_matrix(
+        (np.arange(1.0, matrix.nnz + 1.0), matrix.indices, matrix.indptr),
+        shape=matrix.shape,
+    )
+    renumbered = sparse.csr_matrix(positions[order][:, order])
+    renumbered.sort_indices()
+    source = np.rint(renumbered.data).astype(np.int64) - 1
+    return (
+        renumbered.indptr.astype(np.int64),
+        renumbered.indices.astype(np.int64),
+        source,
+    )
+
+
 def _unit_diagonal_where_empty(matrix: sparse.csr_matrix) -> sparse.csr_matrix:
     """``matrix`` with a one on the diagonal of its rows without a diagonal entry."""
     empty = matrix.diagonal() == 0.0
@@ -330,12 +445,17 @@ class _Level:
     """One level of the V-cycle: its operator and its smoother.
 
     Chebyshev iteration with Jacobi preconditioning (``estimate``: its interval from
-    the largest eigenvalue), else Gauss--Seidel (`smooth` forward, `smooth_back`
-    backward).
+    the largest eigenvalue), else multicolour Gauss--Seidel over the rows ``groups``
+    of each colour (`_colour_groups`): forward through the colours, or backward.
     """
 
     def __init__(
-        self, matrix: sparse.csr_matrix, steps: int, seed: int, estimate: bool = True
+        self,
+        matrix: sparse.csr_matrix,
+        steps: int,
+        seed: int,
+        estimate: bool = True,
+        groups: list[np.ndarray] | None = None,
     ) -> None:
         """Estimate the largest eigenvalue of the Jacobi-preconditioned operator."""
         size = int(np.shape(matrix)[0])
@@ -343,6 +463,7 @@ class _Level:
         self.inverse_diagonal = 1.0 / matrix.diagonal()
         self.steps = int(steps)
         self.chebyshev = bool(estimate)
+        self.groups = groups
         if not estimate:
             self.lower = self.upper = 0.0
             return
@@ -358,17 +479,15 @@ class _Level:
     def smooth(self, x: np.ndarray, b: np.ndarray, forward: bool = True) -> np.ndarray:
         """``steps`` Chebyshev iterations (or Gauss--Seidel sweeps) on ``A x = b`` from ``x``."""
         if not self.chebyshev:
-            matrix = self.matrix
-            triangle = (
-                sparse.tril(matrix, format="csr")
-                if forward
-                else sparse.triu(matrix, format="csr")
-            )
-            other = matrix - triangle
+            assert self.groups is not None
+            off = self.matrix - sparse.diags(self.matrix.diagonal())
+            order = self.groups if forward else self.groups[::-1]
+            x = np.array(x, dtype=float)
             for _ in range(self.steps):
-                x = scipy.sparse.linalg.spsolve_triangular(
-                    triangle, b - other @ x, lower=forward
-                )
+                for group in order:
+                    x[group] = (b[group] - off[group] @ x) * self.inverse_diagonal[
+                        group
+                    ]
             return x
         theta = 0.5 * (self.upper + self.lower)
         delta = 0.5 * (self.upper - self.lower)
@@ -436,11 +555,12 @@ class CompositeMultigrid:
         fine_unknowns: np.ndarray,
         system: LinearSystem,
         coarsest_unknowns: int,
-    ) -> list[sparse.csr_matrix]:
+    ) -> tuple[list[sparse.csr_matrix], list[np.ndarray]]:
         """The levels below a base level that `_halved` cannot coarsen (`_lattice_prolongations`).
 
         Only for a base level without refinement and periodic axes, whose nodes
-        are the points of its lattice; otherwise none.
+        are the points of its lattice; otherwise none. Returns the interpolations
+        and the lattice coordinates of each new level's unknowns.
         """
         hierarchy = fine.hierarchy
         if (
@@ -449,11 +569,11 @@ class CompositeMultigrid:
             or fine.hanging.any()
             or fine_unknowns.size <= coarsest_unknowns
         ):
-            return []
+            return [], []
         shape = tuple(int(n) + 1 for n in hierarchy.base_shape)
         lattice = np.asarray(fine.lattice, dtype=np.int64)
         if fine.num_nodes != int(np.prod(shape)):
-            return []  # a domain that does not fill its rectangle
+            return [], []  # a domain that does not fill its rectangle
         flat = np.asarray(np.ravel_multi_index(tuple(lattice.T), shape))
         return _lattice_prolongations(
             shape, flat[fine_unknowns], system, coarsest_unknowns
@@ -468,10 +588,12 @@ class CompositeMultigrid:
         smoothing_steps: int = 2,
         coarsest_unknowns: int = COARSEST_UNKNOWNS,
         smoother: str = "chebyshev",
+        num_threads: int | None = None,
     ) -> None:
         """Build the coarse spaces and their interpolations, then the levels."""
         if smoother not in SMOOTHERS:
             raise ValueError(f"smoother must be one of {SMOOTHERS}, got {smoother!r}")
+        self.num_threads = _num_threads() if num_threads is None else int(num_threads)
         self.rtol = float(rtol)
         self.max_iterations = int(max_iterations)
         self.smoothing_steps = int(smoothing_steps)
@@ -479,12 +601,18 @@ class CompositeMultigrid:
         self._reference: sparse.csr_matrix | None = None
         self._diagonal_map: sparse.csr_matrix | None = None
         self._diagonal_positions: np.ndarray | None = None
+        self._patterns: list[tuple[np.ndarray, np.ndarray]] | None = None
+        self._groups: list[list[np.ndarray]] = []
+        self._orders: list[np.ndarray] = []
+        self._renumbering: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
         self._transfer: tuple | None = None
         self._compiled: dict[str, Any] | None = None
         fine = system.nodes
         fine_unknowns = np.asarray(system.unknowns)
         self.hierarchies = coarser_hierarchies(fine.hierarchy, coarsest_unknowns)
         self.interpolations = []
+        # lattice coordinates of every level's unknowns, for the colours
+        self._coordinates = [np.asarray(fine.lattice)[fine_unknowns]]
         for hierarchy in self.hierarchies:
             coarse = CompositeNodes(hierarchy)
             coarse_unknowns = _unknowns(coarse, system)
@@ -493,11 +621,14 @@ class CompositeMultigrid:
             self.interpolations.append(
                 prolongation(coarse, coarse_unknowns, fine, fine_unknowns)
             )
+            self._coordinates.append(np.asarray(coarse.lattice)[coarse_unknowns])
             fine, fine_unknowns = coarse, coarse_unknowns
         else:
-            self.interpolations += self._lattice_levels(
+            more, coordinates = self._lattice_levels(
                 fine, fine_unknowns, system, coarsest_unknowns
             )
+            self.interpolations += more
+            self._coordinates += coordinates
         self.num_levels = len(self.interpolations) + 1
         # the control volumes of the hanging nodes go to the nodes they hang from:
         # sum_p V_p phi_p over all nodes, phi on the unknowns
@@ -526,44 +657,55 @@ class CompositeMultigrid:
     ) -> dict[str, Any]:
         """The arguments of the ``multigrid_vcycle`` kernel for these level operators.
 
-        The structure of ``previous`` (the last arguments) is kept when every
-        level's pattern is the same: then only the values are copied.
+        The structure of ``previous`` (the last arguments, given when every
+        level's pattern is the same) is kept: then only the values are copied.
         """
         sizes = [int(np.shape(m)[0]) for m in operators]
         offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
         coarsest = operators[-1].toarray()
         n = coarsest.shape[0]
         dense = np.zeros((n, n))
-        if self.singular:
+        if self.singular:  # the coarsest level keeps its numbering
             # x[1:] = A[1:, 1:]^-1 (b[1:] - mean(b)), x[0] = 0, as `_coarsest_solve`
             inverse = np.linalg.inv(coarsest[1:, 1:])
             dense[1:, 1:] = inverse
             dense[1:, :] -= inverse.sum(axis=1)[:, None] / n
         else:
             dense = np.linalg.inv(coarsest)
-        patterns = [(m.indptr, m.indices) for m in operators]
-        same = previous is not None and len(previous["patterns"]) == len(patterns)
-        if same:
-            assert previous is not None
-            same = all(
-                np.array_equal(old_ptr, ptr) and np.array_equal(old_idx, idx)
-                for (old_ptr, old_idx), (ptr, idx) in zip(
-                    previous["patterns"], patterns, strict=True
-                )
-            )
-        if same:
-            assert previous is not None
+        values = np.concatenate(
+            [
+                m.data[source]
+                for m, (_, _, source) in zip(operators, self._renumbering, strict=True)
+            ]
+        )
+        if previous is not None:
             pointers, starts, columns, _ = previous["a"]
-            a = (pointers, starts, columns, np.concatenate([m.data for m in operators]))
+            a = (pointers, starts, columns, values)
         else:
-            a = _concatenated(operators)
+            renumbered = [
+                sparse.csr_matrix((m.data[source], idx, ptr), shape=m.shape)
+                for m, (ptr, idx, source) in zip(
+                    operators, self._renumbering, strict=True
+                )
+            ]
+            a = _concatenated(renumbered)
         if self._transfer is None:
+            orders = self._orders
+            interpolations = [
+                sparse.csr_matrix(p[orders[k]][:, orders[k + 1]])
+                for k, p in enumerate(self.interpolations)
+            ]
             self._transfer = (
-                _concatenated(self.interpolations),
-                _concatenated([sparse.csr_matrix(p.T) for p in self.interpolations]),
+                _concatenated(interpolations),
+                _concatenated([sparse.csr_matrix(p.T) for p in interpolations]),
             )
         p, r = self._transfer
         total = int(offsets[-1])
+        colours = (
+            previous["colours"]
+            if previous is not None
+            else _colour_bounds(self._groups)
+        )
         return {
             "levels": len(operators),
             "offsets": offsets,
@@ -573,10 +715,10 @@ class CompositeMultigrid:
             "coarse": np.ascontiguousarray(dense),
             "work": (
                 previous["work"]
-                if same and previous is not None
+                if previous is not None
                 else (np.zeros(total), np.zeros(total), np.zeros(total))
             ),
-            "patterns": patterns,
+            "colours": colours,
         }
 
     def _take(self, operator: sparse.csr_matrix, change: np.ndarray | None) -> None:
@@ -622,12 +764,37 @@ class CompositeMultigrid:
                     sparse.csr_matrix(interpolation.T @ operators[-1] @ interpolation)
                 )
             )
+        patterns = [(m.indptr, m.indices) for m in operators]
+        old = self._patterns
+        same = old is not None and len(old) == len(patterns)
+        if same:
+            assert old is not None
+            same = all(
+                np.array_equal(old_ptr, ptr) and np.array_equal(old_idx, idx)
+                for (old_ptr, old_idx), (ptr, idx) in zip(old, patterns, strict=True)
+            )
+        self._patterns = patterns
+        gauss_seidel = self.smoother == "gauss-seidel"
+        if gauss_seidel and not same:
+            self._groups = [
+                _colour_groups(m, c)
+                for m, c in zip(operators[:-1], self._coordinates, strict=False)
+            ]
+            # every level numbered colour by colour for the compiled cycle
+            self._orders = [np.concatenate(g) for g in self._groups]
+            self._orders.append(np.arange(np.shape(operators[-1])[0]))
+            self._renumbering = [
+                _renumbered(m, order)
+                for m, order in zip(operators, self._orders, strict=True)
+            ]
+            self._transfer = None
         self.levels = [
             _Level(
                 matrix,
                 self.smoothing_steps,
                 depth,
-                estimate=self.smoother == "chebyshev",
+                estimate=not gauss_seidel,
+                groups=self._groups[depth] if gauss_seidel else None,
             )
             for depth, matrix in enumerate(operators[:-1])
         ]
@@ -635,8 +802,10 @@ class CompositeMultigrid:
         self._coarsest_operator = coarsest
         self._coarsest = None  # factorised when the uncompiled cycle needs it
         previous, self._compiled = self._compiled, None
-        if self.smoother == "gauss-seidel" and np.shape(coarsest)[0] <= DENSE_COARSEST:
-            self._compiled = self._compiled_arguments(operators, previous)
+        if gauss_seidel and np.shape(coarsest)[0] <= DENSE_COARSEST:
+            self._compiled = self._compiled_arguments(
+                operators, previous if same else None
+            )
 
     def update_diagonal(self, diagonal: np.ndarray) -> None:
         """Take the operator of the last full update with ``diagonal`` on its diagonal.
@@ -732,12 +901,16 @@ class CompositeMultigrid:
             return self._cycle(0, b)
         from patchwork.kernels.multigrid_vcycle import kernel
 
-        x = np.empty_like(b)
+        order = self._orders[0]
+        renumbered = np.empty_like(b)
         kernel(
             arguments["levels"], arguments["offsets"], *arguments["a"],
             *arguments["p"], *arguments["r"], arguments["coarse"],
-            self.smoothing_steps, np.ascontiguousarray(b), x, *arguments["work"],
+            *arguments["colours"], self.smoothing_steps, self.num_threads,
+            np.ascontiguousarray(b[order]), renumbered, *arguments["work"],
         )  # fmt: skip
+        x = np.empty_like(b)
+        x[order] = renumbered
         return x
 
     @property
@@ -845,6 +1018,7 @@ class MultigridBackend(Backend):
         smoothing_steps: int = 2,
         coarsest_unknowns: int = COARSEST_UNKNOWNS,
         smoother: str = "chebyshev",
+        num_threads: int | None = None,
     ) -> None:
         """The options of `CompositeMultigrid`."""
         self.options: dict[str, Any] = {
@@ -853,6 +1027,7 @@ class MultigridBackend(Backend):
             "smoothing_steps": smoothing_steps,
             "coarsest_unknowns": coarsest_unknowns,
             "smoother": smoother,
+            "num_threads": num_threads,
         }
 
     def unsupported(self, system: LinearSystem) -> str | None:
