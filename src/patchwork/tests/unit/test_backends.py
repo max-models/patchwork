@@ -259,3 +259,86 @@ def test_a_periodic_line_with_a_body_is_not_tridiagonal() -> None:
     body = EmbeddedDirichlet(lambda points: np.abs(points[0] - 0.5) < 0.1, 1.0)
     solver = NodalPoisson(_mesh((16,), (True,)), embedded=[body], backend="auto")
     assert not isinstance(solver.solver, TridiagonalLU | FFTSolver)
+
+
+AMG = pytest.mark.skipif(
+    __import__("importlib").util.find_spec("pyamg") is None, reason="needs pyamg"
+)
+
+
+def _sphere_case(ndim: int, reaction: float | None = None):
+    """A body at 1 V in a box at 0 V (2D: a disc), with a source, LU and AMG."""
+    from patchwork import AMGBackend
+
+    shape = (24,) * ndim
+    bounds = tuple((-1.0, 1.0) for _ in range(ndim))
+    faces = {
+        f"{axis}_{side}": Dirichlet(0.0)
+        for axis in "xyz"[:ndim]
+        for side in ("lower", "upper")
+    }
+
+    def body(points):
+        return np.sum(np.asarray(points) ** 2, axis=0) < 0.3**2
+
+    solutions = []
+    for backend in (LUBackend(), AMGBackend(rtol=1e-12)):
+        solver = NodalPoisson(
+            AMRHierarchy(base_shape=shape, bounds=bounds),
+            faces=faces,
+            embedded=[EmbeddedDirichlet(body, 1.0)],
+            backend=backend,
+        )
+        if reaction is not None:
+            solver.set_reaction(reaction)
+        source = np.cos(np.asarray(solver.nodes.coordinates)[:, 0])
+        solutions.append((solver, solver.solve(source)))
+    return solutions
+
+
+@AMG
+@pytest.mark.parametrize("ndim", [2, 3])
+@pytest.mark.parametrize("reaction", [None, 40.0])
+def test_amg_solves_as_the_lu(ndim, reaction) -> None:
+    (_, direct), (solver, amg) = _sphere_case(ndim, reaction)
+    np.testing.assert_allclose(amg, direct, rtol=0.0, atol=1e-9)
+    assert 0 < solver.solver.iterations < 40  # the V-cycle preconditions well
+
+
+@AMG
+def test_the_amg_preconditioner_serves_a_nearby_operator() -> None:
+    from patchwork import AMGSolver
+
+    (_, _), (solver, _) = _sphere_case(3)
+    assert isinstance(solver.solver, AMGSolver)
+    # the Laplacian's V-cycle preconditions GMRES on the operator with a reaction term
+    nearby = solver.stiffness + scipy.sparse.diags(
+        np.full(solver.unknowns.size, 5.0) * solver.volumes[solver.unknowns]
+    )
+    b = np.ones(solver.unknowns.size)
+    x, info = scipy.sparse.linalg.gmres(
+        nearby, b, M=solver.solver.preconditioner, rtol=1e-10, restart=40, maxiter=2
+    )
+    assert info == 0
+    np.testing.assert_allclose(nearby @ x, b, atol=1e-8)
+
+
+@AMG
+def test_amg_refuses_a_singular_operator_and_reports_a_failed_solve() -> None:
+    from patchwork import AMGBackend, AMGSolver
+
+    with pytest.raises(ValueError, match="singular"):
+        neumann = {
+            f"{axis}_{side}": Neumann(0.0)
+            for axis in "xy"
+            for side in ("lower", "upper")
+        }
+        NodalPoisson(AMRHierarchy(base_shape=(8, 8)), faces=neumann, backend="amg")
+    assert backend_of("amg").name == "amg"
+    assert "rtol=1e-06" in repr(AMGBackend(rtol=1e-6))
+    hard = AMGSolver(scipy.sparse.random(30, 30, 0.2, random_state=0) + scipy.sparse.eye(30) * 1e-3,
+                     symmetric=False, rtol=1e-14, max_iterations=50)  # fmt: skip
+    with pytest.raises(RuntimeError, match="did not reach"):
+        hard.solve(np.ones(30))
+    np.testing.assert_array_equal(hard.solve(np.zeros(30)), 0.0)
+    assert hard.iterations == 0
