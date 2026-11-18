@@ -3,11 +3,13 @@
 `nodal_poisson` (`NodalPoisson` on the node space), `cell_operator`
 (`CellOperator` on the cell space), `curl_curl` (`CurlCurl` on the edge space,
 with hypre's AMS), `backends` (the linear solvers behind them:
-LU, PETSc, FFT), `multigrid` (geometric multigrid over the patches), `distributed` (the PETSc system distributed by rows) and
+LU, PETSc, FFT, AMG), `multigrid` (geometric multigrid over the patches), `distributed` (the PETSc system distributed by rows) and
 `poisson` (the legacy cell-centred Poisson solve).
 """
 
 from patchwork.solvers.backends import (
+    AMGBackend,
+    AMGSolver,
     AutoBackend,
     Backend,
     FFTBackend,
@@ -23,6 +25,8 @@ from patchwork.solvers.nodal_poisson import NodalPoisson, solve_nodal_poisson
 from patchwork.solvers.poisson import solve_poisson
 
 __all__ = [
+    "AMGBackend",
+    "AMGSolver",
     "AutoBackend",
     "Backend",
     "CellOperator",

@@ -20,6 +20,10 @@ give the same answer to round-off (or to the tolerance of an iterative one).
   both of its faces. Also the singular operators: all axes periodic or Neumann.
 - ``"auto"`` (`AutoBackend`): the tridiagonal LU on a line, the FFT
   where it applies, the LU elsewhere.
+- ``"amg"`` (`AMGBackend`): algebraic multigrid (pyamg's classical Ruge--Stueben
+  hierarchy) preconditioning CG for a symmetric operator and GMRES otherwise, on every
+  rank; the preconditioner can be kept and reused for nearby operators (`AMGSolver`).
+  Any mesh, conditions and embedded bodies; not a singular operator. Needs pyamg.
 - ``"multigrid"`` (`patchwork.solvers.multigrid.MultigridBackend`): geometric
   multigrid over the refinement levels and a coarsened base level, preconditioning
   CG, on every rank. Any mesh and conditions, also the singular operators;
@@ -244,6 +248,98 @@ class PetscBackend(Backend):
     def __repr__(self) -> str:
         """The backend with its tolerance and options."""
         return f"PetscBackend(rtol={self.rtol!r}, options={self.options!r})"
+
+
+class AMGSolver:
+    """A Krylov method preconditioned by one algebraic-multigrid V-cycle (pyamg).
+
+    `solve` runs CG (``symmetric``) or GMRES on ``matrix`` to the relative residual
+    ``rtol``; ``preconditioner`` is the V-cycle as a SciPy ``LinearOperator``, for callers
+    that keep it for nearby operators (e.g. the Jacobians of a Newton iteration), and
+    ``iterations`` the Krylov iterations of the last solve.
+    """
+
+    def __init__(
+        self,
+        matrix: sparse.spmatrix,
+        *,
+        symmetric: bool,
+        rtol: float = 1.0e-10,
+        max_iterations: int = 200,
+    ) -> None:
+        """Build the multigrid hierarchy of ``matrix``."""
+        try:
+            import pyamg
+        except ImportError as error:  # pragma: no cover - depends on the environment
+            raise ImportError(
+                "the 'amg' backend needs pyamg (pip install patchwork-amr[amg])"
+            ) from error
+        self.matrix = sparse.csr_matrix(matrix)
+        self.symmetric = bool(symmetric)
+        self.rtol = float(rtol)
+        self.max_iterations = int(max_iterations)
+        self.hierarchy = pyamg.ruge_stuben_solver(self.matrix)
+        self.preconditioner = self.hierarchy.aspreconditioner(cycle="V")
+        self.iterations = 0
+
+    def solve(self, right_hand_side: np.ndarray) -> np.ndarray:
+        """The unknowns for a right-hand side; raises if the Krylov method fails."""
+        b = np.asarray(right_hand_side, dtype=float)
+        if not np.any(b):
+            self.iterations = 0
+            return np.zeros_like(b)
+        count = [0]
+
+        def counter(_: Any) -> None:
+            count[0] += 1
+
+        if self.symmetric:
+            x, info = scipy.sparse.linalg.cg(
+                self.matrix, b, rtol=self.rtol, maxiter=self.max_iterations,
+                M=self.preconditioner, callback=counter,
+            )  # fmt: skip
+        else:
+            x, info = scipy.sparse.linalg.gmres(
+                self.matrix, b, rtol=self.rtol, restart=50,
+                maxiter=max(1, self.max_iterations // 50), M=self.preconditioner,
+                callback=counter, callback_type="pr_norm",
+            )  # fmt: skip
+        self.iterations = count[0]
+        if info != 0:
+            raise RuntimeError(
+                f"the AMG-preconditioned Krylov solve did not reach rtol={self.rtol} "
+                f"in {self.max_iterations} iterations"
+            )
+        return x
+
+
+class AMGBackend(Backend):
+    """Algebraic multigrid preconditioning a Krylov method (`AMGSolver`), on every rank.
+
+    The whole operator on every rank, as `LUBackend`, but without its fill: the setup
+    and the solve grow about linearly with the unknowns, which pays in 3D. The tolerance
+    ``rtol`` is relative to the right-hand side. Needs pyamg.
+    """
+
+    name = "amg"
+
+    def __init__(self, rtol: float = 1.0e-10, max_iterations: int = 200) -> None:
+        """Keep the tolerance and the iteration limit."""
+        self.rtol = float(rtol)
+        self.max_iterations = int(max_iterations)
+
+    def setup(self, system: LinearSystem) -> AMGSolver:
+        """Build the multigrid hierarchy."""
+        return AMGSolver(
+            system.matrix,
+            symmetric=system.symmetric,
+            rtol=self.rtol,
+            max_iterations=self.max_iterations,
+        )
+
+    def __repr__(self) -> str:
+        """The backend with its tolerance."""
+        return f"AMGBackend(rtol={self.rtol!r}, max_iterations={self.max_iterations!r})"
 
 
 def _axis_kind(system: LinearSystem, axis: int) -> str | None:
@@ -492,7 +588,7 @@ class AutoBackend(Backend):
 #: The backends by name, as ``backend=`` takes them.
 BACKENDS: dict[str, type[Backend]] = {
     backend.name: backend
-    for backend in (LUBackend, PetscBackend, FFTBackend, AutoBackend)
+    for backend in (LUBackend, PetscBackend, FFTBackend, AutoBackend, AMGBackend)
 }
 
 

@@ -20,6 +20,8 @@ from patchwork.mesh import (
     plot_patches,
 )
 from patchwork.solvers import (
+    AMGBackend,
+    AMGSolver,
     AutoBackend,
     Backend,
     CellOperator,
@@ -54,6 +56,8 @@ __version__ = "0.2.0"
 
 __all__ = [
     "AMRHierarchy",
+    "AMGBackend",
+    "AMGSolver",
     "AutoBackend",
     "Backend",
     "CellOperator",
