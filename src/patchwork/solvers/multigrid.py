@@ -27,10 +27,14 @@ the last one along each axis, with linear interpolation between them (the last
 interval of an odd axis spans one fine cell), as long as the base level has no
 refinement and no periodic axis.
 
-``smoother="gauss-seidel"`` smooths by a forward Gauss--Seidel sweep before the
-coarse correction and a backward one after it; with a coarsest level of at most
+``smoother="gauss-seidel"`` smooths by multicolour Gauss--Seidel: the unknowns
+of a level are split into colours that do not couple (parities of the lattice, red-black
+on a seven-point stencil, else independent sets of the operator's graph), swept in
+order before the coarse correction and in reverse after it. With a coarsest level of at most
 `DENSE_COARSEST` unknowns the whole V-cycle is then one compiled kernel
-(``multigrid_vcycle``). An operator that differs from the last one only on its
+(``multigrid_vcycle``), each colour in parallel over OpenMP threads
+(``num_threads``, by default ``OMP_NUM_THREADS`` or the usable cores) with a result
+that does not depend on their number. An operator that differs from the last one only on its
 diagonal (the reaction of a Newton step: `NodalPoisson.set_reaction`,
 `CompositeMultigrid.update_diagonal`) gets its first coarse operator from a
 precomputed linear map of the diagonal change, not from a new Galerkin product.
@@ -522,7 +526,7 @@ class _Level:
         "the base level halves while every bound of its boxes is even and every axis keeps two cells; else its LU is the coarsest solve",
         "the whole system on every rank (like 'lu')",
         "a base level with an odd number of cells along an axis coarsens on its node lattice (linear interpolation)",
-        "smoother='gauss-seidel': symmetric Gauss--Seidel smoothing, the V-cycle compiled when the coarsest level is small",
+        "smoother='gauss-seidel': multicolour symmetric Gauss--Seidel, the V-cycle compiled (OpenMP over each colour) when the coarsest level is small",
         "point (Jacobi) smoothing: a strongly anisotropic coefficient (magnetized susceptibility) slows it down",
     ),
     references=(

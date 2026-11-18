@@ -7,6 +7,13 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- The compiled multigrid V-cycle (`smoother="gauss-seidel"`) runs on OpenMP threads
+  (`MultigridBackend(num_threads=...)`, by default `OMP_NUM_THREADS` or the usable cores):
+  multicolour Gauss–Seidel, red-black on seven-point stencils and the eight lattice parities
+  on the coarse 27-point ones (independent sets of the graph on composite levels), each level
+  numbered colour by colour. The result does not depend on the threads; on 413 000 unknowns
+  a cycle takes 24 ms on one thread and 8.8 ms on four.
+
 - `NodalPoisson(metric="cylindrical")`: the axisymmetric Poisson problem on an r–z hierarchy,
   finite volumes over the rings (each conductance weighted by 2π times the mean radius of its
   half cell, each control volume by its quarter cells', the 1/r term in the Shortley–Weller
@@ -228,6 +235,9 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The multigrid's interpolations drop the round-off weights (below 1e-12) of fine nodes on
+  coarse nodes: they widened the Galerkin stencils to two cells (10% more entries on a
+  halved 3D level).
 - The multigrid coarsens base levels with an odd number of cells along an axis on their node
   lattice (linear interpolation, the last interval one fine cell), where it stopped and solved
   the whole base level by LU before.
