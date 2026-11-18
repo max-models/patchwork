@@ -17,6 +17,14 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Jacobian of a Newton step for a Boltzmann species; only the reduction is redone.
   `stiffness` is the operator without it, `unknowns` the order of the columns and `values`
   the prescribed values. The FFT backend refuses a reaction (`"auto"` takes the LU).
+- `MultigridBackend(smoother="gauss-seidel")`: symmetric Gauss–Seidel smoothing, with the whole
+  V-cycle in a compiled kernel (`multigrid_vcycle`) when the coarsest level has at most 2000
+  unknowns. `CompositeMultigrid.update_diagonal` and `update_operator` take a new operator
+  without the system; one that differs only on its diagonal (a reaction, `set_reaction`) gets
+  its first coarse level from a precomputed map instead of a Galerkin product. With the Jacobian
+  of every Newton step: a 3D Boltzmann extraction (55 000 nodes) 3.7 → 2.0 ms per V-cycle,
+  25 → 10 ms per update; `preconditioner` as on `AMGSolver`.
+
 
 - Compiled kernels for the node deposit in 1D and 3D (`deposit_nodes_1d`,
   `deposit_nodes_3d`; only 2D had one): `CompositeNodes.deposit` of 1e5 markers on a line
@@ -220,6 +228,9 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- The multigrid coarsens base levels with an odd number of cells along an axis on their node
+  lattice (linear interpolation, the last interval one fine cell), where it stopped and solved
+  the whole base level by LU before.
 - The math in the docstrings renders on the API pages: `$$` blocks and `$...$` instead of reST
   `.. math::` and `:math:` (shown as code), and code spans instead of `:class:`, `:meth:` and
   the other roles. The module docstring of `cells` gives the radial conductance of an
