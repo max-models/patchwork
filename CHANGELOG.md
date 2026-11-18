@@ -7,6 +7,11 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `plot_patches` options for drawing a hierarchy as part of another figure: `transpose`
+  (the second axis horizontal, e.g. `x` of an `(r, x)` hierarchy), `scale` (e.g. `1e3` for
+  millimetres), `mask_covered=False` (every level's grid in full, not hidden under the finer
+  patches), `colors` and `labels` per level, and `title`.
+
 - `CompositeMultigrid.update_reaction(weights)`: the operator without a reaction plus the
   lumped reaction `T^T diag(w) T` (`T` the hanging nodes from the unknowns), its finest and
   first coarse levels from precomputed maps of the weights instead of Galerkin products. A

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -14,8 +15,10 @@ def _plot_line(
     field: str | None,
     gathered: dict[int, Any],
     show_grid: bool,
-    palette: Any,
+    palette: Callable[[int], Any],
     grid_alpha: float | None,
+    scale: float,
+    label: Callable[[int], str | None],
 ) -> None:
     """`plot_patches` of a 1D hierarchy."""
     import numpy as np
@@ -24,8 +27,10 @@ def _plot_line(
     nodal = field is not None and hierarchy.centering(field) == "node"
     for patch in hierarchy:
         ((x0, x1),) = patch.physical_bounds(hierarchy)
-        color = palette(patch.level % 10)
+        x0, x1 = x0 * scale, x1 * scale
+        color = palette(patch.level)
         (edges,) = patch.node_coordinates(hierarchy)
+        edges = np.asarray(edges) * scale
         if field is None:
             ax.plot([x0, x1], [patch.level, patch.level], color=color, lw=6.0)
             if show_grid:
@@ -52,7 +57,7 @@ def _plot_line(
             zorder=2 * patch.level + 2,
         )
     ((xmin, xmax),) = hierarchy.bounds
-    ax.set_xlim(xmin, xmax)
+    ax.set_xlim(xmin * scale, xmax * scale)
     ax.set_xlabel("x")
     if field is None:
         ax.set_ylabel("level")
@@ -61,11 +66,12 @@ def _plot_line(
     else:
         ax.set_ylabel(field)
     handles = [
-        Line2D([0], [0], color=palette(level % 10), lw=2, label=f"level {level}")
+        Line2D([0], [0], color=palette(level), lw=2, label=label(level))
         for level in range(hierarchy.max_level + 1)
-        if hierarchy.patches_at_level(level)
+        if hierarchy.patches_at_level(level) and label(level) is not None
     ]
-    ax.legend(handles=handles, loc="upper right", framealpha=0.9)
+    if handles:
+        ax.legend(handles=handles, loc="upper right", framealpha=0.9)
     ax.set_title(
         "Patchwork AMR hierarchy" if field is None else f"Patchwork field: {field}"
     )
@@ -81,6 +87,12 @@ def plot_patches(
     root: int = 0,
     grid_linewidth: float | None = None,
     grid_alpha: float | None = None,
+    transpose: bool = False,
+    scale: float = 1.0,
+    mask_covered: bool = True,
+    colors: Sequence[Any] | None = None,
+    labels: Sequence[str | None] | None = None,
+    title: str | None = None,
 ) -> tuple[Any, Any] | None:
     """Plot patch extents and cell grids, optionally colored by a field.
 
@@ -89,6 +101,14 @@ def plot_patches(
     ``grid_alpha`` set the cell lines of every level; by default they are thin
     and faint, more so on the base level, which suits a large figure. A small
     one, e.g. an animation's frames, may need stronger lines.
+
+    ``transpose`` draws the hierarchy's second axis horizontally (e.g. ``x`` of an
+    ``(r, x)`` cylindrical hierarchy), ``scale`` multiplies the coordinates (``1e3``
+    for millimetres from metres). Without ``field``, the cells of a coarser level
+    under a finer patch are hidden; ``mask_covered=False`` keeps them, so every
+    level's grid shows in full. ``colors`` and ``labels`` give each level its colour
+    and legend entry (``None`` leaves a level out of the legend; by default ``tab10``
+    and "level n"), ``title`` the axes' title (``""`` for none).
 
     A 1D hierarchy is drawn as a line plot: without ``field`` one bar per patch
     at the height of its level (with its cell edges if ``show_grid``); with
@@ -113,6 +133,8 @@ def plot_patches(
             "plotting requires matplotlib; install patchwork[plot]"
         ) from exc
 
+    if transpose and hierarchy.ndim != 2:
+        raise ValueError("transpose applies to 2D hierarchies only")
     rank = hierarchy.comm.Get_rank()
     gathered: dict[int, Any] = {}
     if field is not None:
@@ -127,10 +149,39 @@ def plot_patches(
     else:
         fig = ax.figure
 
-    palette = plt.get_cmap("tab10")
+    tab10 = plt.get_cmap("tab10")
+
+    def palette(level: int) -> Any:
+        """The colour of ``level``."""
+        if colors is not None:
+            return colors[level]
+        return tab10(level % 10)
+
+    def label(level: int) -> str | None:
+        """The legend entry of ``level``."""
+        return f"level {level}" if labels is None else labels[level]
+
     if hierarchy.ndim == 1:
-        _plot_line(hierarchy, ax, field, gathered, show_grid, palette, grid_alpha)
+        _plot_line(
+            hierarchy, ax, field, gathered, show_grid, palette, grid_alpha, scale, label
+        )
+        if title is not None:
+            ax.set_title(title)
         return fig, ax
+
+    def rectangle(x0: float, x1: float, y0: float, y1: float, **kwargs: Any) -> None:
+        """Add the box ``[x0, x1] x [y0, y1]`` of the hierarchy to the axes."""
+        if transpose:
+            x0, x1, y0, y1 = y0, y1, x0, x1
+        ax.add_patch(
+            Rectangle(
+                (x0 * scale, y0 * scale),
+                (x1 - x0) * scale,
+                (y1 - y0) * scale,
+                **kwargs,
+            )
+        )
+
     mappable = None
     # the colour scale shared by all patches; set when a field is drawn
     limits = (0.0, 1.0)
@@ -143,87 +194,88 @@ def plot_patches(
         )
     for patch in hierarchy:
         ((x0, x1), (y0, y1)) = patch.physical_bounds(hierarchy)
-        color = palette(patch.level % 10)
+        color = palette(patch.level)
+        dx, dy = hierarchy.spacing(patch.level)
+        x_edges = (x0 + np.arange(patch.shape[0] + 1) * dx) * scale
+        y_edges = (y0 + np.arange(patch.shape[1] + 1) * dy) * scale
         if field is not None:
-            values = gathered[id(patch)]
-            dx, dy = hierarchy.spacing(patch.level)
-            x_edges = x0 + np.arange(patch.shape[0] + 1) * dx
-            y_edges = y0 + np.arange(patch.shape[1] + 1) * dy
+            values = np.asarray(gathered[id(patch)])
             # node values sit on the cell corners and are shaded between them
             mappable = ax.pcolormesh(
-                x_edges,
-                y_edges,
-                values.T,
+                *(
+                    (y_edges, x_edges, values)
+                    if transpose
+                    else (x_edges, y_edges, values.T)
+                ),
                 shading="gouraud" if nodal else "flat",
                 cmap=cmap,
                 vmin=limits[0],
                 vmax=limits[1],
                 zorder=2 * patch.level + 1,
             )
-        elif patch.level > 0 and show_grid:
+        elif patch.level > 0 and show_grid and mask_covered:
             # Mask the covered coarse cells so only the finest active grid is visible.
-            ax.add_patch(
-                Rectangle(
-                    (x0, y0),
-                    x1 - x0,
-                    y1 - y0,
-                    facecolor="white",
-                    edgecolor="none",
-                    zorder=2 * patch.level,
-                )
+            rectangle(
+                x0,
+                x1,
+                y0,
+                y1,
+                facecolor="white",
+                edgecolor="none",
+                zorder=2 * patch.level,
             )
-        ax.add_patch(
-            Rectangle(
-                (x0, y0),
-                x1 - x0,
-                y1 - y0,
-                fill=False,
-                edgecolor=color,
-                linewidth=2.0 if patch.level else 1.2,
-                linestyle="--" if patch.level == 0 else "-",
-                zorder=2 * patch.level + 2,
-            )
+        rectangle(
+            x0,
+            x1,
+            y0,
+            y1,
+            fill=False,
+            edgecolor=color,
+            linewidth=2.0 if patch.level else 1.2,
+            linestyle="--" if patch.level == 0 else "-",
+            zorder=2 * patch.level + 2,
         )
         if show_grid:
-            dx, dy = hierarchy.spacing(patch.level)
             alpha = grid_alpha
             if alpha is None:
                 alpha = 0.62 if patch.level else 0.24
             linewidth = grid_linewidth
             if linewidth is None:
                 linewidth = 0.42 if patch.level else 0.32
-            ax.vlines(
-                x0 + np.arange(patch.shape[0] + 1) * dx,
-                y0,
-                y1,
-                colors=[color],
-                alpha=alpha,
-                linewidth=linewidth,
-                zorder=2 * patch.level + 2,
+            style = {
+                "colors": [color],
+                "alpha": alpha,
+                "linewidth": linewidth,
+                "zorder": 2 * patch.level + 2,
+            }
+            # the lines across the first axis, then those across the second
+            first, second = (
+                (ax.hlines, ax.vlines) if transpose else (ax.vlines, ax.hlines)
             )
-            ax.hlines(
-                y0 + np.arange(patch.shape[1] + 1) * dy,
-                x0,
-                x1,
-                colors=[color],
-                alpha=alpha,
-                linewidth=linewidth,
-                zorder=2 * patch.level + 2,
-            )
+            first(x_edges, y_edges[0], y_edges[-1], **style)
+            second(y_edges, x_edges[0], x_edges[-1], **style)
 
     (xmin, xmax), (ymin, ymax) = hierarchy.bounds
-    ax.set(xlim=(xmin, xmax), ylim=(ymin, ymax), xlabel="x", ylabel="y")
+    limits_x, limits_y = (xmin * scale, xmax * scale), (ymin * scale, ymax * scale)
+    names = ("x", "y")
+    if transpose:
+        limits_x, limits_y = limits_y, limits_x
+        names = ("y", "x")
+    ax.set(xlim=limits_x, ylim=limits_y, xlabel=names[0], ylabel=names[1])
     ax.set_aspect("equal", adjustable="box")
     levels = range(hierarchy.max_level + 1)
     handles = [
-        Line2D([0], [0], color=palette(level % 10), lw=2, label=f"level {level}")
+        Line2D([0], [0], color=palette(level), lw=2, label=label(level))
         for level in levels
-        if hierarchy.patches_at_level(level)
+        if hierarchy.patches_at_level(level) and label(level) is not None
     ]
-    ax.legend(handles=handles, loc="upper right", framealpha=0.9)
+    if handles:
+        ax.legend(handles=handles, loc="upper right", framealpha=0.9)
     if mappable is not None:
         fig.colorbar(mappable, ax=ax, label=field)
-    ax.set_title(
-        "Patchwork AMR hierarchy" if field is None else f"Patchwork field: {field}"
-    )
+    if title is None:
+        title = (
+            "Patchwork AMR hierarchy" if field is None else f"Patchwork field: {field}"
+        )
+    ax.set_title(title)
     return fig, ax
