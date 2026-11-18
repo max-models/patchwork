@@ -192,7 +192,7 @@ def _linear_1d(n: int) -> sparse.csr_matrix:
     nodes are not coarsened (the identity).
     """
     if n <= 2:
-        return sparse.identity(n, format="csr")
+        return sparse.csr_matrix(sparse.identity(n))
     coarse = np.arange(0, n, 2)
     if coarse[-1] != n - 1:
         coarse = np.append(coarse, n - 1)
@@ -229,7 +229,7 @@ def _lattice_prolongations(
     shape = tuple(int(n) for n in shape)
     while int(np.prod(shape)) > unknowns:
         factors = [_linear_1d(n) for n in shape]
-        coarse_shape = tuple(int(f.shape[1]) for f in factors)
+        coarse_shape = tuple(int(np.shape(f)[1]) for f in factors)
         if coarse_shape == shape:
             break
         full = factors[0]
@@ -269,7 +269,7 @@ def _concatenated(
         columns.append(matrix.indices.astype(np.int64))
         values.append(matrix.data.astype(float))
         position += int(matrix.indptr[-1])
-        start += matrix.shape[0] + 1
+        start += int(np.shape(matrix)[0]) + 1
     return (
         np.concatenate(pointers),
         np.asarray(starts, dtype=np.int64),
@@ -289,7 +289,7 @@ def _galerkin_of_diagonal(
     """
     p = sparse.csr_matrix(interpolation)
     p.sum_duplicates()
-    fine, size = p.shape
+    fine, size = np.shape(p)
     counts = np.diff(p.indptr)
     rows = np.repeat(np.arange(fine), counts)
     per_entry = counts[rows]
@@ -529,7 +529,7 @@ class CompositeMultigrid:
         The structure of ``previous`` (the last arguments) is kept when every
         level's pattern is the same: then only the values are copied.
         """
-        sizes = [int(m.shape[0]) for m in operators]
+        sizes = [int(np.shape(m)[0]) for m in operators]
         offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
         coarsest = operators[-1].toarray()
         n = coarsest.shape[0]
@@ -584,11 +584,11 @@ class CompositeMultigrid:
         self.matrix = operator
         if change is None:
             self._reference = operator
-            rows = np.repeat(np.arange(operator.shape[0]), np.diff(operator.indptr))
+            rows = np.repeat(np.arange(np.shape(operator)[0]), np.diff(operator.indptr))
             on = operator.indices == rows
             self._off_diagonal = ~on
             positions = np.flatnonzero(on)
-            complete = positions.size == operator.shape[0]
+            complete = positions.size == np.shape(operator)[0]
             self._diagonal_positions = positions if complete else None
         operators = [operator]
         rest = self.interpolations
@@ -635,7 +635,7 @@ class CompositeMultigrid:
         self._coarsest_operator = coarsest
         self._coarsest = None  # factorised when the uncompiled cycle needs it
         previous, self._compiled = self._compiled, None
-        if self.smoother == "gauss-seidel" and coarsest.shape[0] <= DENSE_COARSEST:
+        if self.smoother == "gauss-seidel" and np.shape(coarsest)[0] <= DENSE_COARSEST:
             self._compiled = self._compiled_arguments(operators, previous)
 
     def update_diagonal(self, diagonal: np.ndarray) -> None:
