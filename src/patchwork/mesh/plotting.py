@@ -22,17 +22,21 @@ def _plot_line(
 ) -> None:
     """`plot_patches` of a 1D hierarchy."""
     import numpy as np
-    from matplotlib.lines import Line2D
 
     nodal = field is not None and hierarchy.centering(field) == "node"
+    labelled: set[int] = set()
     for patch in hierarchy:
         ((x0, x1),) = patch.physical_bounds(hierarchy)
         x0, x1 = x0 * scale, x1 * scale
         color = palette(patch.level)
         (edges,) = patch.node_coordinates(hierarchy)
         edges = np.asarray(edges) * scale
+        entry = label(patch.level) if patch.level not in labelled else None
+        labelled.add(patch.level)
         if field is None:
-            ax.plot([x0, x1], [patch.level, patch.level], color=color, lw=6.0)
+            ax.plot(
+                [x0, x1], [patch.level, patch.level], color=color, lw=6.0, label=entry
+            )
             if show_grid:
                 alpha = 0.8 if grid_alpha is None else grid_alpha
                 ax.vlines(
@@ -55,6 +59,7 @@ def _plot_line(
             marker="." if show_grid else None,
             lw=1.5,
             zorder=2 * patch.level + 2,
+            label=entry,
         )
     ((xmin, xmax),) = hierarchy.bounds
     ax.set_xlim(xmin * scale, xmax * scale)
@@ -65,13 +70,8 @@ def _plot_line(
         ax.set_ylim(-0.5, hierarchy.max_level + 0.5)
     else:
         ax.set_ylabel(field)
-    handles = [
-        Line2D([0], [0], color=palette(level), lw=2, label=label(level))
-        for level in range(hierarchy.max_level + 1)
-        if hierarchy.patches_at_level(level) and label(level) is not None
-    ]
-    if handles:
-        ax.legend(handles=handles, loc="upper right", framealpha=0.9)
+    if any(label(level) is not None for level in labelled):
+        ax.legend(loc="upper right", framealpha=0.9)
     ax.set_title(
         "Patchwork AMR hierarchy" if field is None else f"Patchwork field: {field}"
     )
@@ -108,7 +108,8 @@ def plot_patches(
     under a finer patch are hidden; ``mask_covered=False`` keeps them, so every
     level's grid shows in full. ``colors`` and ``labels`` give each level its colour
     and legend entry (``None`` leaves a level out of the legend; by default ``tab10``
-    and "level n"), ``title`` the axes' title (``""`` for none).
+    and "level n"; the entries are the labels of the plotted artists, so a later
+    ``ax.legend()`` keeps them), ``title`` the axes' title (``""`` for none).
 
     A 1D hierarchy is drawn as a line plot: without ``field`` one bar per patch
     at the height of its level (with its cell edges if ``show_grid``); with
@@ -126,7 +127,6 @@ def plot_patches(
 
     try:
         import matplotlib.pyplot as plt
-        from matplotlib.lines import Line2D
         from matplotlib.patches import Rectangle
     except ImportError as exc:
         raise ImportError(
@@ -192,6 +192,7 @@ def plot_patches(
             min(float(np.nanmin(values)) for values in gathered.values()),
             max(float(np.nanmax(values)) for values in gathered.values()),
         )
+    labelled: set[int] = set()
     for patch in hierarchy:
         ((x0, x1), (y0, y1)) = patch.physical_bounds(hierarchy)
         color = palette(patch.level)
@@ -224,11 +225,15 @@ def plot_patches(
                 edgecolor="none",
                 zorder=2 * patch.level,
             )
+        # the level's legend entry: its first patch's cell lines, or else its outline
+        entry = label(patch.level) if patch.level not in labelled else None
+        labelled.add(patch.level)
         rectangle(
             x0,
             x1,
             y0,
             y1,
+            label=None if show_grid else entry,
             fill=False,
             edgecolor=color,
             linewidth=2.0 if patch.level else 1.2,
@@ -252,7 +257,7 @@ def plot_patches(
             first, second = (
                 (ax.hlines, ax.vlines) if transpose else (ax.vlines, ax.hlines)
             )
-            first(x_edges, y_edges[0], y_edges[-1], **style)
+            first(x_edges, y_edges[0], y_edges[-1], label=entry, **style)
             second(y_edges, x_edges[0], x_edges[-1], **style)
 
     (xmin, xmax), (ymin, ymax) = hierarchy.bounds
@@ -263,14 +268,12 @@ def plot_patches(
         names = ("y", "x")
     ax.set(xlim=limits_x, ylim=limits_y, xlabel=names[0], ylabel=names[1])
     ax.set_aspect("equal", adjustable="box")
-    levels = range(hierarchy.max_level + 1)
-    handles = [
-        Line2D([0], [0], color=palette(level), lw=2, label=label(level))
-        for level in levels
-        if hierarchy.patches_at_level(level) and label(level) is not None
-    ]
-    if handles:
-        ax.legend(handles=handles, loc="upper right", framealpha=0.9)
+    if any(label(level) is not None for level in labelled):
+        legend = ax.legend(loc="upper right", framealpha=0.9)
+        for handle in legend.legend_handles:
+            # the faint cell lines as solid lines in the legend
+            handle.set_alpha(1.0)
+            handle.set_linewidth(2.0)
     if mappable is not None:
         fig.colorbar(mappable, ax=ax, label=field)
     if title is None:

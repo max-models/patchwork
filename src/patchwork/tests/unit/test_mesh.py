@@ -133,6 +133,8 @@ def test_the_cells_are_plotted_transposed_and_scaled() -> None:
         np.linspace(0.0, 1.0, 5)
     )
     assert [text.get_text() for text in axes.get_legend().get_texts()] == ["box"]
+    axes.plot([0.0, 1.0], [0.0, 1.0], label="beam")  # a legend drawn later keeps it
+    assert [text.get_text() for text in axes.legend().get_texts()] == ["box", "beam"]
     assert axes.get_title() == ""
     matplotlib.pyplot.close(figure)
 
