@@ -400,3 +400,26 @@ def test_the_interpolation_has_no_round_off_weights() -> None:
     solver = NodalPoisson(AMRHierarchy(base_shape=(32, 16, 16)), backend="multigrid")
     for interpolation in solver.solver.interpolations:
         assert np.abs(interpolation.data).min() >= ROUND_OFF_WEIGHT
+
+
+@pytest.mark.parametrize("levels", [0, 2])
+def test_a_reaction_is_taken_without_the_finest_galerkin_products(levels: int) -> None:
+    """`update_reaction` gives the operator and the cycle of `set_reaction`, refined too."""
+    backend = MultigridBackend(smoother="gauss-seidel", smoothing_steps=1)
+    solver = NodalPoisson(_nested(32, levels), backend=backend)
+    multigrid = solver.solver
+    reaction = np.random.default_rng(6).uniform(0.0, 40.0, solver.nodes.num_nodes)
+    b = np.random.default_rng(7).standard_normal(multigrid.matrix.shape[0])
+    multigrid.update_reaction(solver.volumes * reaction)
+    taken, fast = multigrid.matrix.copy(), multigrid.cycle(b)
+    solver.set_reaction(reaction)  # assembled and reduced by NodalPoisson
+    assert abs(taken - solver.matrix).max() < 1e-12 * abs(solver.matrix).max()
+    multigrid._reference = None
+    solver.set_reaction(reaction)  # a full update
+    full = multigrid.cycle(b)
+    assert np.allclose(fast, full, rtol=0, atol=1e-11 * abs(full).max())
+    solver.set_reaction(None)
+    without = NodalPoisson(_nested(32, levels), backend=backend).solver
+    without._stiffness = None
+    with pytest.raises(ValueError, match="without a reaction"):
+        without.update_reaction(np.zeros(solver.nodes.num_nodes))

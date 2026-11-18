@@ -7,6 +7,12 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `CompositeMultigrid.update_reaction(weights)`: the operator without a reaction plus the
+  lumped reaction `T^T diag(w) T` (`T` the hanging nodes from the unknowns), its finest and
+  first coarse levels from precomputed maps of the weights instead of Galerkin products. A
+  Newton step of a Boltzmann species takes its Jacobian this way on refined hierarchies too,
+  where `update_diagonal` does not apply.
+
 - The compiled multigrid V-cycle (`smoother="gauss-seidel"`) runs on OpenMP threads
   (`MultigridBackend(num_threads=...)`, by default `OMP_NUM_THREADS` or the usable cores):
   multicolour Gauss–Seidel, red-black on seven-point stencils and the eight lattice parities
