@@ -21,6 +21,20 @@ are its restrictions. Each level is smoothed by Chebyshev iteration with Jacobi
 preconditioning, the coarsest is solved by LU; the V-cycle preconditions
 conjugate gradients (GMRES for a non-symmetric operator, with embedded bodies).
 
+A base level that cannot be halved as a hierarchy (an odd number of cells
+along an axis) is coarsened on its node lattice instead: every other node and
+the last one along each axis, with linear interpolation between them (the last
+interval of an odd axis spans one fine cell), as long as the base level has no
+refinement and no periodic axis.
+
+``smoother="gauss-seidel"`` smooths by a forward Gauss--Seidel sweep before the
+coarse correction and a backward one after it; with a coarsest level of at most
+`DENSE_COARSEST` unknowns the whole V-cycle is then one compiled kernel
+(``multigrid_vcycle``). An operator that differs from the last one only on its
+diagonal (the reaction of a Newton step: `NodalPoisson.set_reaction`,
+`CompositeMultigrid.update_diagonal`) gets its first coarse operator from a
+precomputed linear map of the diagonal change, not from a new Galerkin product.
+
 A refined patch is a level of the multigrid: the refinement is what the
 coarse levels remove first, so the number of iterations does not grow with
 the number of refinement levels or with the cell count (`test_multigrid.py`).
@@ -55,6 +69,12 @@ COARSEST_UNKNOWNS = 1000
 
 #: Power iterations for the largest eigenvalue of the Jacobi-preconditioned operator.
 POWER_ITERATIONS = 20
+
+#: The smoothers of `CompositeMultigrid`.
+SMOOTHERS = ("chebyshev", "gauss-seidel")
+
+#: The compiled V-cycle inverts the coarsest operator densely up to this size.
+DENSE_COARSEST = 2000
 
 
 def _rebuilt(
@@ -164,6 +184,140 @@ def prolongation(
     return matrix
 
 
+def _linear_1d(n: int) -> sparse.csr_matrix:
+    """Linear interpolation from every other of ``n`` nodes (and the last) to all ``n``.
+
+    The coarse nodes are the even ones and, when ``n - 1`` is odd, the last one,
+    whose interval then spans a single fine cell: ``(n, coarse nodes)``. Two
+    nodes are not coarsened (the identity).
+    """
+    if n <= 2:
+        return sparse.csr_matrix(sparse.identity(n))
+    coarse = np.arange(0, n, 2)
+    if coarse[-1] != n - 1:
+        coarse = np.append(coarse, n - 1)
+    fine = np.arange(n)
+    right = np.clip(np.searchsorted(coarse, fine, side="right"), 1, coarse.size - 1)
+    left = right - 1
+    weight = (fine - coarse[left]) / (coarse[right] - coarse[left])
+    rows = np.concatenate([fine, fine])
+    columns = np.concatenate([left, right])
+    values = np.concatenate([1.0 - weight, weight])
+    matrix = sparse.csr_matrix((values, (rows, columns)), shape=(n, coarse.size))
+    matrix.eliminate_zeros()
+    return matrix
+
+
+def _lattice_prolongations(
+    shape: tuple[int, ...],
+    fine_unknowns: np.ndarray,
+    system: LinearSystem,
+    unknowns: int,
+) -> list[sparse.csr_matrix]:
+    """Interpolations coarsening a structured node lattice, from ``shape`` down.
+
+    For base levels that `_halved` cannot coarsen (an odd number of cells): the
+    tensor product of `_linear_1d` along every axis, from the unknowns
+    ``fine_unknowns`` (flat C-order indices into ``shape``) to the coarse nodes
+    neither on a Dirichlet face of ``system`` nor without a fine unknown to
+    interpolate to (inside a body). Stops once a level has at most ``unknowns``
+    nodes or no axis shrinks. Returns the interpolations, the finest first.
+    """
+    from patchwork.spaces.boundaries import faces_of
+
+    result = []
+    shape = tuple(int(n) for n in shape)
+    while int(np.prod(shape)) > unknowns:
+        factors = [_linear_1d(n) for n in shape]
+        coarse_shape = tuple(int(np.shape(f)[1]) for f in factors)
+        if coarse_shape == shape:
+            break
+        full = factors[0]
+        for factor in factors[1:]:
+            full = sparse.kron(full, factor, format="csr")
+        keep = np.ones(coarse_shape, dtype=bool)
+        for face, (axis, side) in faces_of(len(shape)).items():
+            if isinstance(system.faces.get(face), Dirichlet):
+                index: list[Any] = [slice(None)] * len(shape)
+                index[axis] = 0 if side == 0 else -1
+                keep[tuple(index)] = False
+        matrix = sparse.csr_matrix(full[fine_unknowns][:, np.flatnonzero(keep)])
+        matrix.eliminate_zeros()
+        used = np.flatnonzero(np.diff(matrix.tocsc().indptr))
+        coarse_unknowns = np.flatnonzero(keep)[used]
+        if not coarse_unknowns.size:
+            break
+        result.append(sparse.csr_matrix(matrix[:, used]))
+        shape, fine_unknowns = coarse_shape, coarse_unknowns
+    return result
+
+
+def _concatenated(
+    matrices: list[sparse.csr_matrix],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """CSR matrices one after the other, for the ``multigrid_vcycle`` kernel.
+
+    Returns the row pointers (absolute positions), the start of each matrix's
+    pointers, the columns and the values.
+    """
+    pointers, starts, columns, values = [], [], [], []
+    position = start = 0
+    for matrix in matrices:
+        matrix = sparse.csr_matrix(matrix)
+        pointers.append(matrix.indptr.astype(np.int64) + position)
+        starts.append(start)
+        columns.append(matrix.indices.astype(np.int64))
+        values.append(matrix.data.astype(float))
+        position += int(matrix.indptr[-1])
+        start += int(np.shape(matrix)[0]) + 1
+    return (
+        np.concatenate(pointers),
+        np.asarray(starts, dtype=np.int64),
+        np.concatenate(columns),
+        np.concatenate(values),
+    )
+
+
+def _galerkin_of_diagonal(
+    interpolation: sparse.csr_matrix, coarse: sparse.csr_matrix
+) -> tuple[sparse.csr_matrix, sparse.csr_matrix]:
+    """The map from a diagonal ``d`` of the fine operator to ``P^T diag(d) P``.
+
+    Returns ``coarse`` on a pattern that holds ``P^T diag(d) P`` for every ``d``
+    (with explicit zeros), and the matrix that maps ``d`` to that product's values
+    on the pattern: ``sum_i P[i, a] d_i P[i, b]`` at the position of ``(a, b)``.
+    """
+    p = sparse.csr_matrix(interpolation)
+    p.sum_duplicates()
+    fine, size = np.shape(p)
+    counts = np.diff(p.indptr)
+    rows = np.repeat(np.arange(fine), counts)
+    per_entry = counts[rows]
+    first = np.repeat(np.arange(p.nnz), per_entry)
+    row_of = rows[first]
+    group = np.arange(first.size) - np.repeat(
+        np.cumsum(per_entry) - per_entry, per_entry
+    )
+    second = p.indptr[row_of] + group
+    pair_keys = p.indices[first].astype(np.int64) * size + p.indices[second]
+    coarse = sparse.csr_matrix(coarse)
+    coarse.sum_duplicates()
+    coarse_rows = np.repeat(np.arange(size), np.diff(coarse.indptr))
+    coarse_keys = coarse_rows.astype(np.int64) * size + coarse.indices
+    keys = np.union1d(coarse_keys, pair_keys)
+    values = np.zeros(keys.size)
+    values[np.searchsorted(keys, coarse_keys)] = coarse.data
+    indptr = np.concatenate([[0], np.cumsum(np.bincount(keys // size, minlength=size))])
+    pattern = sparse.csr_matrix(
+        (values, (keys % size).astype(np.int64), indptr), shape=(size, size)
+    )
+    mapping = sparse.csr_matrix(
+        (p.data[first] * p.data[second], (np.searchsorted(keys, pair_keys), row_of)),
+        shape=(keys.size, fine),
+    )
+    return pattern, mapping
+
+
 def _unit_diagonal_where_empty(matrix: sparse.csr_matrix) -> sparse.csr_matrix:
     """``matrix`` with a one on the diagonal of its rows without a diagonal entry."""
     empty = matrix.diagonal() == 0.0
@@ -173,14 +327,25 @@ def _unit_diagonal_where_empty(matrix: sparse.csr_matrix) -> sparse.csr_matrix:
 
 
 class _Level:
-    """One level of the V-cycle: its operator and its Chebyshev smoother."""
+    """One level of the V-cycle: its operator and its smoother.
 
-    def __init__(self, matrix: sparse.csr_matrix, steps: int, seed: int) -> None:
+    Chebyshev iteration with Jacobi preconditioning (``estimate``: its interval from
+    the largest eigenvalue), else Gauss--Seidel (`smooth` forward, `smooth_back`
+    backward).
+    """
+
+    def __init__(
+        self, matrix: sparse.csr_matrix, steps: int, seed: int, estimate: bool = True
+    ) -> None:
         """Estimate the largest eigenvalue of the Jacobi-preconditioned operator."""
         size = int(np.shape(matrix)[0])
         self.matrix = matrix
         self.inverse_diagonal = 1.0 / matrix.diagonal()
         self.steps = int(steps)
+        self.chebyshev = bool(estimate)
+        if not estimate:
+            self.lower = self.upper = 0.0
+            return
         vector = np.random.default_rng(seed).standard_normal(size)
         largest = 1.0
         for _ in range(POWER_ITERATIONS):
@@ -190,8 +355,21 @@ class _Level:
         # PETSc's default interval for a Chebyshev smoother: [0.1, 1.1] x the estimate
         self.lower, self.upper = 0.1 * largest, 1.1 * largest
 
-    def smooth(self, x: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """``steps`` Chebyshev iterations on ``A x = b`` from ``x``."""
+    def smooth(self, x: np.ndarray, b: np.ndarray, forward: bool = True) -> np.ndarray:
+        """``steps`` Chebyshev iterations (or Gauss--Seidel sweeps) on ``A x = b`` from ``x``."""
+        if not self.chebyshev:
+            matrix = self.matrix
+            triangle = (
+                sparse.tril(matrix, format="csr")
+                if forward
+                else sparse.triu(matrix, format="csr")
+            )
+            other = matrix - triangle
+            for _ in range(self.steps):
+                x = scipy.sparse.linalg.spsolve_triangular(
+                    triangle, b - other @ x, lower=forward
+                )
+            return x
         theta = 0.5 * (self.upper + self.lower)
         delta = 0.5 * (self.upper - self.lower)
         sigma = theta / delta
@@ -216,13 +394,16 @@ class _Level:
     equations={
         "spaces": r"V_0 \subset \dots \subset V_L: \ \text{the composite nodes of the hierarchy without its finest levels, then of its base level coarsened by } 2^k",
         "interpolation": r"P_k = E_{k}\big(\mathbf{x}^{(k+1)}_\mathrm{free}\big)\, T_k \Big|_{\mathrm{free}}, \qquad A_{k} = P_k^\top A_{k+1} P_k \ (\text{Galerkin})",
-        "cycle": r"\text{V-cycle: Chebyshev/Jacobi smoothing on } [0.1, 1.1]\,\lambda_{\max}(D^{-1}A), \text{ LU on } V_0; \ \text{CG (GMRES if } A \ne A^\top\text{)}, \ \|r\| \le \texttt{rtol}\,\|b\|",
+        "cycle": r"\text{V-cycle: Chebyshev/Jacobi smoothing on } [0.1, 1.1]\,\lambda_{\max}(D^{-1}A) \text{ (or Gauss--Seidel), LU on } V_0; \ \text{CG (GMRES if } A \ne A^\top\text{)}, \ \|r\| \le \texttt{rtol}\,\|b\|",
+        "diagonal": r"A_1 = P_0^\top (A + \operatorname{diag} d) P_0 = A_1^{\mathrm{ref}} + W d, \qquad W_{(a,b), i} = (P_0)_{ia} (P_0)_{ib}",
         "singular": r"b \to b - \bar b, \qquad \sum_p V_p (T\phi)_p = 0 \quad \text{(no Dirichlet face, no body; all nodes, the hanging ones too)}",
     },
     assumptions=(
         "the coarse spaces are nested in the fine one: a refinement level is a multigrid level",
         "the base level halves while every bound of its boxes is even and every axis keeps two cells; else its LU is the coarsest solve",
         "the whole system on every rank (like 'lu')",
+        "a base level with an odd number of cells along an axis coarsens on its node lattice (linear interpolation)",
+        "smoother='gauss-seidel': symmetric Gauss--Seidel smoothing, the V-cycle compiled when the coarsest level is small",
         "point (Jacobi) smoothing: a strongly anisotropic coefficient (magnetized susceptibility) slows it down",
     ),
     references=(
@@ -249,6 +430,35 @@ class CompositeMultigrid:
         residuals: The relative residual after each iteration of the last solve.
     """
 
+    @staticmethod
+    def _lattice_levels(
+        fine: CompositeNodes,
+        fine_unknowns: np.ndarray,
+        system: LinearSystem,
+        coarsest_unknowns: int,
+    ) -> list[sparse.csr_matrix]:
+        """The levels below a base level that `_halved` cannot coarsen (`_lattice_prolongations`).
+
+        Only for a base level without refinement and periodic axes, whose nodes
+        are the points of its lattice; otherwise none.
+        """
+        hierarchy = fine.hierarchy
+        if (
+            hierarchy.max_level > 0
+            or any(hierarchy.periodic)
+            or fine.hanging.any()
+            or fine_unknowns.size <= coarsest_unknowns
+        ):
+            return []
+        shape = tuple(int(n) + 1 for n in hierarchy.base_shape)
+        lattice = np.asarray(fine.lattice, dtype=np.int64)
+        if fine.num_nodes != int(np.prod(shape)):
+            return []  # a domain that does not fill its rectangle
+        flat = np.asarray(np.ravel_multi_index(tuple(lattice.T), shape))
+        return _lattice_prolongations(
+            shape, flat[fine_unknowns], system, coarsest_unknowns
+        )
+
     @sp.profile("patchwork.multigrid_setup", tags=PROFILE_TAGS)
     def __init__(
         self,
@@ -257,11 +467,20 @@ class CompositeMultigrid:
         max_iterations: int = 200,
         smoothing_steps: int = 2,
         coarsest_unknowns: int = COARSEST_UNKNOWNS,
+        smoother: str = "chebyshev",
     ) -> None:
         """Build the coarse spaces and their interpolations, then the levels."""
+        if smoother not in SMOOTHERS:
+            raise ValueError(f"smoother must be one of {SMOOTHERS}, got {smoother!r}")
         self.rtol = float(rtol)
         self.max_iterations = int(max_iterations)
         self.smoothing_steps = int(smoothing_steps)
+        self.smoother = smoother
+        self._reference: sparse.csr_matrix | None = None
+        self._diagonal_map: sparse.csr_matrix | None = None
+        self._diagonal_positions: np.ndarray | None = None
+        self._transfer: tuple | None = None
+        self._compiled: dict[str, Any] | None = None
         fine = system.nodes
         fine_unknowns = np.asarray(system.unknowns)
         self.hierarchies = coarser_hierarchies(fine.hierarchy, coarsest_unknowns)
@@ -275,6 +494,10 @@ class CompositeMultigrid:
                 prolongation(coarse, coarse_unknowns, fine, fine_unknowns)
             )
             fine, fine_unknowns = coarse, coarse_unknowns
+        else:
+            self.interpolations += self._lattice_levels(
+                fine, fine_unknowns, system, coarsest_unknowns
+            )
         self.num_levels = len(self.interpolations) + 1
         # the control volumes of the hanging nodes go to the nodes they hang from:
         # sum_p V_p phi_p over all nodes, phi on the unknowns
@@ -286,30 +509,200 @@ class CompositeMultigrid:
 
     @sp.profile("patchwork.multigrid_update", tags=PROFILE_TAGS)
     def update(self, system: LinearSystem) -> None:
-        """Take the operator of ``system`` (same unknowns): the Galerkin products and smoothers."""
-        operator = sparse.csr_matrix(system.matrix)
-        self.symmetric = system.symmetric
-        self.singular = system.singular
-        self.matrix = operator
-        self.levels = [_Level(operator, self.smoothing_steps, 0)]
-        for depth, interpolation in enumerate(self.interpolations[:-1]):
-            operator = _unit_diagonal_where_empty(
-                sparse.csr_matrix(interpolation.T @ operator @ interpolation)
-            )
-            self.levels.append(_Level(operator, self.smoothing_steps, depth + 1))
-        if self.interpolations:
-            last = self.interpolations[-1]
-            operator = _unit_diagonal_where_empty(
-                sparse.csr_matrix(last.T @ operator @ last)
-            )
-        # a singular coarsest operator (the constants): pin its first unknown
-        start = 1 if self.singular else 0
-        self._coarsest = scipy.sparse.linalg.splu(
-            sparse.csc_matrix(operator[start:, start:]), permc_spec="MMD_AT_PLUS_A"
+        """Take the operator of ``system`` (same unknowns): the Galerkin products and smoothers.
+
+        An operator that differs from the one of the last full update only on its
+        diagonal (a new reaction, as in the Newton steps of a Boltzmann species)
+        takes the first coarse level as that level's operator plus the
+        Galerkin image of the diagonal change, a precomputed linear map
+        (`_galerkin_of_diagonal`).
+        """
+        self.update_operator(
+            system.matrix, symmetric=system.symmetric, singular=system.singular
         )
+
+    def _compiled_arguments(
+        self, operators: list[sparse.csr_matrix], previous: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """The arguments of the ``multigrid_vcycle`` kernel for these level operators.
+
+        The structure of ``previous`` (the last arguments) is kept when every
+        level's pattern is the same: then only the values are copied.
+        """
+        sizes = [int(np.shape(m)[0]) for m in operators]
+        offsets = np.concatenate([[0], np.cumsum(sizes)]).astype(np.int64)
+        coarsest = operators[-1].toarray()
+        n = coarsest.shape[0]
+        dense = np.zeros((n, n))
+        if self.singular:
+            # x[1:] = A[1:, 1:]^-1 (b[1:] - mean(b)), x[0] = 0, as `_coarsest_solve`
+            inverse = np.linalg.inv(coarsest[1:, 1:])
+            dense[1:, 1:] = inverse
+            dense[1:, :] -= inverse.sum(axis=1)[:, None] / n
+        else:
+            dense = np.linalg.inv(coarsest)
+        patterns = [(m.indptr, m.indices) for m in operators]
+        same = previous is not None and len(previous["patterns"]) == len(patterns)
+        if same:
+            assert previous is not None
+            same = all(
+                np.array_equal(old_ptr, ptr) and np.array_equal(old_idx, idx)
+                for (old_ptr, old_idx), (ptr, idx) in zip(
+                    previous["patterns"], patterns, strict=True
+                )
+            )
+        if same:
+            assert previous is not None
+            pointers, starts, columns, _ = previous["a"]
+            a = (pointers, starts, columns, np.concatenate([m.data for m in operators]))
+        else:
+            a = _concatenated(operators)
+        if self._transfer is None:
+            self._transfer = (
+                _concatenated(self.interpolations),
+                _concatenated([sparse.csr_matrix(p.T) for p in self.interpolations]),
+            )
+        p, r = self._transfer
+        total = int(offsets[-1])
+        return {
+            "levels": len(operators),
+            "offsets": offsets,
+            "a": a,
+            "p": p,
+            "r": r,
+            "coarse": np.ascontiguousarray(dense),
+            "work": (
+                previous["work"]
+                if same and previous is not None
+                else (np.zeros(total), np.zeros(total), np.zeros(total))
+            ),
+            "patterns": patterns,
+        }
+
+    def _take(self, operator: sparse.csr_matrix, change: np.ndarray | None) -> None:
+        """The levels of ``operator``: the reference's plus a diagonal ``change``, or new."""
+        self.matrix = operator
+        if change is None:
+            self._reference = operator
+            rows = np.repeat(np.arange(np.shape(operator)[0]), np.diff(operator.indptr))
+            on = operator.indices == rows
+            self._off_diagonal = ~on
+            positions = np.flatnonzero(on)
+            complete = positions.size == np.shape(operator)[0]
+            self._diagonal_positions = positions if complete else None
+        operators = [operator]
+        rest = self.interpolations
+        if self.interpolations:
+            if change is None:
+                self._diagonal_map = None
+                first = self.interpolations[0]
+                coarse = _unit_diagonal_where_empty(
+                    sparse.csr_matrix(first.T @ operator @ first)
+                )
+                self._reference_coarse = coarse
+            else:
+                if self._diagonal_map is None:
+                    self._reference_coarse, self._diagonal_map = _galerkin_of_diagonal(
+                        self.interpolations[0], self._reference_coarse
+                    )
+                base = self._reference_coarse
+                coarse = sparse.csr_matrix(
+                    (
+                        base.data + self._diagonal_map @ change,
+                        base.indices,
+                        base.indptr,
+                    ),
+                    shape=base.shape,
+                )
+            operators.append(coarse)
+            rest = self.interpolations[1:]
+        for interpolation in rest:
+            operators.append(
+                _unit_diagonal_where_empty(
+                    sparse.csr_matrix(interpolation.T @ operators[-1] @ interpolation)
+                )
+            )
+        self.levels = [
+            _Level(
+                matrix,
+                self.smoothing_steps,
+                depth,
+                estimate=self.smoother == "chebyshev",
+            )
+            for depth, matrix in enumerate(operators[:-1])
+        ]
+        coarsest = operators[-1]
+        self._coarsest_operator = coarsest
+        self._coarsest = None  # factorised when the uncompiled cycle needs it
+        previous, self._compiled = self._compiled, None
+        if self.smoother == "gauss-seidel" and np.shape(coarsest)[0] <= DENSE_COARSEST:
+            self._compiled = self._compiled_arguments(operators, previous)
+
+    def update_diagonal(self, diagonal: np.ndarray) -> None:
+        """Take the operator of the last full update with ``diagonal`` on its diagonal.
+
+        The cheap update of a Newton iteration whose Jacobian changes only on
+        the diagonal (a reaction): nothing is compared or copied but the values
+        (`update_operator` takes a whole matrix instead).
+        """
+        reference = self._reference
+        if reference is None or self._diagonal_positions is None:
+            raise ValueError(
+                "update_diagonal needs a full update with every diagonal entry first"
+            )
+        operator = sparse.csr_matrix(
+            (reference.data.copy(), reference.indices, reference.indptr),
+            shape=reference.shape,
+        )
+        diagonal = np.asarray(diagonal, dtype=float)
+        operator.data[self._diagonal_positions] = diagonal
+        self._take(operator, diagonal - reference.data[self._diagonal_positions])
+
+    def _diagonal_change(self, operator: sparse.csr_matrix) -> np.ndarray | None:
+        """``operator``'s diagonal minus the reference's, if nothing else changed."""
+        reference = self._reference
+        if (
+            reference is None
+            or reference.shape != operator.shape
+            or not np.array_equal(reference.indptr, operator.indptr)
+            or not np.array_equal(reference.indices, operator.indices)
+        ):
+            return None
+        off = self._off_diagonal
+        if not np.array_equal(operator.data[off], reference.data[off]):
+            return None
+        return operator.diagonal() - reference.diagonal()
+
+    def update_operator(
+        self,
+        matrix: sparse.spmatrix,
+        *,
+        symmetric: bool | None = None,
+        singular: bool | None = None,
+    ) -> None:
+        """Take a new operator on the same unknowns, as `update` (see there).
+
+        For callers that assemble the operator themselves, such as a Newton
+        iteration adding a reaction to the diagonal; ``symmetric`` and ``singular``
+        default to those of the last operator.
+        """
+        operator = sparse.csr_matrix(matrix, dtype=float, copy=True)
+        operator.sum_duplicates()
+        if symmetric is not None:
+            self.symmetric = bool(symmetric)
+        if singular is not None:
+            self.singular = bool(singular)
+        self._take(operator, self._diagonal_change(operator))
 
     def _coarsest_solve(self, b: np.ndarray) -> np.ndarray:
         """The coarsest level's direct solve (up to a constant if singular)."""
+        if self._coarsest is None:
+            # a singular coarsest operator (the constants): pin its first unknown
+            start = 1 if self.singular else 0
+            self._coarsest = scipy.sparse.linalg.splu(
+                sparse.csc_matrix(self._coarsest_operator[start:, start:]),
+                permc_spec="MMD_AT_PLUS_A",
+            )
         if not self.singular:
             return self._coarsest.solve(b)
         result = np.zeros(b.size)
@@ -325,11 +718,32 @@ class CompositeMultigrid:
         x = level.smooth(np.zeros(b.size), b)
         residual = b - level.matrix @ x
         x = x + interpolation @ self._cycle(depth + 1, interpolation.T @ residual)
-        return level.smooth(x, b)
+        return level.smooth(x, b, forward=False)
 
     def cycle(self, right_hand_side: np.ndarray) -> np.ndarray:
-        """One V-cycle from zero: the preconditioner applied to ``right_hand_side``."""
-        return self._cycle(0, np.asarray(right_hand_side, dtype=float))
+        """One V-cycle from zero: the preconditioner applied to ``right_hand_side``.
+
+        With ``smoother="gauss-seidel"`` and a small coarsest level, the compiled
+        ``multigrid_vcycle`` kernel.
+        """
+        b = np.asarray(right_hand_side, dtype=float)
+        arguments = self._compiled
+        if arguments is None:
+            return self._cycle(0, b)
+        from patchwork.kernels.multigrid_vcycle import kernel
+
+        x = np.empty_like(b)
+        kernel(
+            arguments["levels"], arguments["offsets"], *arguments["a"],
+            *arguments["p"], *arguments["r"], arguments["coarse"],
+            self.smoothing_steps, np.ascontiguousarray(b), x, *arguments["work"],
+        )  # fmt: skip
+        return x
+
+    @property
+    def preconditioner(self) -> scipy.sparse.linalg.LinearOperator:
+        """The V-cycle as a SciPy `LinearOperator`, as `AMGSolver.preconditioner`."""
+        return self.as_linear_operator()
 
     def as_linear_operator(self) -> scipy.sparse.linalg.LinearOperator:
         """The V-cycle as a SciPy `LinearOperator` (a preconditioner ``M``)."""
@@ -430,6 +844,7 @@ class MultigridBackend(Backend):
         max_iterations: int = 200,
         smoothing_steps: int = 2,
         coarsest_unknowns: int = COARSEST_UNKNOWNS,
+        smoother: str = "chebyshev",
     ) -> None:
         """The options of `CompositeMultigrid`."""
         self.options: dict[str, Any] = {
@@ -437,6 +852,7 @@ class MultigridBackend(Backend):
             "max_iterations": max_iterations,
             "smoothing_steps": smoothing_steps,
             "coarsest_unknowns": coarsest_unknowns,
+            "smoother": smoother,
         }
 
     def unsupported(self, system: LinearSystem) -> str | None:

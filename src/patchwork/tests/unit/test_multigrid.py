@@ -142,9 +142,10 @@ def test_a_line_and_a_box() -> None:
         assert multigrid.solver.iterations <= 12
 
 
-def test_a_singular_operator_gives_the_solution_of_zero_mean() -> None:
+@pytest.mark.parametrize("smoother", ["chebyshev", "gauss-seidel"])
+def test_a_singular_operator_gives_the_solution_of_zero_mean(smoother: str) -> None:
     mesh = _nested(32, 1, periodic=(True, True))
-    multigrid = NodalPoisson(mesh, backend="multigrid")
+    multigrid = NodalPoisson(mesh, backend=MultigridBackend(smoother=smoother))
     source = _source(multigrid)
     potential = multigrid.solve(source)
     volumes = multigrid.nodes.volumes
@@ -155,7 +156,9 @@ def test_a_singular_operator_gives_the_solution_of_zero_mean() -> None:
     # a uniform periodic mesh: the FFT's answer
     uniform = AMRHierarchy(base_shape=(32, 32), periodic=(True, True))
     fft = NodalPoisson(uniform, backend="fft")
-    multigrid = NodalPoisson(uniform, nodes=fft.nodes, backend="multigrid")
+    multigrid = NodalPoisson(
+        uniform, nodes=fft.nodes, backend=MultigridBackend(smoother=smoother)
+    )
     source = _source(fft)
     assert np.allclose(multigrid.solve(source), fft.solve(source), atol=1e-10)
 
@@ -205,3 +208,133 @@ def test_no_convergence_and_zero_right_hand_sides() -> None:
     small = NodalPoisson(AMRHierarchy(base_shape=(8, 8)), backend="multigrid")
     assert small.solver.num_levels == 1
     assert "rtol=1e-10" in repr(MultigridBackend())
+
+
+def _box_3d(shape: tuple[int, int, int], **kwargs) -> NodalPoisson:
+    """A 3D box: Dirichlet on the x faces, Neumann on the others, a body in the middle."""
+    mesh = AMRHierarchy(base_shape=shape)
+    faces = {"x_lower": Dirichlet(0.0), "x_upper": Dirichlet(1.0)}
+    for face in ("y_lower", "y_upper", "z_lower", "z_upper"):
+        faces[face] = Neumann(0.0)
+    body = EmbeddedDirichlet(
+        lambda p: (np.abs(p[0] - 0.5) < 0.06) & (p[1] ** 2 + p[2] ** 2 > 0.35**2), 0.3
+    )
+    return NodalPoisson(mesh, faces=faces, embedded=(body,), **kwargs)
+
+
+def test_linear_interpolation_on_an_odd_lattice() -> None:
+    from patchwork.solvers.multigrid import _linear_1d
+
+    for n, coarse in ((2, [0, 1]), (3, [0, 2]), (6, [0, 2, 4, 5]), (7, [0, 2, 4, 6])):
+        matrix = _linear_1d(n)
+        assert matrix.shape == (n, len(coarse))
+        line = 0.3 + 2.0 * np.arange(n)
+        assert np.allclose(matrix @ line[coarse], line)  # exact for linears
+
+
+@pytest.mark.parametrize("shape", [(24, 12, 12), (25, 13, 11)])
+def test_odd_base_levels_coarsen_on_their_lattice(shape) -> None:
+    """A base level `_halved` cannot coarsen goes on with linear interpolation on its nodes."""
+    solver = _box_3d(shape, backend=MultigridBackend(rtol=1e-10, coarsest_unknowns=100))
+    multigrid = solver.solver
+    assert multigrid.num_levels >= 3
+    direct = _box_3d(shape)
+    source = np.ones(solver.nodes.num_nodes)
+    assert np.allclose(solver.solve(source), direct.solve(source), atol=1e-8)
+    assert multigrid.iterations < 30
+
+
+def test_gauss_seidel_cycles_compiled_and_uncompiled_agree() -> None:
+    import cunumpy as xp
+
+    solver = _box_3d(
+        (25, 13, 11),
+        backend=MultigridBackend(
+            smoother="gauss-seidel", smoothing_steps=1, coarsest_unknowns=100
+        ),
+    )
+    multigrid = solver.solver
+    assert multigrid._compiled is not None
+    b = np.random.default_rng(0).standard_normal(multigrid.matrix.shape[0])
+    arguments, multigrid._compiled = multigrid._compiled, None
+    uncompiled = multigrid.cycle(b)
+    multigrid._compiled = arguments
+    results = []
+    for implementation in ("numpy", "python", "pyccel"):
+        try:
+            with xp.kernels.use_host_kernel_implementation(implementation):
+                results.append(multigrid.cycle(b))
+        except Exception:  # noqa: BLE001 -- no Pyccel, or no compiler
+            assert implementation == "pyccel"
+    for result in results:
+        assert np.allclose(
+            result, uncompiled, rtol=0, atol=1e-12 * abs(uncompiled).max()
+        )
+    direct = _box_3d((25, 13, 11))
+    source = np.ones(solver.nodes.num_nodes)
+    assert np.allclose(solver.solve(source), direct.solve(source), atol=1e-8)
+    with pytest.raises(ValueError, match="smoother"):
+        MultigridBackend(smoother="jacobi").setup(solver.system)
+
+
+def test_a_new_diagonal_is_taken_without_the_galerkin_product() -> None:
+    """`update_diagonal`, `update_operator` and `set_reaction` give the levels of a full update."""
+    import scipy.sparse as sparse
+
+    from patchwork.solvers.multigrid import _galerkin_of_diagonal
+
+    backend = MultigridBackend(
+        smoother="gauss-seidel", smoothing_steps=1, coarsest_unknowns=100
+    )
+    solver = _box_3d((25, 13, 11), backend=backend)
+    multigrid = solver.solver
+    b = np.random.default_rng(1).standard_normal(multigrid.matrix.shape[0])
+    reaction = np.random.default_rng(2).uniform(0.0, 50.0, solver.nodes.num_nodes)
+    solver.set_reaction(reaction)  # through update(system): only the diagonal changed
+    assert multigrid._diagonal_map is not None
+    fast = multigrid.cycle(b)
+    jacobian = multigrid.matrix.copy()
+    multigrid._reference = None
+    solver.set_reaction(reaction)  # a full update
+    assert multigrid._diagonal_map is None
+    full = multigrid.cycle(b)
+    assert np.allclose(fast, full, rtol=0, atol=1e-12 * abs(full).max())
+    solver.set_reaction(None)
+    multigrid.update_diagonal(jacobian.diagonal())
+    assert np.allclose(multigrid.cycle(b), full, rtol=0, atol=1e-12 * abs(full).max())
+    multigrid.update_operator(jacobian)
+    assert np.allclose(multigrid.cycle(b), full, rtol=0, atol=1e-12 * abs(full).max())
+    # the map itself: P^T diag(d) P on the pattern
+    p = multigrid.interpolations[0]
+    d = np.random.default_rng(3).uniform(size=p.shape[0])
+    pattern, mapping = _galerkin_of_diagonal(p, sparse.csr_matrix(p.T @ p))
+    product = sparse.csr_matrix(
+        (mapping @ d, pattern.indices, pattern.indptr), shape=pattern.shape
+    )
+    assert abs(product - p.T @ sparse.diags(d) @ p).max() < 1e-14
+    multigrid._reference = None
+    with pytest.raises(ValueError, match="full update"):
+        multigrid.update_diagonal(jacobian.diagonal())
+
+
+def test_a_singular_3d_box_with_the_compiled_cycle() -> None:
+    """Neumann on every face: the compiled cycle's coarsest solve pins the constant."""
+    mesh = AMRHierarchy(base_shape=(17, 9, 9))
+    faces = {
+        face: Neumann(0.0)
+        for face in ("x_lower", "x_upper", "y_lower", "y_upper", "z_lower", "z_upper")
+    }
+    backend = MultigridBackend(
+        smoother="gauss-seidel", smoothing_steps=1, coarsest_unknowns=50
+    )
+    solver = NodalPoisson(mesh, faces=faces, backend=backend)
+    assert solver.solver._compiled is not None and solver.solver.singular
+    x, y, z = solver.nodes.coordinates.T
+    source = np.cos(np.pi * x) * np.cos(np.pi * y)
+    potential = solver.solve(source)
+    assert abs(solver.nodes.volumes @ potential) < 1e-12
+    right = solver.load @ source
+    residual = solver.matrix @ potential[solver.free] - (right - right.mean())
+    assert np.linalg.norm(residual) < 1e-8 * np.linalg.norm(right)
+    solver.set_coefficient(2.0)  # not only the diagonal: a full update
+    assert solver.solver._diagonal_map is None
