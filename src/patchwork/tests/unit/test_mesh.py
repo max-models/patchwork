@@ -105,6 +105,48 @@ def test_patches_of_an_l_are_plotted() -> None:
     matplotlib.pyplot.close(figure)
 
 
+def test_the_cells_are_plotted_transposed_and_scaled() -> None:
+    pytest.importorskip("matplotlib")
+    import matplotlib
+
+    matplotlib.use("Agg")
+    # an (r, x) hierarchy: 2 mm of radius, 4 mm along x, a refined box at small r and x
+    mesh = AMRHierarchy(base_shape=(4, 8), bounds=((0.0, 2e-3), (0.0, 4e-3)))
+    mesh.add_patch(level=1, box=((0, 4), (0, 6)))
+
+    figure, axes = plot_patches(
+        mesh,
+        transpose=True,
+        scale=1e3,
+        mask_covered=False,
+        colors=["grey", "blue"],
+        labels=[None, "box"],
+        title="",
+    )
+
+    assert axes.get_xlim() == pytest.approx((0.0, 4.0))
+    assert axes.get_ylim() == pytest.approx((0.0, 2.0))
+    assert not any(patch.get_fill() for patch in axes.patches)  # nothing is masked
+    # the fine box's lines across r are horizontal: at r = 0, 0.25, ..., 1 mm
+    horizontal = axes.collections[2].get_segments()
+    assert [segment[0][1] for segment in horizontal] == pytest.approx(
+        np.linspace(0.0, 1.0, 5)
+    )
+    assert [text.get_text() for text in axes.get_legend().get_texts()] == ["box"]
+    axes.plot([0.0, 1.0], [0.0, 1.0], label="beam")  # a legend drawn later keeps it
+    assert [text.get_text() for text in axes.legend().get_texts()] == ["box", "beam"]
+    assert axes.get_title() == ""
+    matplotlib.pyplot.close(figure)
+
+    mesh.allocate_field("phi", centering="node")
+    figure, axes = plot_patches(mesh, field="phi", transpose=True, scale=1e3)
+    corner = axes.collections[0].get_coordinates()[-1, -1]
+    assert tuple(corner) == pytest.approx((4.0, 2.0))
+    matplotlib.pyplot.close(figure)
+    with pytest.raises(ValueError, match="2D hierarchies only"):
+        plot_patches(AMRHierarchy(base_shape=(8,)), transpose=True)
+
+
 def test_on_one_rank_every_patch_is_local_whatever_its_placement() -> None:
     for placement in ("all", "balanced"):
         mesh = AMRHierarchy(base_shape=(16, 16), base_boxes=ELL, placement=placement)
