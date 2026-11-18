@@ -605,6 +605,14 @@ class CompositeMultigrid:
         self._reference: sparse.csr_matrix | None = None
         self._diagonal_map: sparse.csr_matrix | None = None
         self._diagonal_positions: np.ndarray | None = None
+        self._stiffness: sparse.csr_matrix | None = None
+        self._reaction_maps: (
+            list[tuple[sparse.csr_matrix, sparse.csr_matrix]] | None
+        ) = None
+        # all nodes from the unknowns (hanging nodes interpolated), for `update_reaction`
+        self._node_transfer = sparse.csr_matrix(
+            system.nodes.reduction[:, np.asarray(system.unknowns)]
+        )
         self._patterns: list[tuple[np.ndarray, np.ndarray]] | None = None
         self._groups: list[list[np.ndarray]] = []
         self._orders: list[np.ndarray] = []
@@ -655,6 +663,10 @@ class CompositeMultigrid:
         self.update_operator(
             system.matrix, symmetric=system.symmetric, singular=system.singular
         )
+        if not system.reaction:
+            # the operator without a reaction, which `update_reaction` adds to
+            self._stiffness = self.matrix
+            self._reaction_maps = None
 
     def _compiled_arguments(
         self, operators: list[sparse.csr_matrix], previous: dict[str, Any] | None
@@ -725,44 +737,10 @@ class CompositeMultigrid:
             "colours": colours,
         }
 
-    def _take(self, operator: sparse.csr_matrix, change: np.ndarray | None) -> None:
-        """The levels of ``operator``: the reference's plus a diagonal ``change``, or new."""
-        self.matrix = operator
-        if change is None:
-            self._reference = operator
-            rows = np.repeat(np.arange(np.shape(operator)[0]), np.diff(operator.indptr))
-            on = operator.indices == rows
-            self._off_diagonal = ~on
-            positions = np.flatnonzero(on)
-            complete = positions.size == np.shape(operator)[0]
-            self._diagonal_positions = positions if complete else None
-        operators = [operator]
-        rest = self.interpolations
-        if self.interpolations:
-            if change is None:
-                self._diagonal_map = None
-                first = self.interpolations[0]
-                coarse = _unit_diagonal_where_empty(
-                    sparse.csr_matrix(first.T @ operator @ first)
-                )
-                self._reference_coarse = coarse
-            else:
-                if self._diagonal_map is None:
-                    self._reference_coarse, self._diagonal_map = _galerkin_of_diagonal(
-                        self.interpolations[0], self._reference_coarse
-                    )
-                base = self._reference_coarse
-                coarse = sparse.csr_matrix(
-                    (
-                        base.data + self._diagonal_map @ change,
-                        base.indices,
-                        base.indptr,
-                    ),
-                    shape=base.shape,
-                )
-            operators.append(coarse)
-            rest = self.interpolations[1:]
-        for interpolation in rest:
+    def _finish(self, operators: list[sparse.csr_matrix]) -> None:
+        """The levels below the given operators (Galerkin products), their smoothers and kernel."""
+        operators = list(operators)
+        for interpolation in self.interpolations[len(operators) - 1 :]:
             operators.append(
                 _unit_diagonal_where_empty(
                     sparse.csr_matrix(interpolation.T @ operators[-1] @ interpolation)
@@ -810,6 +788,82 @@ class CompositeMultigrid:
             self._compiled = self._compiled_arguments(
                 operators, previous if same else None
             )
+
+    def _take(self, operator: sparse.csr_matrix, change: np.ndarray | None) -> None:
+        """The levels of ``operator``: the reference's plus a diagonal ``change``, or new."""
+        self.matrix = operator
+        if change is None:
+            self._reference = operator
+            rows = np.repeat(np.arange(np.shape(operator)[0]), np.diff(operator.indptr))
+            on = operator.indices == rows
+            self._off_diagonal = ~on
+            positions = np.flatnonzero(on)
+            complete = positions.size == np.shape(operator)[0]
+            self._diagonal_positions = positions if complete else None
+        operators = [operator]
+        if self.interpolations:
+            if change is None:
+                self._diagonal_map = None
+                first = self.interpolations[0]
+                coarse = _unit_diagonal_where_empty(
+                    sparse.csr_matrix(first.T @ operator @ first)
+                )
+                self._reference_coarse = coarse
+            else:
+                if self._diagonal_map is None:
+                    self._reference_coarse, self._diagonal_map = _galerkin_of_diagonal(
+                        self.interpolations[0], self._reference_coarse
+                    )
+                base = self._reference_coarse
+                coarse = sparse.csr_matrix(
+                    (
+                        base.data + self._diagonal_map @ change,
+                        base.indices,
+                        base.indptr,
+                    ),
+                    shape=base.shape,
+                )
+            operators.append(coarse)
+        self._finish(operators)
+
+    def update_reaction(self, weights: np.ndarray) -> None:
+        r"""Take the operator without a reaction plus the lumped reaction ``weights``.
+
+        The operator becomes $K + T^\top \operatorname{diag}(w)\, T$: $K$ the
+        operator of the last `update` whose system had no reaction, $T$ the
+        interpolation of all nodes from the unknowns (the hanging nodes from the
+        nodes they hang from) and $w$ one weight per node, e.g. the control
+        volume times the reaction coefficient (`NodalPoisson.set_reaction`).
+        The fine operator and the first coarse one are $K$'s and its Galerkin
+        product plus precomputed linear maps of $w$ (`_galerkin_of_diagonal` of
+        $T$ and of $T P_0$), so a Newton step's Jacobian is taken without a
+        product on the finest levels, with refined patches too.
+        """
+        stiffness = self._stiffness
+        if stiffness is None:
+            raise ValueError("update_reaction needs an update without a reaction first")
+        if self._reaction_maps is None:
+            transfer = self._node_transfer
+            maps = [_galerkin_of_diagonal(transfer, stiffness)]
+            if self.interpolations:
+                first = self.interpolations[0]
+                coarse = _unit_diagonal_where_empty(
+                    sparse.csr_matrix(first.T @ stiffness @ first)
+                )
+                maps.append(
+                    _galerkin_of_diagonal(sparse.csr_matrix(transfer @ first), coarse)
+                )
+            self._reaction_maps = maps
+        weights = np.asarray(weights, dtype=float)
+        operators = [
+            sparse.csr_matrix(
+                (base.data + mapping @ weights, base.indices, base.indptr),
+                shape=base.shape,
+            )
+            for base, mapping in self._reaction_maps
+        ]
+        self.matrix = operators[0]
+        self._finish(operators)
 
     def update_diagonal(self, diagonal: np.ndarray) -> None:
         """Take the operator of the last full update with ``diagonal`` on its diagonal.
