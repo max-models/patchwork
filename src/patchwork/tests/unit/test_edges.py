@@ -287,3 +287,75 @@ def test_a_path_that_stays_put_deposits_nothing_and_shapes_are_checked() -> None
     np.testing.assert_array_equal(edges.deposit_paths(point, point, np.ones(1)), 0.0)
     with pytest.raises(ValueError, match="paths"):
         edges.deposit_paths(point, np.zeros((2, 2)), np.ones(1))
+
+
+def _random_paths(edges: CompositeEdges, count: int, seed: int, scale: float):
+    """Paths from points in the domain, some ending outside or across seams."""
+    rng = np.random.default_rng(seed)
+    lower = np.asarray(edges.nodes._origin)
+    size = np.asarray(edges.nodes._spacing) * edges.nodes._cells
+    start = lower[:, None] + size[:, None] * rng.random((lower.size, count))
+    end = start + rng.normal(scale=scale, size=start.shape)
+    return start, end, rng.normal(size=count)
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("periodic", [(False, False), (False, True), (True, True)])
+def test_the_compiled_path_deposit_is_the_piecewise_one(layout, periodic) -> None:
+    """deposit_paths (mpifield's block kernels per patch) against the NumPy pieces."""
+    edges = _edges(layout, periodic=periodic)
+    start, end, charges = _random_paths(edges, 600, seed=21, scale=0.4)
+    # paths that stay put, run along lattice lines and wrap more than once
+    end[:, :10] = start[:, :10]
+    end[1, 10:20] = start[1, 10:20]
+    end[1, 20:25] = start[1, 20:25] + 2.7
+    expected = edges._deposit_pieces(start, end, charges)
+    np.testing.assert_allclose(
+        edges.deposit_paths(start, end, charges), expected, rtol=0.0, atol=1e-12
+    )
+
+
+def _nested_3d(periodic=None) -> CompositeEdges:
+    mesh = AMRHierarchy(
+        base_shape=(6, 6, 6),
+        bounds=((0.0, 1.0), (0.0, 1.0), (0.0, 1.5)),
+        periodic=periodic,
+    )
+    mesh.add_patch(level=1, box=((2, 10), (0, 6), (4, 12)))
+    mesh.add_patch(level=2, box=((6, 14), (2, 8), (10, 18)))
+    return CompositeEdges(CompositeNodes(mesh))
+
+
+@pytest.mark.parametrize("periodic", [None, (True, False, True)])
+def test_the_compiled_path_deposit_in_3d(periodic) -> None:
+    edges = _nested_3d(periodic)
+    start, end, charges = _random_paths(edges, 300, seed=22, scale=0.3)
+    expected = edges._deposit_pieces(start, end, charges)
+    current = edges.deposit_paths(start, end, charges)
+    np.testing.assert_allclose(current, expected, rtol=0.0, atol=1e-12)
+    if periodic is not None:  # every path stays in the domain on the bounded axis
+        start[1] = np.clip(start[1], 0.0, 1.0)
+        end[1] = np.clip(end[1], 0.0, 1.0)
+        assert _continuity_error(edges, start, end, charges) < 1e-12
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+@pytest.mark.parametrize("periodic", [(False, False), (True, True)])
+def test_the_compiled_gather_is_the_evaluation(layout, periodic) -> None:
+    edges = _edges(layout, periodic=periodic)
+    values = edges.reduction @ np.random.default_rng(23).normal(size=edges.num_edges)
+    points = _points(1500, seed=24)
+    # points on lattice lines and patch edges, and outside the domain
+    points[:, :20] = np.round(points[:, :20] * 32.0) / 32.0
+    points[0, 20:30] = 2.3
+    expected = np.array([matrix @ values for matrix in edges.evaluation(points)])
+    np.testing.assert_allclose(edges.gather(points, values), expected, atol=1e-11)
+
+
+def test_the_compiled_gather_in_3d() -> None:
+    edges = _nested_3d((False, True, False))
+    values = edges.reduction @ np.random.default_rng(25).normal(size=edges.num_edges)
+    rng = np.random.default_rng(26)
+    points = rng.random((3, 800)) * np.array([[1.0], [1.0], [1.5]])
+    expected = np.array([matrix @ values for matrix in edges.evaluation(points)])
+    np.testing.assert_allclose(edges.gather(points, values), expected, atol=1e-11)
