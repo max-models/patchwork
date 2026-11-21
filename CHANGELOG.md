@@ -7,6 +7,21 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `CompositeEdges.gather(points, e)`: the field of an edge field at points, `evaluation`
+  applied to `e` with mpifield's compiled edge gather (`mpifield.WHITNEY`) on the block of each
+  point's patch.
+
+### Changed
+
+- `CompositeEdges.deposit_paths` runs mpifield's compiled path deposit (`mpifield.WHITNEY`)
+  patch by patch in 1D, 2D and 3D: each path is clipped to the leaf cells of every patch (its
+  box without its children's, shifted by whole periods on a periodic axis) and integrated on
+  the patch's block, whose edges map to the composite ones. The same current as the NumPy
+  pieces to round-off; 1e5 paths on a 2D three-level hierarchy 490 → 31 ms (scope-profiler,
+  medians of 10 calls, four threads). patchwork's own `deposit_paths_1d` kernel is gone: on a
+  line the composition takes 22 ms for 1e5 paths where it took 12 ms. Needs mpifield with
+  `WHITNEY`.
+
 - `plot_patches` options for drawing a hierarchy as part of another figure: `transpose`
   (the second axis horizontal, e.g. `x` of an `(r, x)` hierarchy), `scale` (e.g. `1e3` for
   millimetres), `mask_covered=False` (every level's grid in full, not hidden under the finer

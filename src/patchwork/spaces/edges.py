@@ -26,13 +26,17 @@ component is constant along every edge. Then
   `patchwork.spaces.mass`.
 
 This is the space of the implicit, energy-conserving PIC: the field gather
-(`CompositeEdges.evaluation`) and the current deposit, its transpose
-(`CompositeEdges.deposit`).
+(`CompositeEdges.evaluation`, compiled in `CompositeEdges.gather`) and the current
+deposit, its transpose (`CompositeEdges.deposit`, along paths
+`CompositeEdges.deposit_paths`). The compiled ones run mpifield's block kernels
+(`mpifield.WHITNEY`) on every patch.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import itertools
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import scipy.sparse as sparse
@@ -77,6 +81,79 @@ def _axis_columns(ndim: int, axis: int) -> list[int]:
     """The columns of `CompositeEdges.cell_edges` that hold the edges along ``axis``."""
     per_axis = 2 ** (ndim - 1)
     return list(range(axis * per_axis, (axis + 1) * per_axis))
+
+
+def _clip(
+    a: np.ndarray, step: np.ndarray, lower: np.ndarray, upper: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """The times in ``[0, 1]`` at which the paths ``a + t step`` ``(ndim, k)`` enter and leave a box.
+
+    ``lower`` and ``upper`` are the box's corners ``(ndim,)``. A path that misses the
+    box gets an exit before its entry. Every path is clipped with the same arithmetic,
+    so two boxes that share a face give their common path point the same time.
+    """
+    enter = np.zeros(a.shape[1])
+    leave = np.ones(a.shape[1])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for axis in range(a.shape[0]):
+            d = step[axis]
+            low = (lower[axis] - a[axis]) / d
+            high = (upper[axis] - a[axis]) / d
+            moving = d != 0.0
+            inside = (a[axis] >= lower[axis]) & (a[axis] <= upper[axis])
+            enter = np.where(moving, np.maximum(enter, np.minimum(low, high)), enter)
+            leave = np.where(moving, np.minimum(leave, np.maximum(low, high)), leave)
+            leave = np.where(moving | inside, leave, -1.0)
+    return enter, leave
+
+
+def _shifts(
+    a: np.ndarray,
+    b: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    cells: np.ndarray,
+    periodic: tuple[bool, ...],
+) -> list[np.ndarray]:
+    """The shifts by whole periods that bring part of some path into a box.
+
+    On a periodic axis paths are not wrapped: a box at ``[lower, upper]`` meets them
+    at ``[lower, upper] + k cells`` for every ``k`` within their extent.
+    """
+    ranges = []
+    for axis, wraps in enumerate(periodic):
+        if not wraps or a.shape[1] == 0:
+            ranges.append([0])
+            continue
+        period = float(cells[axis])
+        smallest = float(min(a[axis].min(), b[axis].min()))
+        largest = float(max(a[axis].max(), b[axis].max()))
+        first = int(np.ceil((smallest - upper[axis]) / period))
+        last = int(np.floor((largest - lower[axis]) / period))
+        ranges.append([k * period for k in range(first, last + 1)])
+    return [np.array(shift) for shift in itertools.product(*ranges)]
+
+
+@dataclass(frozen=True)
+class _PatchBlock:
+    """A patch as the block kernels see it, on the finest lattice (its unit is one cell).
+
+    Attributes:
+        grid: The `mpifield.BlockGrid` of the patch's nodes, in finest-lattice units
+            (lower corner, span, nodes), bounded on every axis.
+        lower: Finest-lattice coordinates of the patch's lower corner.
+        upper: Finest-lattice coordinates of its upper corner.
+        children: The boxes ``(c, 2, ndim)`` of the patches one level finer that
+            overlap it: their cells are not leaf cells of this patch.
+        edge_map: The composite edge of every edge of the block, ``num_nodes +
+            (ndim,)``; -1 for an edge of no leaf cell of the patch.
+    """
+
+    grid: Any
+    lower: np.ndarray
+    upper: np.ndarray
+    children: np.ndarray
+    edge_map: np.ndarray
 
 
 def _uniform_edges(hx: float, hy: float, cells: int = 4) -> CompositeEdges:
@@ -394,6 +471,8 @@ class CompositeEdges:
         # a periodic axis one cell wide joins a node to itself: no difference
         self.gradient.eliminate_zeros()
         self._find_hanging_edges()
+        self._blocks: list[_PatchBlock] | None = None
+        self._cell_block = np.zeros(0, dtype=np.int64)
 
     # Operators -------------------------------------------------------------------#
     @method(
@@ -526,14 +605,6 @@ class CompositeEdges:
             np.zeros(self.num_edges),
         )
 
-    def _line_edges(self) -> np.ndarray:
-        """The edge of each leaf cell of a line, C-ordered (the kernels' argument)."""
-        if getattr(self, "_line_edge", None) is None:
-            self._line_edge = np.ascontiguousarray(
-                self.cell_edges[:, 0], dtype=np.int64
-            )
-        return self._line_edge
-
     def _pieces(
         self, start: np.ndarray, end: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -609,6 +680,142 @@ class CompositeEdges:
             )
         return current
 
+    # The blocks of the patches ------------------------------------------------------#
+    def _patch_blocks(self) -> tuple[list[_PatchBlock], np.ndarray]:
+        """Every patch as a block of the kernels, and the block of every leaf cell.
+
+        Built on first use. A leaf cell's edges are the edges of its patch's block at
+        the cell's corners; the edges of the cells that finer patches cover are not in
+        the space (-1 in the block's ``edge_map``).
+        """
+        if self._blocks is not None:
+            return self._blocks, self._cell_block
+        from mpifield import BlockGrid
+
+        nodes = self.nodes
+        ndim = nodes.ndim
+        hierarchy = nodes.hierarchy
+        ratio = hierarchy.refinement_ratio
+        finest = hierarchy.max_level
+        bits = corner_bits(ndim)
+        blocks = []
+        cell_block = np.full(nodes.cell_span.size, -1, dtype=np.int64)
+        for patch in hierarchy.patches:
+            span = ratio ** (finest - patch.level)
+            lower = np.array([lo for lo, _ in patch.box], dtype=np.int64) * span
+            upper = np.array([hi for _, hi in patch.box], dtype=np.int64) * span
+            children = [
+                (
+                    np.array([lo for lo, _ in child.box]) * (span // ratio),
+                    np.array([hi for _, hi in child.box]) * (span // ratio),
+                )
+                for child in hierarchy.patches_at_level(patch.level + 1)
+            ]
+            children = np.array(
+                [
+                    (low, high)
+                    for low, high in children
+                    if np.all(low < upper) and np.all(high > lower)
+                ],
+                dtype=float,
+            ).reshape(-1, 2, ndim)
+            node_shape = tuple(int(n) + 1 for n in (upper - lower) // span)
+            edge_map = np.full((*node_shape, ndim), -1, dtype=np.int64)
+            cells = np.flatnonzero(
+                (nodes.cell_span == span)
+                & np.all(nodes.cell_lower >= lower, axis=1)
+                & np.all(nodes.cell_lower < upper, axis=1)
+            )
+            cell_block[cells] = len(blocks)
+            local = (nodes.cell_lower[cells] - lower) // span
+            for axis in range(ndim):
+                starts = [start for start, _ in edge_corners(ndim, axis)]
+                columns = _axis_columns(ndim, axis)
+                for column, start in zip(columns, starts, strict=True):
+                    index = local + bits[start]
+                    edge_map[(*index.T, axis)] = self.cell_edges[cells, column]
+            grid = BlockGrid.from_geometry(
+                lower.astype(float), (float(span),) * ndim, node_shape
+            )
+            blocks.append(
+                _PatchBlock(
+                    grid, lower.astype(float), upper.astype(float), children, edge_map
+                )
+            )
+        self._blocks, self._cell_block = blocks, cell_block
+        return blocks, cell_block
+
+    def _leaf_paths(
+        self, block: _PatchBlock, a: np.ndarray, b: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The parts of the paths from ``a`` to ``b`` in the leaf cells of a patch.
+
+        ``a`` and ``b`` are on the finest lattice ``(ndim, k)``, not wrapped. Returns
+        the path of every part and its two ends, shifted by whole periods into the
+        patch's frame: the paths clipped to the patch, without the boxes of its
+        children, for every shift that brings them into it.
+        """
+        nodes = self.nodes
+        step = b - a
+        smallest, largest = np.minimum(a, b), np.maximum(a, b)
+        lower, upper = block.lower[:, None], block.upper[:, None]
+        paths, starts, ends = [], [], []
+        for shift in _shifts(
+            a, b, block.lower, block.upper, nodes._cells, nodes._periodic
+        ):
+            low, high = smallest - shift[:, None], largest - shift[:, None]
+            near = np.all((high >= lower) & (low <= upper), axis=0)
+            # a path inside the patch that comes nowhere near a child is one part
+            whole = near & np.all((low >= lower) & (high <= upper), axis=0)
+            for child_low, child_high in block.children:
+                whole &= ~np.all(
+                    (high >= child_low[:, None]) & (low <= child_high[:, None]), axis=0
+                )
+            inside = np.flatnonzero(whole)
+            paths.append(inside)
+            starts.append(a[:, inside] - shift[:, None])
+            ends.append(b[:, inside] - shift[:, None])
+            candidates = np.flatnonzero(near & ~whole)
+            if candidates.size == 0:
+                continue
+            shifted = a[:, candidates] - shift[:, None]
+            enter, leave = _clip(shifted, step[:, candidates], block.lower, block.upper)
+            local = np.flatnonzero(leave > enter)
+            if local.size == 0:
+                continue
+            hit = candidates[local]
+            a_hit, step_hit = shifted[:, local], step[:, hit]
+            enter, leave = enter[local], leave[local]
+            # the times the paths enter and leave the children, within the patch
+            cuts = [enter[:, None], leave[:, None]]
+            covered = []
+            for low, high in block.children:
+                into, out = _clip(a_hit, step_hit, low, high)
+                into = np.clip(into, enter, leave)
+                out = np.clip(out, enter, leave)
+                cuts += [into[:, None], out[:, None]]
+                covered.append((into, out))
+            times = np.sort(np.hstack(cuts), axis=1)
+            first, last = times[:, :-1], times[:, 1:]
+            keep = last > first
+            middle = 0.5 * (first + last)
+            for into, out in covered:
+                keep &= ~((middle > into[:, None]) & (middle < out[:, None]))
+            row, column = np.nonzero(keep)
+            begin, finish = first[row, column], last[row, column]
+            paths.append(hit[row])
+            starts.append(a_hit[:, row] + begin * step_hit[:, row])
+            ends.append(a_hit[:, row] + finish * step_hit[:, row])
+        if not paths:
+            empty = np.zeros((a.shape[0], 0))
+            return np.zeros(0, dtype=np.int64), empty, empty
+        return np.concatenate(paths), np.hstack(starts), np.hstack(ends)
+
+    def _lattice(self, points: np.ndarray) -> np.ndarray:
+        """``points`` ``(ndim, k)`` in units of the finest lattice, from the origin."""
+        nodes = self.nodes
+        return (points - nodes._origin[:, None]) / nodes._spacing[:, None]
+
     @method(
         equations={
             "pieces": r"j_\mathrm{lower} \mathrel{+}= q\,\frac{\Delta x}{h_x}(1 - \eta_\mathrm{mid}), \qquad j_\mathrm{upper} \mathrel{+}= q\,\frac{\Delta x}{h_x}\,\eta_\mathrm{mid}, \qquad \text{likewise for the } y\text{-edges}",
@@ -617,14 +824,17 @@ class CompositeEdges:
             "work": r"j^\top e = \sum_k q_k \int_{\mathbf{x}_0}^{\mathbf{x}_1} \mathbf{E}\cdot d\mathbf{l}",
         },
         assumptions=(
-            "straight paths, cut at every finest-lattice face so that each piece lies in one leaf cell; Simpson's rule integrates the edge functions (linear along a piece in 2D, quadratic in 3D) exactly",
+            "straight paths, clipped to the leaf cells of every patch and integrated on the patch's block by mpifield's compiled path deposit, which cuts them at its cell faces and integrates the edge functions (linear along a piece in 2D, quadratic in 3D) exactly; `_deposit_pieces` (Simpson's rule on the finest-lattice pieces) is the NumPy reference",
             r"$Q$ the bilinear node deposit (`CompositeNodes.deposit`); conserved across patch edges and periodic seams to round-off",
             "pieces outside the domain deposit nothing",
         ),
         references=(
             "[Villasenor and Buneman, Comput. Phys. Commun. 69, 306 (1992)](https://doi.org/10.1016/0010-4655(92)90169-Y)",
         ),
-        components=("patchwork.spaces.nodes.CompositeNodes.deposit",),
+        components=(
+            "patchwork.spaces.nodes.CompositeNodes.deposit",
+            "mpifield.edges.EdgeWeighting",
+        ),
         symbolic=_continuity_rules,
     )
     def deposit_paths(
@@ -640,10 +850,14 @@ class CompositeEdges:
         charge on the nodes, ``T^T`` of `CompositeNodes.deposit` at the ends minus at the
         starts, and ``j @ e`` is the work of the field ``e`` on the charges. The
         current density times the time step, summed over a step's paths, is
-        ``j``. Pieces outside the domain deposit nothing. On a line a compiled
-        kernel (``deposit_paths_1d``) walks each path; in 2D and 3D a NumPy
-        reference, one pass over all pieces.
+        ``j``. Pieces outside the domain deposit nothing. The paths are clipped to
+        the leaf cells of every patch (its box without its children's, shifted by
+        whole periods on a periodic axis), and mpifield's compiled path deposit
+        (`mpifield.WHITNEY`) integrates each part on the patch's block, whose edges
+        are those of its leaf cells; `_deposit_pieces` is the NumPy reference.
         """
+        from mpifield import WHITNEY
+
         start = np.asarray(start, dtype=float)
         end = np.asarray(end, dtype=float)
         charges = np.asarray(charges, dtype=float).reshape(-1)
@@ -651,25 +865,63 @@ class CompositeEdges:
             raise ValueError(
                 f"paths from {start.shape} to {end.shape} for {charges.size} charges"
             )
-        nodes = self.nodes
-        if nodes.ndim == 1:
-            from patchwork.kernels.deposit_paths_1d import kernel as deposit_paths_1d
-            from patchwork.spaces.nodes import _c_order
-
-            current = np.zeros(self.num_edges)
-            if charges.size:
-                deposit_paths_1d(
-                    _c_order(start),
-                    _c_order(end),
-                    _c_order(charges),
-                    nodes._origin,
-                    nodes._spacing,
-                    nodes._cells,
-                    np.asarray(nodes._periodic, dtype=np.int64),
-                    nodes._leaf_cells(),
-                    nodes.cell_span,
-                    self._line_edges(),
-                    current,
-                )
+        current = np.zeros(self.num_edges)
+        if charges.size == 0:
             return current
-        return self._deposit_pieces(start, end, charges)
+        a, b = self._lattice(start), self._lattice(end)
+        for axis, wraps in enumerate(self.nodes._periodic):
+            if wraps:  # starts into the first period: fewer images to clip
+                period = float(self.nodes._cells[axis])
+                offset = np.floor(a[axis] / period) * period
+                a[axis] -= offset
+                b[axis] -= offset
+        blocks, _ = self._patch_blocks()
+        for block in blocks:
+            path, part_start, part_end = self._leaf_paths(block, a, b)
+            if path.size == 0:
+                continue
+            block_current = np.zeros(block.edge_map.shape)
+            WHITNEY.deposit_paths_block(
+                part_start, part_end, charges[path], block_current, block.grid
+            )
+            known = block.edge_map >= 0
+            current += np.bincount(
+                block.edge_map[known],
+                weights=block_current[known],
+                minlength=self.num_edges,
+            )
+        return current
+
+    def gather(self, points: np.ndarray, values: np.ndarray) -> np.ndarray:
+        """The field of the edge values ``values`` at ``points`` ``(ndim, k)``: ``(ndim, k)``.
+
+        `evaluation` applied to ``values``, with mpifield's compiled edge gather
+        (`mpifield.WHITNEY`) on the block of each point's patch. Apply it to values
+        with their hanging edges filled (``T1 @ e``); a point outside the domain gets
+        zero.
+        """
+        from mpifield import WHITNEY
+
+        points = np.asarray(points, dtype=float)
+        values = np.asarray(values, dtype=float)
+        nodes = self.nodes
+        blocks, cell_block = self._patch_blocks()
+        leaf, _, inside = nodes.point_cells(points)
+        lattice = self._lattice(points)
+        for axis in range(nodes.ndim):
+            if nodes._periodic[axis]:
+                lattice[axis] %= nodes._cells[axis]
+        field = np.zeros_like(points)
+        owner = np.where(inside, cell_block[leaf], -1)
+        for number in np.unique(owner[owner >= 0]):
+            block = blocks[number]
+            mine = np.flatnonzero(owner == number)
+            known = block.edge_map >= 0
+            block_values = np.zeros(block.edge_map.shape)
+            block_values[known] = values[block.edge_map[known]]
+            result = np.zeros((nodes.ndim, mine.size))
+            WHITNEY.gather_block(
+                np.ascontiguousarray(lattice[:, mine]), block_values, result, block.grid
+            )
+            field[:, mine] = result / nodes._spacing[:, None]
+        return field
