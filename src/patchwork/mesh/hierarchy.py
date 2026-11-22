@@ -676,6 +676,16 @@ class AMRHierarchy:
         nodes = self.node_positions(level, axis)
         return nodes[i + 1] - nodes[i]
 
+    def _mid_radius(self, level: int, i: Any) -> Any:
+        """The mid-radii of the cells of ``level`` with radial index ``i`` (r–z)."""
+        import numpy as np
+
+        i = np.asarray(i, dtype=np.int64)
+        if self.axis_nodes[0] is None:
+            return self.bounds[0][0] + (i + 0.5) * self.spacing(level)[0]
+        nodes = self.node_positions(level, 0)
+        return 0.5 * (nodes[i] + nodes[i + 1])
+
     def _check_index(self, index: tuple[Any, ...]) -> None:
         """Raise unless ``index`` holds one array of indices per axis."""
         if len(index) != self.ndim:
@@ -699,9 +709,7 @@ class AMRHierarchy:
         for axis, i in enumerate(index):
             volume = volume * self.cell_sizes(level, axis, i)
         if self.cylindrical:
-            nodes = self.node_positions(level, 0)
-            i = np.asarray(index[0], dtype=np.int64)
-            volume = volume * np.pi * (nodes[i] + nodes[i + 1])
+            volume = volume * 2.0 * np.pi * self._mid_radius(level, index[0])
         return np.broadcast_to(
             volume, np.broadcast_shapes(*(np.shape(i) for i in index))
         )
@@ -732,7 +740,7 @@ class AMRHierarchy:
             if axis == 0:
                 area = area * 2.0 * np.pi * nodes[i]
             else:
-                area = area * np.pi * (nodes[i] + nodes[i + 1])
+                area = area * 2.0 * np.pi * self._mid_radius(level, i)
         return np.broadcast_to(area, np.broadcast_shapes(*(np.shape(i) for i in index)))
 
     def level_shape(self, level: int) -> tuple[int, ...]:

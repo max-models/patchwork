@@ -448,7 +448,21 @@ class CellOperator:
         w_centre = np.ones(coarse.size)
         w_below = np.zeros(coarse.size)
         w_above = np.zeros(coarse.size)
-        # Lagrange weights at the middle of the face through the cell centres
+        if cells.hierarchy.axis_nodes[other] is None:
+            # a uniform axis: the weights in units of the coarse cell
+            delta = (start + 0.5 * count - (lattice[:, other] + 0.5 * span)) / span
+            w_below[both] = 0.5 * delta[both] * (delta[both] - 1.0)
+            w_centre[both] = 1.0 - delta[both] ** 2
+            w_above[both] = 0.5 * delta[both] * (delta[both] + 1.0)
+            w_centre[only_below] = 1.0 + delta[only_below]
+            w_below[only_below] = -delta[only_below]
+            w_centre[only_above] = 1.0 - delta[only_above]
+            w_above[only_above] = delta[only_above]
+            return (
+                np.stack([coarse, below, above], axis=1),
+                np.stack([w_centre, f_below * w_below, f_above * w_above], axis=1),
+            )
+        # a graded axis: Lagrange weights at the middle of the face through the centres
         x, b, c, a = middle[both], x_below[both], centre[both], x_above[both]
         w_below[both] = (x - c) * (x - a) / ((b - c) * (b - a))
         w_centre[both] = (x - b) * (x - a) / ((c - b) * (c - a))
@@ -763,9 +777,12 @@ class CellOperator:
             on_axis = names == "x_lower"
             if self._azimuthal:
                 # the half cell between the axis and the first centre
-                start = boundary["start"]
-                z = cells._positions[1]
-                length = z[start + boundary["count"]] - z[start]
+                start, count = boundary["start"], boundary["count"]
+                if hierarchy.axis_nodes[1] is None:
+                    length = count * cells._spacing[1]
+                else:
+                    z = cells._positions[1]
+                    length = z[start + count] - z[start]
                 np.add.at(
                     diagonal,
                     cell[on_axis],

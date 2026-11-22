@@ -122,6 +122,15 @@ class CompositeCells:
         self.sizes = high - low
         # the map is linear in every base cell: a leaf cell is a physical box
         self.centers = 0.5 * (low + high)
+        # the uniform axes exactly as before: no round-off of a difference
+        lower = np.asarray(hierarchy.lower_bound, dtype=float)
+        for axis in range(hierarchy.ndim):
+            if hierarchy.axis_nodes[axis] is None:
+                h = self._spacing[axis]
+                self.sizes[:, axis] = self.span * h
+                self.centers[:, axis] = (
+                    lower[axis] + (self.lattice[:, axis] + 0.5 * self.span) * h
+                )
         if hierarchy.cylindrical:
             self.volumes = (
                 2.0 * np.pi * self.centers[:, 0] * np.prod(self.sizes, axis=1)
@@ -252,7 +261,10 @@ class CompositeCells:
             return np.ones(position.shape), position, np.zeros(position.shape)
         other = 1 - axis
         t0 = self._positions[other][start]
-        t1 = self._positions[other][start + count]
+        if hierarchy.axis_nodes[other] is None:
+            t1 = t0 + count * self._spacing[other]
+        else:
+            t1 = self._positions[other][start + count]
         if not hierarchy.cylindrical:
             area = t1 - t0
         elif axis == 0:

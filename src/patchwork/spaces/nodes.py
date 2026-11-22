@@ -423,6 +423,10 @@ class CompositeNodes:
             self._origin + (self.cell_lower + self.cell_span[:, None]) * self._spacing
         )
         size = upper - lower  # (m, ndim) physical edge lengths
+        # the uniform axes exactly as span times spacing (no round-off of a difference)
+        for axis in range(ndim):
+            if hierarchy.axis_nodes[axis] is None:
+                size[:, axis] = self.cell_span * self._spacing[axis]
         self.cell_size = size
         # the map is linear in every base cell, so a leaf cell is a physical box
         self.cell_centers = lower + size / 2

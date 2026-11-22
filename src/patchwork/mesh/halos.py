@@ -433,9 +433,8 @@ def conservative_from_below(
         # In r–z the fine cells weigh with their radius: measure the radial
         # offsets from the volume-weighted centre of the coarse cell, so that the
         # volume-weighted mean of the fine cells is the coarse value.
-        nodes = hierarchy.node_positions(patch.level - 1, 0)
-        spacing = nodes[parent[0] + 1] - nodes[parent[0]]
-        radius = 0.5 * (nodes[parent[0]] + nodes[parent[0] + 1])
+        spacing = hierarchy.cell_sizes(patch.level - 1, 0, parent[0])
+        radius = hierarchy._mid_radius(patch.level - 1, parent[0])
         squares = np.sum((((np.arange(ratio) + 0.5) / ratio) - 0.5) ** 2)
         offsets[:, 0] -= spacing * squares / (ratio * radius)
     buffer_box = tuple((int(p.min()) - 1, int(p.max()) + 2) for p in parent)
@@ -743,9 +742,9 @@ class Restriction:
                 if hierarchy.cylindrical:
                     n, m = counts
                     # the fine cells of a coarse cell differ only in their radius
-                    fine_r = hierarchy.node_positions(level, 0)
-                    i = first + np.arange(n * r)
-                    weight = fine_r[i] + fine_r[i + 1]
+                    weight = hierarchy.cell_volumes(
+                        level, first + np.arange(n * r), np.zeros(1, dtype=np.int64)
+                    )
                     weighted = (fine * weight[:, None]).reshape(n, r, m, r)
                     # each coarse cell: r x r fine cells, r of each radial weight
                     total = r * weight.reshape(n, r).sum(axis=1)
