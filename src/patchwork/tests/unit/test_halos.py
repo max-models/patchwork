@@ -249,3 +249,53 @@ def test_a_field_without_halo_needs_no_exchange() -> None:
     mesh.restrict("u")
     for patch in mesh.local_patches:
         assert np.all(np.asarray(patch.field("u").local) == 2.0)
+
+
+@pytest.mark.parametrize("ndim", [1, 2, 3])
+def test_the_box_index_finds_every_overlapping_box(ndim: int) -> None:
+    from patchwork.mesh.halos import _BoxIndex, _overlap
+
+    rng = np.random.default_rng(ndim)
+    lower = rng.integers(0, 60, (80, ndim))
+    boxes = [
+        tuple((int(lo), int(lo + n)) for lo, n in zip(row, size, strict=True))
+        for row, size in zip(lower, rng.integers(1, 12, (80, ndim)), strict=True)
+    ]
+    index = _BoxIndex(boxes)
+    for _ in range(200):
+        start = rng.integers(-10, 70, ndim)
+        query = tuple(
+            (int(s), int(s + n))
+            for s, n in zip(start, rng.integers(1, 15, ndim), strict=True)
+        )
+        expected = [k for k, box in enumerate(boxes) if _overlap(box, query)]
+        found = index.candidates(query)
+        assert set(expected) <= set(found)
+        assert found == sorted(found)
+    assert index.candidates(((5, 5),) * ndim) == []
+
+
+def test_the_halo_schedule_of_many_patches_matches_their_neighbours() -> None:
+    # 256 tiles of 4 x 4 fine cells: each halo filled from its neighbours
+    mesh = AMRHierarchy(base_shape=(32, 32), periodic=(True, False))
+    for i in range(0, 64, 4):
+        for j in range(16, 48, 2):
+            mesh.add_patch(level=1, box=((i, i + 4), (j, j + 2)))
+    mesh.allocate_field("u", halo=1)
+    for patch in mesh.local_patches:
+        x, y = patch.local_cell_centers(mesh, "u")
+        patch.field("u").local[...] = x + 2 * y
+    mesh.exchange_halos("u")
+    for patch in mesh.local_patches:
+        field = patch.field("u")
+        x, y = patch.local_cell_centers(mesh, "u")
+        h = mesh.spacing(1)
+        with_halo = np.asarray(field.local_with_halos)
+        # the halo row above (same level or interpolated, both exact for a
+        # linear function away from the periodic seam)
+        inner = slice(1, -1)
+        expected = x + 2 * (y + h[1])
+        if patch.box[0][0] > 0 and patch.box[0][1] < 64:
+            np.testing.assert_allclose(
+                with_halo[inner, -1], expected[:, -1], atol=1e-12
+            )

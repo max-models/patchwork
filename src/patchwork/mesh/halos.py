@@ -68,6 +68,49 @@ def _frame(own: Box, width: int) -> list[Box]:
     return boxes
 
 
+class _BoxIndex:
+    """The boxes of one level in bins: which of them may overlap a query box.
+
+    A bin is ``size`` points long per axis (the mean extent of the boxes), and
+    holds the boxes that touch it, so that a query visits only the boxes near
+    it: building the index and querying every box once is linear in the
+    number of boxes, where testing every pair is quadratic.
+    """
+
+    def _keys(self, box: Box) -> itertools.product:
+        return itertools.product(
+            *(
+                range(lo // size, (hi - 1) // size + 1)
+                for (lo, hi), size in zip(box, self._size, strict=True)
+            )
+        )
+
+    def __init__(self, boxes: list[Box]) -> None:
+        self._boxes = boxes
+        extents = np.array(
+            [[hi - lo for lo, hi in box] for box in boxes], dtype=float
+        ).reshape(len(boxes), -1)
+        self._size = (
+            tuple(max(1, int(np.ceil(m))) for m in extents.mean(axis=0))
+            if boxes
+            else ()
+        )
+        self._bins: dict[tuple[int, ...], list[int]] = {}
+        for number, box in enumerate(boxes):
+            for key in self._keys(box):
+                self._bins.setdefault(key, []).append(number)
+
+    def candidates(self, *boxes: Box) -> list[int]:
+        """The numbers of the boxes that may overlap one of ``boxes``, in order."""
+        found: set[int] = set()
+        for box in boxes:
+            if any(lo >= hi for lo, hi in box):
+                continue
+            for key in self._keys(box):
+                found.update(self._bins.get(key, ()))
+        return sorted(found)
+
+
 class _Points:
     """The points a field of one centering has on a hierarchy, level by level."""
 
@@ -77,11 +120,28 @@ class _Points:
         self.ratio = hierarchy.refinement_ratio
         self.periodic = hierarchy.periodic
         self._domains: dict[int, np.ndarray] = {}
+        self._indices: dict[int, tuple[tuple[Patch, ...], _BoxIndex]] = {}
 
     def own(self, patch: Patch) -> Box:
         """The patch's points as a half-open box of level indices."""
         extra = 1 if self.nodal else 0
         return tuple((lo, hi + extra) for lo, hi in patch.box)
+
+    def near(self, level: int, box: Box) -> list[Patch]:
+        """The patches of ``level`` that may overlap ``box`` or one of its periodic images.
+
+        In the order of `AMRHierarchy.patches_at_level`; overlaps still need
+        `_overlap` (the index only rules out the patches far away).
+        """
+        if level not in self._indices:
+            patches = self.hierarchy.patches_at_level(level)
+            self._indices[level] = (
+                patches,
+                _BoxIndex([self.own(patch) for patch in patches]),
+            )
+        patches, index = self._indices[level]
+        images = [_shift(box, tuple(-d for d in shift)) for shift in self.shifts(level)]
+        return [patches[number] for number in index.candidates(*images)]
 
     def shifts(self, level: int) -> list[tuple[int, ...]]:
         """The periodic images to look in: shifts by a period on periodic axes."""
@@ -174,7 +234,7 @@ def _coarse_buffer(
         if patch.is_local
         else None
     )
-    for coarse in hierarchy.patches_at_level(patch.level - 1):
+    for coarse in points.near(patch.level - 1, buffer_box):
         coarse_origin = tuple(lo for lo, _ in points.own(coarse))
         for shift in points.shifts(patch.level - 1):
             part = _overlap(buffer_box, _shift(points.own(coarse), shift))
@@ -482,7 +542,7 @@ class HaloExchange:
         covered = np.zeros([hi - lo for lo, hi in extended], dtype=bool)
         covered[(slice(width, -width),) * len(own)] = True
         origin = tuple(lo for lo, _ in own)
-        for other in self._hierarchy.patches_at_level(patch.level):
+        for other in points.near(patch.level, extended):
             other_origin = tuple(lo for lo, _ in points.own(other))
             for shift in points.shifts(patch.level):
                 if other is patch and not any(shift):
@@ -613,7 +673,7 @@ class Restriction:
         under = tuple(
             (lo // ratio, hi // ratio + (1 if nodal else 0)) for lo, hi in fine.box
         )
-        for coarse in hierarchy.patches_at_level(fine.level - 1):
+        for coarse in points.near(fine.level - 1, under):
             # across a periodic face too: a node on it is also the one at the start
             for shift in points.shifts(fine.level - 1):
                 part = _overlap(_shift(under, shift), points.own(coarse))
