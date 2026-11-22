@@ -7,6 +7,14 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `PatchHierarchy.deposit` and `interpolate` take `splines=`, the B-spline degree of the shape
+  (1, the default and the cloud-in-cell weights so far, 2 or 3) or an `mpifield.Splines`;
+  the field needs a halo of `mpifield.splines(p).halo` nodes (2 from degree 2 on). From degree
+  2 on a stencil that would reach past the edge of the marker's patch folds onto the patch's
+  edge nodes (as at a bounded wall), so `accumulate_halos` drops nothing and the total is
+  kept; `interpolate` stays the transpose of the deposit. `CompositeNodes` and
+  `CompositeEdges` stay at degree 1 (leaf cells with hanging nodes).
+
 - `CompositeEdges.gather(points, e)`: the field of an edge field at points, `evaluation`
   applied to `e` with mpifield's compiled edge gather (`mpifield.WHITNEY`) on the block of each
   point's patch.

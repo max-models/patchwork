@@ -353,6 +353,62 @@ def test_every_marker_reads_the_field_of_its_own_patch() -> None:
     assert np.abs(found - mesh.locate(nx, ny)).max() < 1e-12
 
 
+@pytest.mark.parametrize("degree", [2, 3])
+def test_spline_deposits_keep_the_charge_and_interpolation_is_their_transpose(
+    degree,
+) -> None:
+    """Degree 2 and 3: nothing lost at patch edges, walls and seams; the work is kept."""
+    mesh = hierarchy(halo=2)
+    mesh.allocate_field("rho", centering="node", halo=2)
+    x, y, q, _ = markers()
+    nodes = CompositeNodes(mesh)
+    nx, ny, nq = mesh.migrate(*share(x, y, q), name="rho")
+    mesh.deposit(nx, ny, nq, "rho", splines=degree)
+    mesh.accumulate_halos("rho")
+
+    charge = nodes.from_patches("rho")
+    assert charge.sum() == pytest.approx(float(q.sum()), abs=1e-9)
+    for patch in mesh.local_patches:  # the halos are empty after the accumulation
+        array = patch.field("rho")
+        assert array.local_with_halos.sum() == pytest.approx(
+            float(array.local.sum()), abs=1e-12
+        )
+    # a wider stencil than the cloud-in-cell one
+    linear = nodes.deposit(np.array([x, y]), q)
+    assert np.abs(charge - linear).max() > 1e-3
+
+    values = np.random.default_rng(6).normal(size=nodes.num_nodes)
+    nodes.to_patches(values, "q")
+    mesh.exchange_halos("q")
+    found = mesh.interpolate(nx, ny, "q", splines=degree)
+    work = WORLD.allreduce(float(nq @ found), op=MPI.SUM)
+    assert work == pytest.approx(float(charge @ values), rel=1e-12, abs=1e-10)
+
+
+def test_a_constant_field_is_interpolated_exactly_with_every_degree() -> None:
+    mesh = hierarchy(halo=2)
+    for patch in mesh.local_patches:
+        patch.field("q").local_with_halos[...] = 2.5
+    x, y, _, _ = markers()
+    nx, ny = mesh.migrate(*share(x, y), name="q")
+    for degree in (1, 2, 3):
+        found = mesh.interpolate(nx, ny, "q", splines=degree)
+        assert np.abs(found - 2.5).max() < 1e-12
+
+
+def test_spline_degrees_check_the_halo() -> None:
+    mesh = hierarchy()  # a halo of one node
+    x, y, q, _ = markers(20)
+    nx, ny, nq = mesh.migrate(*share(x, y, q), name="q")
+
+    with pytest.raises(ValueError, match="degree 2 needs a halo of at least 2 nodes"):
+        mesh.deposit(nx, ny, nq, "q", splines=2)
+    with pytest.raises(ValueError, match="degree 3 needs a halo of at least 2 nodes"):
+        mesh.interpolate(nx, ny, "q", splines=3)
+    with pytest.raises(ValueError, match="no built-in splines of degree 7"):
+        mesh.deposit(nx, ny, nq, "q", splines=7)
+
+
 def test_interpolation_outside_the_domain_is_zero_and_checks_its_field() -> None:
     mesh = hierarchy()
     mesh.allocate_field("cells")

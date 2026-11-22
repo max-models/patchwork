@@ -2318,7 +2318,7 @@ mpi = [
 [[package]]
 name = "mpifield"
 version = "0.1.0"
-source = { git = "https://github.com/max-models/mpifield?branch=devel#45f93a7c3d41aaeccbf605f114057938bfc9bfc1" }
+source = { git = "https://github.com/max-models/mpifield?branch=devel#c5f2154bdc5ad2fc1f78fff1990af5e1a6424103" }
 dependencies = [
     { name = "cunumpy" },
     { name = "maybempi" },
