@@ -25,8 +25,10 @@ jobs:
     uses: max-models/starlight-theme/.github/workflows/docs.yml@v0
     with:
       node-version: "24"
+      pyodide: true
       smoke-paths: |
         getting-started/installation/index.html
+        getting-started/live-demo/index.html
         examples/01-first-hierarchy/index.html
         numerics/index.html
         numerics/solvers-nodal-poisson/index.html
