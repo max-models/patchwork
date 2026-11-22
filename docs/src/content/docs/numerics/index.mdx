@@ -25,8 +25,9 @@ module by module; this one shows how they fit together.
 
 1. **[Hierarchy](/patchwork/numerics/mesh-hierarchy/).** Level $L$ has the spacing $h_L = h_0 / r^L$;
    patch boxes are aligned to the level below and covered by it. In $(r, z)$ a cell is a ring
-   with its exact volume and face areas. Markers are deposited with cloud-in-cell weights in the
-   finest patch that holds them, and the copies of a node are summed by the
+   with its exact volume and face areas. Markers are deposited with cloud-in-cell weights (or
+   B-splines of degree 2 or 3, `splines=`, folded at the patch edges) in the finest patch that
+   holds them, and the copies of a node are summed by the
    [deposit accumulation](/patchwork/numerics/mesh-accumulate/).
 2. **[Halos and restriction](/patchwork/numerics/mesh-halos/).** A halo takes the values of the
    patches of its level, else the bilinear interpolation of the level below; restriction gives a

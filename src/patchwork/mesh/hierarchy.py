@@ -1268,22 +1268,74 @@ class AMRHierarchy:
         ]
         return storage, self._grid(patch, first, storage.shape)
 
+    def _patch_block(self, patch: Patch, name: str, degree: int) -> tuple[Any, Any]:
+        """The stored block of `_stored_block` without its halo nodes outside ``patch``.
+
+        A stencil wider than the cell (B-spline degree 2 and up) reaches past the
+        cell's corners, and at a patch edge past the patch, where `accumulate_halos`
+        drops what a halo holds. On this block the weightings fold such a stencil
+        onto the patch's edge nodes, as at a bounded wall, so no charge is lost. For
+        degree 1 the whole stored block, as the corners are always in the patch.
+        """
+        storage, grid = self._stored_block(patch, name)
+        if degree == 1:
+            return storage, grid
+        layout = patch.field(name).layout
+        first = [
+            layout.index_bounds[axis][0] - layout.halo[axis]
+            for axis in range(self.ndim)
+        ]
+        lower = [max(0, -f) for f in first]
+        upper = [
+            min(storage.shape[axis], patch.node_shape[axis] - first[axis])
+            for axis in range(self.ndim)
+        ]
+        if lower == [0] * self.ndim and upper == list(storage.shape):
+            return storage, grid
+        block = storage[
+            tuple(slice(lo, hi) for lo, hi in zip(lower, upper, strict=True))
+        ]
+        start = [f + lo for f, lo in zip(first, lower, strict=True)]
+        return block, self._grid(patch, start, block.shape)
+
+    def _shape(self, name: str, splines: Any, what: str) -> Any:
+        """The `mpifield.Splines` of ``splines`` (a degree or one), checked against the halo."""
+        from mpifield import splines as resolve
+
+        shape = resolve(splines)
+        halo = self._field_specs[name]["halo"]
+        if halo < shape.halo:
+            raise ValueError(
+                f"{what} with splines of degree {shape.degree} needs a halo of at least "
+                f"{shape.halo} node{'s' if shape.halo > 1 else ''}, field {name!r} has {halo}"
+            )
+        return shape
+
     @sp.profile("patchwork.deposit", tags=PROFILE_TAGS)
     @method(
         equations={
             "cloud_in_cell": r"q_{00} = q(1-\xi)(1-\eta), \quad q_{10} = q\,\xi(1-\eta), \quad q_{01} = q(1-\xi)\,\eta, \quad q_{11} = q\,\xi\eta, \qquad \xi = \frac{x - x_i}{h_x}, \ \eta = \frac{y - y_j}{h_y}",
             "line": r"q_0 = q(1-\xi), \qquad q_1 = q\,\xi",
+            "splines": r"q_{\mathbf k} = q \prod_d B_p(r_d - k_d), \qquad r_d = \frac{x_d - x_{d,0}}{h_d} \quad (\text{degree } p; \ p = 1 \text{ above})",
             "gather": r"E(\mathbf{x}) = \sum_{\text{corners } c} w_c(\mathbf{x})\,E_c \quad (\text{the transpose: } \texttt{interpolate})",
         },
         assumptions=(
             "each marker in the finest patch that holds it; the values are charges, not a density",
             "a marker gathers the field of its own patch, which may jump at a coarse-fine edge",
             "the halos and the copies of shared nodes are summed afterwards (`accumulate_halos`)",
+            "from degree 2 on a stencil folds onto the edge nodes of the marker's patch where it would reach past them (at coarse-fine edges, walls and periodic seams alike): the charge is kept, the shape there is not the spline's",
         ),
-        components=("patchwork.mesh.accumulate.Accumulation",),
+        components=(
+            "patchwork.mesh.accumulate.Accumulation",
+            "mpifield.splines.Splines",
+        ),
     )
     def deposit(
-        self, *arguments: Any, name: str | None = None, reset: bool = True
+        self,
+        *arguments: Any,
+        name: str | None = None,
+        reset: bool = True,
+        splines: Any = 1,
     ) -> None:
         """Deposit the charge of markers on the node-centered field ``name``, patch by patch.
 
@@ -1301,6 +1353,13 @@ class AMRHierarchy:
         not yet where the composite mesh wants them: follow with
         `accumulate_halos`. With ``reset`` the field is zeroed first,
         halos included. Collective (the check of the owners).
+
+        ``splines`` is the B-spline degree of the shape (1, the cloud-in-cell weights
+        above, 2 or 3), or an `mpifield.Splines`: the marker spreads its charge
+        over ``(p + 1)`` nodes per axis, and the field needs a halo of at least
+        ``mpifield.splines(p).halo`` nodes (2 from degree 2 on). Where the
+        stencil would reach past the edge of the marker's patch it folds onto the
+        patch's edge nodes, so the total is kept; such charge stays on the patch.
         """
         import numpy as np
 
@@ -1312,6 +1371,7 @@ class AMRHierarchy:
             raise ValueError("deposit is for node-centered fields")
         if spec["halo"] < 1:
             raise ValueError("deposit needs a halo of at least one node")
+        shape = self._shape(name, splines, "deposit")
         flat, _ = self._points(coordinates)
         size = flat[0].size
         charge = np.asarray(charge, dtype=float).reshape(-1)
@@ -1326,18 +1386,20 @@ class AMRHierarchy:
         if reset:
             for patch in self.local_patches:
                 patch.field(name).local_with_halos[...] = 0.0
-        from mpifield import LINEAR
-
         patches = self.patches
         for number in np.unique(found[found >= 0]):
             chosen = np.flatnonzero(found == number)
-            storage, grid = self._stored_block(patches[number], name)
+            storage, grid = self._patch_block(patches[number], name, shape.degree)
             positions = np.array([w[chosen] for w in wrapped])
             # the kernels take the nodes component-last: a view with one component
-            LINEAR.scatter_block(positions, charge[chosen], storage[..., None], grid)
+            shape.nodes.scatter_block(
+                positions, charge[chosen], storage[..., None], grid
+            )
 
     @sp.profile("patchwork.interpolate", tags=PROFILE_TAGS)
-    def interpolate(self, *arguments: Any, name: str | None = None) -> Any:
+    def interpolate(
+        self, *arguments: Any, name: str | None = None, splines: Any = 1
+    ) -> Any:
         """Interpolate the node-centered field ``name`` at markers, each in its own patch.
 
         ``interpolate(x, name)`` in 1D, ``interpolate(x, y, name)`` in 2D. Each marker
@@ -1349,13 +1411,17 @@ class AMRHierarchy:
         halos filled (`exchange_halos`), since a cell's upper corners may be in
         the halo. A marker outside the domain gets zero. Returns an array of the shape
         of ``x``. Collective (the check of the owners).
+
+        ``splines`` is the B-spline degree of the weights (1, 2 or 3) or an
+        `mpifield.Splines`, as for `deposit`, whose transpose this is for the same
+        degree, the fold at the patch edges included.
         """
         import numpy as np
-        from mpifield import LINEAR
 
         coordinates, _, name = self._split(arguments, name, 0, "interpolate")
         if self.centering(name) != "node":
             raise ValueError("interpolate is for node-centered fields")
+        weights = self._shape(name, splines, "interpolate")
         flat, shape = self._points(coordinates)
         found, cell, wrapped = self._cells(flat)
         wrong = (found >= 0) & (self._owners(found, cell, name) != self.comm.Get_rank())
@@ -1367,10 +1433,10 @@ class AMRHierarchy:
         patches = self.patches
         for number in np.unique(found[found >= 0]):
             chosen = np.flatnonzero(found == number)
-            storage, grid = self._stored_block(patches[number], name)
+            storage, grid = self._patch_block(patches[number], name, weights.degree)
             positions = np.array([w[chosen] for w in wrapped])
             result = np.zeros((1, chosen.size))
-            LINEAR.gather_block(positions, storage[..., None], result, grid)
+            weights.nodes.gather_block(positions, storage[..., None], result, grid)
             values[chosen] = result[0]
         return values.reshape(shape)
 
@@ -1392,7 +1458,9 @@ class AMRHierarchy:
 
         This is the whole of the scatter-add of a bilinear deposit: a marker's cell is in
         one patch, so its corners are nodes of that patch and no halo reaches over a
-        coarse-fine edge. (The charge on a hanging node is passed to its coarse neighbours
+        coarse-fine edge. A deposit of a higher B-spline degree folds its stencil at the
+        patch edges for the same reason, so it too leaves nothing in the dropped halos
+        (but `CompositeNodes.deposit` has no such degree to compare with). (The charge on a hanging node is passed to its coarse neighbours
         by `NodalPoisson.solve`.) Cell-centered
         fields are not supported. Collective; the schedule is built at the first call and
         kept until a patch is added.

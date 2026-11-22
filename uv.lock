@@ -2318,7 +2318,7 @@ mpi = [
 [[package]]
 name = "mpifield"
 version = "0.1.0"
-source = { git = "https://github.com/max-models/mpifield?branch=devel#289781a9d4fb0b668cb66769f831f80639c764ac" }
+source = { git = "https://github.com/max-models/mpifield?branch=devel#8e964f6a65b1a21dd06df5b5942ec0b7f4bff98f" }
 dependencies = [
     { name = "cunumpy" },
     { name = "maybempi" },
@@ -4150,8 +4150,8 @@ wheels = [
 
 [[package]]
 name = "scope-profiler"
-version = "0.7.5"
-source = { git = "https://github.com/max-models/scope-profiler?branch=devel#2abb4ca4fe74166be554d30c3b78af8041f930ae" }
+version = "0.8.0"
+source = { git = "https://github.com/max-models/scope-profiler?branch=devel#128eff380e0fb3b04e33c917614634e0a391d62b" }
 dependencies = [
     { name = "h5py" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
