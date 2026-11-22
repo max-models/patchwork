@@ -173,15 +173,15 @@ def test_the_cylindrical_metric_is_conservative_with_refluxing() -> None:
 def test_the_areas_of_the_fine_faces_add_up_to_the_coarse_face() -> None:
     mesh = AMRHierarchy((4, 4), ((0.5, 1.5), (0.0, 1.0)), geometry="cylindrical")
     for axis in (0, 1):
-        coarse = mesh.face_areas(0, axis, np.arange(4))
-        fine = mesh.face_areas(1, axis, np.arange(8))
+        coarse = mesh.face_areas(0, axis, np.arange(4), 0)
+        fine = mesh.face_areas(1, axis, np.arange(8), 0)
         if axis == 0:  # radial faces: two fine ones (along z) over a coarse one
             np.testing.assert_allclose(2 * fine[::2], coarse)
         else:  # axial faces: two fine rings make a coarse one
             np.testing.assert_allclose(fine[::2] + fine[1::2], coarse)
     # the faces close the cells: the divergence of a uniform radial flux r
-    volumes = mesh.cell_volumes(0, np.arange(4))
-    radial = mesh.face_areas(0, 0, np.arange(5))
+    volumes = mesh.cell_volumes(0, np.arange(4), 0)
+    radial = mesh.face_areas(0, 0, np.arange(5), 0)
     radius = 0.5 + 0.25 * np.arange(5)
     np.testing.assert_allclose((np.diff(radial * radius)) / volumes, 2.0)
 

@@ -16,6 +16,7 @@ from patchwork.mesh import (
     Patch,
     cluster,
     function_tags,
+    graded_nodes,
     gradient_tags,
     plot_patches,
 )
@@ -86,6 +87,7 @@ __all__ = [
     "cluster",
     "function_tags",
     "gradient_tags",
+    "graded_nodes",
     "plot_patches",
     "solve_nodal_poisson",
     "solve_poisson",

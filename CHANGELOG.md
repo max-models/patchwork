@@ -7,6 +7,25 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Graded axes: `AMRHierarchy(axis_nodes=...)` takes, per axis, `None` (uniform) or the
+  physical positions of the base nodes. The map from the logical coordinate (the one of the
+  patches, levels and kernels) to the physical one is linear in every base cell, so every leaf
+  cell is a physical box and finer levels split the base cells evenly. `node_positions`,
+  `cell_sizes`, `to_logical` and `to_physical` (periodic axes map by whole periods) give the
+  geometry; `cell_volumes` and `face_areas` take one index array per axis and return physical
+  measures (also in r–z). `locate`, `owner`, `migrate`, `deposit` and `interpolate` convert the
+  points; the coordinates of patches, `CompositeNodes`, `CompositeCells`, `CompositeEdges` and
+  `CompositeFaces` are physical, and so are their sizes, volumes, lengths and areas.
+  `NodalPoisson` (planar and r–z, with Shortley–Weller rows from the physical arms) and
+  `CellOperator` (the coarse values on coarse-fine faces interpolated through the physical
+  centres) converge at second order on graded meshes with patches; `CompositeEdges.deposit_paths`
+  cuts a path where it crosses a base plane of a graded axis and keeps the charge to round-off,
+  and `gather` divides by the physical cell size. The multigrid's coarse levels keep every other
+  base node; the FFT backend and `solve_poisson` take uniform axes only. Tutorial "Graded axes".
+- `graded_nodes(lower, upper, spacing, through=...)`: the nodes of a graded axis whose cells
+  follow a local size (a function of `x` or `(x, dx)` pairs, linear between them), with
+  neighbouring cells that change smoothly, and nodes at the `through` positions (electrode
+  faces, aperture edges), each stretch between them graded on its own.
 - `PatchHierarchy.deposit` and `interpolate` take `splines=`, the B-spline degree of the shape
   (1, the default and the cloud-in-cell weights so far, 2 or 3) or an `mpifield.Splines`;
   the field needs a halo of `mpifield.splines(p).halo` nodes (2 from degree 2 on). From degree
@@ -27,6 +46,9 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `AMRHierarchy.cell_volumes(level, *index)` and `face_areas(level, axis, *index)` take one
+  index array per axis (they broadcast), since the measures depend on every index on a graded
+  axis.
 - The halo and restriction schedules find a patch's neighbours through a bin index of each
   level's boxes instead of testing every pair of patches: building them is linear in the number
   of patches. The first `exchange_halos` with 1024 patches of a 2D level took 9.9 s, now 0.4 s;

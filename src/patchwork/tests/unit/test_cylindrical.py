@@ -39,7 +39,9 @@ def test_a_cylindrical_hierarchy_is_checked() -> None:
         AMRHierarchy((4, 4), geometry="spherical")
     mesh = AMRHierarchy((4, 4), ((0.0, 2.0), (0.0, 1.0)), geometry="cylindrical")
     assert mesh.on_axis and mesh.cylindrical
-    np.testing.assert_allclose(mesh.cell_volumes(0, np.arange(4)).sum() * 4, 4 * np.pi)
+    np.testing.assert_allclose(
+        mesh.cell_volumes(0, np.arange(4)[:, None], np.arange(4)).sum(), 4 * np.pi
+    )
 
 
 def test_leaf_cells_are_rings() -> None:

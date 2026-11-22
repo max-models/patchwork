@@ -266,11 +266,7 @@ class CurlCurl:
         nodes = self.nodes
         count = nodes.cell_span.size
         if callable(value):
-            centre = (
-                nodes._origin
-                + (nodes.cell_lower + 0.5 * nodes.cell_span[:, None]) * nodes._spacing
-            )
-            value = value(*centre.T)
+            value = value(*nodes.cell_centers.T)
         array = np.asarray(value)
         if array.ndim and array.shape != (count,):
             raise ValueError(f"expected a coefficient on the {count} leaf cells")

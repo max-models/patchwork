@@ -192,42 +192,29 @@ class Patch:
                 raise ValueError(f"field {name!r} is not cell-centered")
         import numpy as np
 
-        axes = [
-            x0 + (i0 + np.arange(b0, b1) + 0.5) * h
-            for (i0, _), (b0, b1), h, x0 in zip(
-                self.box,
-                layout.index_bounds,
-                hierarchy.spacing(self.level),
-                hierarchy.lower_bound,
-                strict=True,
-            )
-        ]
+        axes = []
+        for axis, ((i0, _), (b0, b1)) in enumerate(
+            zip(self.box, layout.index_bounds, strict=True)
+        ):
+            nodes = hierarchy.node_positions(self.level, axis)[i0 + b0 : i0 + b1 + 1]
+            axes.append(0.5 * (nodes[:-1] + nodes[1:]))
         return tuple(np.meshgrid(*axes, indexing="ij"))
 
     def node_coordinates(self, hierarchy: AMRHierarchy) -> tuple[Any, ...]:
         """Coordinates of the nodes of the whole patch along each axis (1D arrays)."""
-        import numpy as np
-
         return tuple(
-            x0 + np.arange(i0, i1 + 1) * h
-            for (i0, i1), h, x0 in zip(
-                self.box,
-                hierarchy.spacing(self.level),
-                hierarchy.lower_bound,
-                strict=True,
-            )
+            hierarchy.node_positions(self.level, axis)[i0 : i1 + 1].copy()
+            for axis, (i0, i1) in enumerate(self.box)
         )
 
     def physical_bounds(self, hierarchy: AMRHierarchy) -> PhysicalBounds:
         """Physical interval (1D) or rectangle (2D) occupied by this patch."""
         return tuple(
-            (x0 + i0 * h, x0 + i1 * h)
-            for (i0, i1), h, x0 in zip(
-                self.box,
-                hierarchy.spacing(self.level),
-                hierarchy.lower_bound,
-                strict=True,
+            (
+                float(hierarchy.node_positions(self.level, axis)[i0]),
+                float(hierarchy.node_positions(self.level, axis)[i1]),
             )
+            for axis, (i0, i1) in enumerate(self.box)
         )
 
 
@@ -250,21 +237,23 @@ def _metric_rules() -> dict:
         "ring_volume": Rule(
             2 * sympy.pi * (r0 + sympy.Rational(3, 2) * dr) * dr * dz,
             implementation=lambda r0, dr, dz: float(
-                _ring(r0, dr, dz).cell_volumes(0, 1)
+                _ring(r0, dr, dz).cell_volumes(0, 1, 0)
             ),
             ranges=ranges,
         ),
         "radial_face": Rule(
             2 * sympy.pi * (r0 + dr) * dz,
             implementation=lambda r0, dr, dz: float(
-                _ring(r0, dr, dz).face_areas(0, 0, 1)
+                _ring(r0, dr, dz).face_areas(0, 0, 1, 0)
             ),
             ranges=ranges,
         ),
         "axial_face": Rule(
             sympy.pi * ((r0 + 2 * dr) ** 2 - (r0 + dr) ** 2),
             # the area of an axial face does not depend on the height
-            implementation=lambda r0, dr: float(_ring(r0, dr, 1.0).face_areas(0, 1, 1)),
+            implementation=lambda r0, dr: float(
+                _ring(r0, dr, 1.0).face_areas(0, 1, 1, 0)
+            ),
             ranges=ranges,
         ),
     }
@@ -386,7 +375,7 @@ class AMRHierarchy:
     def __init__(
         self,
         base_shape: tuple[int, ...],
-        bounds: PhysicalBounds | None = None,
+        bounds: Sequence[Sequence[float] | None] | None = None,
         *,
         refinement_ratio: int = 2,
         periodic: Sequence[bool] | None = None,
@@ -396,6 +385,7 @@ class AMRHierarchy:
         base_ranks: Sequence[int | Sequence[int] | None] | None = None,
         comm: Any = None,
         geometry: str = "cartesian",
+        axis_nodes: Sequence[Any] | None = None,
     ) -> None:
         """Create the base level: ``base_shape`` cells over the physical ``bounds``.
 
@@ -406,7 +396,13 @@ class AMRHierarchy:
         their union is the domain. By default it is the whole rectangle.
         ``base_ranks`` gives the ranks of each base box, as ``ranks`` of
         `add_patch` does for a patch; by default ``placement`` decides.
+        ``axis_nodes`` grades axes: one entry per axis, ``None`` for a uniform axis
+        or the ``n + 1`` increasing physical positions of its base nodes; the
+        bounds of a graded axis are its first and last node (``bounds`` may then
+        leave them out as ``None``, or must agree).
         """
+        import numpy as np
+
         ndim = len(base_shape)
         if ndim not in DIMENSIONS or any(int(n) != n or n <= 0 for n in base_shape):
             raise ValueError(
@@ -414,15 +410,54 @@ class AMRHierarchy:
             )
         if int(refinement_ratio) != refinement_ratio or refinement_ratio < 2:
             raise ValueError("refinement_ratio must be an integer of at least 2")
-        if bounds is None:
-            bounds = ((0.0, 1.0),) * ndim
-        if len(bounds) != ndim or any(len(axis) != 2 for axis in bounds):
+        if axis_nodes is None:
+            axis_nodes = (None,) * ndim
+        if len(axis_nodes) != ndim:
+            raise ValueError("axis_nodes must have one entry per axis")
+        graded = []
+        for axis, nodes in enumerate(axis_nodes):
+            if nodes is None:
+                graded.append(None)
+                continue
+            nodes = np.array(nodes, dtype=float)
+            if nodes.shape != (int(base_shape[axis]) + 1,):
+                raise ValueError(
+                    f"axis_nodes[{axis}] needs the {int(base_shape[axis]) + 1} positions "
+                    f"of the base nodes, got shape {nodes.shape}"
+                )
+            if not np.all(np.diff(nodes) > 0.0):
+                raise ValueError(f"axis_nodes[{axis}] must increase strictly")
+            nodes.setflags(write=False)
+            graded.append(nodes)
+        given: Any = (None,) * ndim if bounds is None else bounds
+        if len(given) == ndim:
+            filled: list[Any] = []
+            for axis, pair in enumerate(given):
+                nodes = graded[axis]
+                if nodes is None:
+                    filled.append((0.0, 1.0) if pair is None else pair)
+                    continue
+                ends = (float(nodes[0]), float(nodes[-1]))
+                if pair is not None and not np.allclose(
+                    pair, ends, rtol=1e-12, atol=0.0
+                ):
+                    raise ValueError(
+                        f"bounds[{axis}] = {tuple(pair)} differ from the ends {ends} of "
+                        f"axis_nodes[{axis}]"
+                    )
+                filled.append(ends)
+            given = tuple(filled)
+        bounds_pairs: Any = given
+        if len(bounds_pairs) != ndim or any(len(axis) != 2 for axis in bounds_pairs):
             expected = ", ".join(f"({a}_lower, {a}_upper)" for a in "xyz"[:ndim])
             raise ValueError(f"bounds must be ({expected},), one pair per axis")
-        if any(hi <= lo for lo, hi in bounds):
+        if any(hi <= lo for lo, hi in bounds_pairs):
             raise ValueError("each physical upper bound must exceed its lower bound")
         self.base_shape = tuple(int(n) for n in base_shape)
-        self.bounds = tuple(tuple(float(x) for x in axis) for axis in bounds)
+        self.bounds = tuple(tuple(float(x) for x in axis) for axis in bounds_pairs)
+        self.axis_nodes: tuple[Any, ...] = tuple(graded)
+        # physical node positions by (level, axis), see node_positions
+        self._positions: dict[tuple[int, int], Any] = {}
         self.refinement_ratio = int(refinement_ratio)
         if periodic is None:
             periodic = (False,) * ndim
@@ -529,51 +564,184 @@ class AMRHierarchy:
         """Whether a cylindrical domain reaches the axis (its radius starts at 0)."""
         return self.cylindrical and self.bounds[0][0] == 0.0
 
-    def cell_volumes(self, level: int, i: Any) -> Any:
-        """Volumes of the cells of ``level`` with first index ``i`` (an array).
+    def node_positions(self, level: int, axis: int) -> Any:
+        """Physical positions of the nodes of ``level`` along ``axis``: ``n + 1`` values.
 
-        ``dx`` on a line (per unit area), ``dx * dy`` in the Cartesian plane;
-        ``2 pi r dr dz`` in r–z, with ``r`` the cell's mid-radius (the exact
-        volume of the ring). The volume does not depend on the second index.
+        ``n`` is the number of cells of the level along the axis. On a uniform axis
+        ``x_0 + i h``; on a graded axis (``axis_nodes``) the base nodes, and between
+        them the nodes of finer levels evenly spaced (the map from the logical to the
+        physical coordinate is linear in every base cell). Kept per level and axis.
         """
         import numpy as np
 
-        spacing = self.spacing(level)
-        i = np.asarray(i, dtype=float)
-        if not self.cylindrical:
-            return np.full(i.shape, float(np.prod(spacing)))
-        dx, dy = spacing
-        radius = self.bounds[0][0] + (i + 0.5) * dx
-        return 2.0 * np.pi * radius * dx * dy
-
-    def face_areas(self, level: int, axis: int, i: Any) -> Any:
-        """Areas of the faces of ``level`` normal to ``axis``, by first index ``i``.
-
-        For ``axis=0``, ``i`` numbers the faces along the first axis (face ``i``
-        is the lower face of cell ``i``); for another axis, it is the first index
-        of the cells the faces belong to. ``1`` on a line (per unit area), ``dy``
-        or ``dx`` in the Cartesian plane (per unit length out of it); in r–z,
-        ``2 pi r dz`` for a radial face at ``r`` and ``2 pi r dr`` for an axial
-        face of a cell of mid-radius ``r``, so that the faces of a cell close it
-        (`cell_volumes`) and the faces of the fine cells over a coarse
-        face add up to it. The area does not depend on the other indices.
-        """
-        import numpy as np
-
-        if axis not in range(self.ndim):
-            raise ValueError(
-                f"axis must be in range({self.ndim}) for a {self.ndim}D hierarchy, "
-                f"got {axis!r}"
+        key = (level, axis)
+        cached = self._positions.get(key)
+        if cached is None:
+            count = self.level_shape(level)[axis]
+            logical = (
+                self.bounds[axis][0] + np.arange(count + 1) * self.spacing(level)[axis]
             )
-        spacing = self.spacing(level)
-        i = np.asarray(i, dtype=float)
-        if not self.cylindrical:
-            others = [h for a, h in enumerate(spacing) if a != axis]
-            return np.full(i.shape, float(np.prod(others)))
-        dx, dy = spacing
-        if axis == 0:
-            return 2.0 * np.pi * (self.bounds[0][0] + i * dx) * dy
-        return 2.0 * np.pi * (self.bounds[0][0] + (i + 0.5) * dx) * dx
+            cached = np.array(self.to_physical(axis, logical), dtype=float)
+            cached.setflags(write=False)
+            self._positions[key] = cached
+        return cached
+
+    @property
+    def graded(self) -> bool:
+        """Whether an axis is graded (``axis_nodes``): its cells differ in size."""
+        return any(nodes is not None for nodes in self.axis_nodes)
+
+    def _base_logical(self, axis: int) -> Any:
+        """The logical positions of the base nodes along ``axis``."""
+        import numpy as np
+
+        lower, upper = self.bounds[axis]
+        count = self.base_shape[axis]
+        return lower + (upper - lower) * np.arange(count + 1) / count
+
+    def _periods(self, axis: int, values: Any) -> Any:
+        """Whole periods of a periodic axis by which ``values`` lie beyond its lower bound."""
+        import numpy as np
+
+        lower, upper = self.bounds[axis]
+        return np.floor((values - lower) / (upper - lower)) * (upper - lower)
+
+    def to_physical(self, axis: int, logical: Any) -> Any:
+        """The physical coordinate along ``axis`` of a logical one (arrays of any shape).
+
+        The logical coordinate is the uniform one that patches, levels and the
+        kernels use: ``x_0 + i h`` at node ``i`` of a level; both share the bounds.
+        On a uniform axis the two are the same and ``logical`` is returned as given;
+        on a graded axis the map is linear between the base nodes and continuous.
+        Beyond the domain it continues the end cells, or on a periodic axis maps a
+        point whole periods beyond it to the point as many periods beyond.
+        """
+        nodes = self.axis_nodes[axis]
+        if nodes is None:
+            return logical
+        import numpy as np
+
+        logical = np.asarray(logical, dtype=float)
+        shift = self._periods(axis, logical) if self.periodic[axis] else 0.0
+        logical = logical - shift
+        base = self._base_logical(axis)
+        h = base[1] - base[0]
+        cell = np.clip(
+            np.floor((logical - base[0]) / h).astype(np.int64), 0, base.size - 2
+        )
+        fraction = (logical - base[cell]) / h
+        return nodes[cell] + fraction * (nodes[cell + 1] - nodes[cell]) + shift
+
+    def to_logical(self, axis: int, physical: Any) -> Any:
+        """The logical coordinate along ``axis`` of a physical one: `to_physical` inverted.
+
+        ``physical`` is returned as given on a uniform axis. On a graded axis the
+        base cell is found by bisection of the sorted base nodes; beyond the domain
+        as `to_physical`.
+        """
+        nodes = self.axis_nodes[axis]
+        if nodes is None:
+            return physical
+        import numpy as np
+
+        physical = np.asarray(physical, dtype=float)
+        shift = self._periods(axis, physical) if self.periodic[axis] else 0.0
+        physical = physical - shift
+        base = self._base_logical(axis)
+        cell = np.clip(
+            np.searchsorted(nodes, physical, side="right") - 1, 0, nodes.size - 2
+        )
+        fraction = (physical - nodes[cell]) / (nodes[cell + 1] - nodes[cell])
+        return base[cell] + fraction * (base[cell + 1] - base[cell]) + shift
+
+    def logical_points(self, coordinates: Sequence[Any]) -> tuple[Any, ...]:
+        """The logical coordinates of points given by one physical array per axis."""
+        return tuple(
+            self.to_logical(axis, values) for axis, values in enumerate(coordinates)
+        )
+
+    def physical_points(self, coordinates: Sequence[Any]) -> tuple[Any, ...]:
+        """The physical coordinates of points given by one logical array per axis."""
+        return tuple(
+            self.to_physical(axis, values) for axis, values in enumerate(coordinates)
+        )
+
+    def cell_sizes(self, level: int, axis: int, i: Any) -> Any:
+        """Physical sizes along ``axis`` of the cells of ``level`` with index ``i`` there."""
+        import numpy as np
+
+        i = np.asarray(i, dtype=np.int64)
+        if self.axis_nodes[axis] is None:
+            return np.full(i.shape, self.spacing(level)[axis])
+        nodes = self.node_positions(level, axis)
+        return nodes[i + 1] - nodes[i]
+
+    def _mid_radius(self, level: int, i: Any) -> Any:
+        """The mid-radii of the cells of ``level`` with radial index ``i`` (r–z)."""
+        import numpy as np
+
+        i = np.asarray(i, dtype=np.int64)
+        if self.axis_nodes[0] is None:
+            return self.bounds[0][0] + (i + 0.5) * self.spacing(level)[0]
+        nodes = self.node_positions(level, 0)
+        return 0.5 * (nodes[i] + nodes[i + 1])
+
+    def _check_index(self, index: tuple[Any, ...]) -> None:
+        """Raise unless ``index`` holds one array of indices per axis."""
+        if len(index) != self.ndim:
+            raise ValueError(
+                f"a {self.ndim}D hierarchy takes {self.ndim} index arrays, got {len(index)}"
+            )
+
+    def cell_volumes(self, level: int, *index: Any) -> Any:
+        """Volumes of the cells of ``level`` with indices ``index`` (one array per axis).
+
+        The arrays broadcast against each other, as do the sizes. ``dx`` on a line
+        (per unit area), ``dx * dy`` in the plane, ``dx dy dz`` in 3D; ``2 pi r dr
+        dz`` in r–z, with ``r`` the cell's mid-radius (the exact volume of the
+        ring). ``dx`` and the others are the physical sizes of the cells
+        (`cell_sizes`), which differ along a graded axis.
+        """
+        import numpy as np
+
+        self._check_index(index)
+        volume = np.ones(())
+        for axis, i in enumerate(index):
+            volume = volume * self.cell_sizes(level, axis, i)
+        if self.cylindrical:
+            volume = volume * 2.0 * np.pi * self._mid_radius(level, index[0])
+        return np.broadcast_to(
+            volume, np.broadcast_shapes(*(np.shape(i) for i in index))
+        )
+
+    def face_areas(self, level: int, axis: int, *index: Any) -> Any:
+        """Areas of the faces of ``level`` normal to ``axis``, one index array per axis.
+
+        Along ``axis`` the index numbers the faces (face ``i`` is the lower face of
+        cell ``i``), along the others the cells the faces belong to; the arrays
+        broadcast. ``1`` on a line (per unit area), the product of the other cell
+        sizes in the plane (per unit length out of it) and in 3D; in r–z, ``2 pi r
+        dz`` for a radial face at ``r`` and ``2 pi r dr`` for an axial face of a cell
+        of mid-radius ``r``, so that the faces of a cell close it (`cell_volumes`)
+        and the faces of the fine cells over a coarse face add up to it.
+        """
+        import numpy as np
+
+        if not 0 <= axis < self.ndim:
+            raise ValueError(f"axis {axis} is not an axis of a {self.ndim}D hierarchy")
+        self._check_index(index)
+        area = np.ones(())
+        for other, i in enumerate(index):
+            if other != axis:
+                area = area * self.cell_sizes(level, other, i)
+        if self.cylindrical:
+            nodes = self.node_positions(level, 0)
+            i = np.asarray(index[0], dtype=np.int64)
+            if axis == 0:
+                area = area * 2.0 * np.pi * nodes[i]
+            else:
+                area = area * 2.0 * np.pi * self._mid_radius(level, i)
+        return np.broadcast_to(area, np.broadcast_shapes(*(np.shape(i) for i in index)))
 
     def level_shape(self, level: int) -> tuple[int, ...]:
         """Number of cells in the full domain at a refinement level."""
@@ -896,6 +1064,7 @@ class AMRHierarchy:
             max_cells_per_rank=self.max_cells_per_rank,
             comm=self.comm,
             geometry=self.geometry,
+            axis_nodes=self.axis_nodes,
         )
         for level in sorted(boxes):
             for box in sorted(boxes[level], key=lambda b: -_shared_cells(b, b)):
@@ -955,8 +1124,9 @@ class AMRHierarchy:
                             for a, b, (first, _) in zip(lo, hi, block, strict=True)
                         )
                     ] = False
-            volumes = self.cell_volumes(patch.level, np.arange(*block[0]))
-            volumes = volumes.reshape((-1,) + (1,) * (self.ndim - 1))
+            volumes = self.cell_volumes(
+                patch.level, *np.ix_(*(np.arange(lo, hi) for lo, hi in block))
+            )
             weighted = np.asarray(array.local) * volumes
             total += float(weighted[leaf].sum())
         return float(self.comm.allreduce(total, op=MPI.SUM))
@@ -1034,7 +1204,9 @@ class AMRHierarchy:
         the index of the finest patch that holds it (-1 outside the domain),
         its cell on the level of that patch (level indices, one array per
         axis), and the coordinates wrapped into the domain on periodic axes.
-        One pass of the compiled ``locate_points`` kernel.
+        One pass of the compiled ``locate_points`` kernel. On a graded axis the
+        wrapped coordinates are logical (`to_logical`), as the kernels of the patch
+        blocks (`node_grid`) take them.
         """
         import numpy as np
 
@@ -1042,7 +1214,7 @@ class AMRHierarchy:
 
         size = coordinates[0].size
         points = np.zeros((3, size))
-        for axis, values in enumerate(coordinates):
+        for axis, values in enumerate(self.logical_points(coordinates)):
             points[axis] = values
         found = np.empty(size, dtype=np.int64)
         cell = np.empty((3, size), dtype=np.int64)
@@ -1246,6 +1418,10 @@ class AMRHierarchy:
 
     def node_grid(self, patch: Patch) -> Any:
         """The nodes of ``patch`` as an `mpifield.BlockGrid`: all of them, no halo.
+
+        The grid is in logical coordinates (`to_logical`): on a graded axis a kernel
+        takes the markers' logical positions, and a gradient it computes is per unit
+        of the logical coordinate (multiply by its derivative, `cell_sizes`).
 
         For compiled kernels that run on a patch's node array, such as a push
         that gathers each marker's field in its own patch. No axis is periodic:

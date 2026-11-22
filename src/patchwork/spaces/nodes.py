@@ -299,6 +299,14 @@ class CompositeNodes:
             self._leaf_map = leaf
         return self._leaf_map
 
+    def _physical(self, logical: np.ndarray) -> np.ndarray:
+        """Physical coordinates ``(k, ndim)`` of logical ones (the same on uniform axes)."""
+        if not self.hierarchy.graded:
+            return logical
+        return np.column_stack(
+            self.hierarchy.physical_points(tuple(logical.T))
+        ).reshape(logical.shape)
+
     # The boundary ----------------------------------------------------------------#
     def _find_boundary(self) -> None:
         """Find the sides of leaf cells on the boundary of the domain and name their face.
@@ -336,7 +344,9 @@ class CompositeNodes:
             ):
                 edges[name][0].append(self.cell_corners[cells][:, on_side])
                 edges[name][1].append(measure[cells])
-                edges[name][2].append(self._origin + midpoint[cells] * self._spacing)
+                edges[name][2].append(
+                    self._physical(self._origin + midpoint[cells] * self._spacing)
+                )
         width = max(2, 2 ** (self.ndim - 1))
         self._boundary = {
             face: (
@@ -406,13 +416,20 @@ class CompositeNodes:
         self.lattice = np.column_stack(
             np.unravel_index(self._keys, tuple(int(n) + 1 for n in self._cells))
         )
-        self.coordinates = self._origin + self.lattice * self._spacing
+        self.coordinates = self._physical(self._origin + self.lattice * self._spacing)
 
-        size = (
-            self.cell_span[:, None] * self._spacing
-        )  # (m, ndim) physical edge lengths
+        lower = self._physical(self._origin + self.cell_lower * self._spacing)
+        upper = self._physical(
+            self._origin + (self.cell_lower + self.cell_span[:, None]) * self._spacing
+        )
+        size = upper - lower  # (m, ndim) physical edge lengths
+        # the uniform axes exactly as span times spacing (no round-off of a difference)
+        for axis in range(ndim):
+            if hierarchy.axis_nodes[axis] is None:
+                size[:, axis] = self.cell_span * self._spacing[axis]
         self.cell_size = size
-        self.cell_centers = self._origin + self.cell_lower * self._spacing + size / 2
+        # the map is linear in every base cell, so a leaf cell is a physical box
+        self.cell_centers = lower + size / 2
         self.node_ranks = np.full(self.num_nodes, np.iinfo(np.int64).max)
         np.minimum.at(
             self.node_ranks,
@@ -430,6 +447,47 @@ class CompositeNodes:
         self._reads: list | None = None
         self._outside: dict[int, np.ndarray | None] = {}
         self._find_boundary()
+
+    def _logical(self, points: np.ndarray) -> np.ndarray:
+        """Logical coordinates ``(ndim, k)`` of physical points (the same on uniform axes)."""
+        if not self.hierarchy.graded:
+            return points
+        return np.array(
+            self.hierarchy.logical_points(tuple(points)), dtype=float
+        ).reshape(points.shape)
+
+    def arm_lengths(self, nodes: np.ndarray, axis: int, step: np.ndarray) -> np.ndarray:
+        """Physical distances from ``nodes`` to the lattice points ``step`` away along ``axis``.
+
+        ``step`` (an array, or a number) is in finest-lattice units and may be
+        negative. On a periodic axis the step wraps around; elsewhere the lattice
+        point must be in the domain. On a uniform axis ``|step| h``.
+        """
+        return self.lattice_lengths(self.lattice[nodes, axis], axis, step)
+
+    def lattice_lengths(
+        self, start: np.ndarray, axis: int, step: np.ndarray
+    ) -> np.ndarray:
+        """Physical distances from finest-lattice coordinates ``start`` along ``axis`` by ``step``.
+
+        As `arm_lengths`, from lattice coordinates instead of nodes.
+        """
+        hierarchy = self.hierarchy
+        start = np.asarray(start, dtype=np.int64)
+        step = np.broadcast_to(np.asarray(step, dtype=np.int64), start.shape)
+        if hierarchy.axis_nodes[axis] is None:
+            return np.abs(step) * self._spacing[axis]
+        positions = hierarchy.node_positions(self._finest, axis)
+        count = int(self._cells[axis])
+        target = start + step
+        shift = np.zeros_like(target)
+        if self._periodic[axis]:
+            shift = np.floor_divide(target, count)
+            target = target - shift * count
+        elif (target < 0).any() or (target > count).any():
+            raise ValueError("an arm leaves the domain along a non-periodic axis")
+        period = positions[-1] - positions[0]
+        return np.abs(positions[target] + shift * period - positions[start])
 
     # Patches -------------------------------------------------------------------#
     def patch_nodes(self, patch: Patch) -> np.ndarray:
@@ -713,7 +771,7 @@ class CompositeNodes:
             # one pass of the compiled kernel, the same cells and weights
             deposit_nodes = _deposit_kernel(self.ndim)
             deposit_nodes(
-                _c_order(points),
+                _c_order(self._logical(points)),
                 _c_order(charges),
                 self._origin,
                 self._spacing,
@@ -742,7 +800,9 @@ class CompositeNodes:
             raise ValueError(
                 f"points of a {ndim}D mesh are ({ndim}, k), got {points.shape}"
             )
-        position = (points - self._origin[:, None]) / self._spacing[:, None]
+        position = (self._logical(points) - self._origin[:, None]) / self._spacing[
+            :, None
+        ]
         cell, local = [], []
         for axis in range(ndim):
             index = np.floor(position[axis]).astype(np.int64)
@@ -823,7 +883,7 @@ class CompositeNodes:
             self._origin[:, None]
             + np.vstack([values.ravel() for values in index]) * spacing[:, None]
         )
-        return self.evaluation(points)
+        return self.evaluation(self._physical(points.T).T)
 
     def _nodes_outside(self, level: int) -> np.ndarray | None:
         """The nodes of a level's lattice outside the domain; None if there are none."""

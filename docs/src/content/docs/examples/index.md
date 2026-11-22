@@ -32,6 +32,9 @@ Step by step, from a first hierarchy to stencils on patches:
 11. [Anisotropic coefficients](/patchwork/examples/11-anisotropic-coefficients/): a tensor turned
     against the grid (a magnetized plasma), with and without its off-diagonal terms, and how far
     the multigrid carries the anisotropy.
+12. [Graded axes](/patchwork/examples/12-graded-axes/): cells that grow smoothly away from a wall
+    (`axis_nodes`), a boundary layer resolved with a few dozen cells, and grading combined with
+    patches.
 
 Every notebook in `tutorials/` is executed when the site is built and published here with its
 outputs. Download a notebook from its page to run the steps yourself.

@@ -507,6 +507,8 @@ class FFTBackend(Backend):
             )
         if hierarchy.max_level > 0:
             return "the 'fft' backend needs a uniform mesh: one level, no patches"
+        if getattr(hierarchy, "graded", False):
+            return "the 'fft' backend needs a uniform mesh: no graded axis"
         if nodes.cell_span.size != int(np.prod(hierarchy.level_shape(0))):
             return "the 'fft' backend needs a domain that fills its box"
         if getattr(hierarchy, "geometry", "cartesian") != "cartesian":
