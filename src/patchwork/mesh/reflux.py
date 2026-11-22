@@ -214,7 +214,6 @@ class FluxRegister:
         records = self._record(name)
         weight = dt if scale is None else scale
         ndim = hierarchy.ndim
-        column = (-1,) + (1,) * (ndim - 1)
         for number, patch in enumerate(hierarchy.patches):
             if not patch.is_local or (level is not None and patch.level != level):
                 continue
@@ -233,16 +232,23 @@ class FluxRegister:
                     f"the fluxes of a block of {block} cells have the shapes "
                     f"{shapes}, got {tuple(f.shape for f in flux)}"
                 )
-            i0 = patch.box[0][0]
-            (b0, b1) = bounds[0]
+            first = [lo for lo, _ in patch.box]
             through = []
             for axis in range(ndim):
-                faces_i = i0 + np.arange(b0, b1 + (axis == 0))
-                area = hierarchy.face_areas(patch.level, axis, faces_i)
-                through.append(flux[axis] * area.reshape(column))
+                index = np.ix_(
+                    *(
+                        first[a] + np.arange(b0, b1 + (a == axis))
+                        for a, (b0, b1) in enumerate(bounds)
+                    )
+                )
+                area = hierarchy.face_areas(patch.level, axis, *index)
+                through.append(flux[axis] * area)
             net = sum(np.diff(t, axis=axis) for axis, t in enumerate(through))
-            volume = hierarchy.cell_volumes(patch.level, i0 + np.arange(b0, b1))
-            array.local[...] -= dt * net / volume.reshape(column)
+            index = np.ix_(
+                *(first[a] + np.arange(b0, b1) for a, (b0, b1) in enumerate(bounds))
+            )
+            volume = hierarchy.cell_volumes(patch.level, *index)
+            array.local[...] -= dt * net / volume
             # a patch on several ranks that all hold all of it records once
             if not array.layout.split and patch.comm.Get_rank() != 0:
                 continue
@@ -294,7 +300,10 @@ class FluxRegister:
             entry, index, _, side = self._coarse[number]
             mine = np.all((index >= low) & (index < high), axis=1)
             entry, index, side = entry[mine], index[mine], side[mine]
-            volume = hierarchy.cell_volumes(patch.level, patch.box[0][0] + index[:, 0])
+            volume = hierarchy.cell_volumes(
+                patch.level,
+                *(lo + index[:, axis] for axis, (lo, _) in enumerate(patch.box)),
+            )
             # the face above the cell carries the flux out of it, the one below in
             change = np.where(side == 1, -1.0, 1.0) * total[entry] / volume
             np.add.at(array.local, tuple((index - low).T), change)

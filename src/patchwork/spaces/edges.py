@@ -456,8 +456,14 @@ class CompositeEdges:
             if nodes._periodic[axis]:  # the seam's edges at the lower end
                 self.lattice[:, axis] %= nodes._cells[axis]
         self.span = span.reshape(-1)[first]
-        self.length = self.span * nodes._spacing[self.direction]
         self.ends = np.stack(ends, axis=1).reshape(-1, 2)[first]
+        # physical lengths: the edge's run of finest-lattice cells along its direction
+        self.length = np.empty(self.num_edges)
+        for axis in range(ndim):
+            mine = self.direction == axis
+            self.length[mine] = nodes.arm_lengths(
+                self.ends[mine, 0], axis, self.span[mine]
+            )
         rows = np.repeat(np.arange(self.num_edges), 2)
         self.gradient = sparse.csr_matrix(
             sparse.coo_matrix(
@@ -605,14 +611,88 @@ class CompositeEdges:
             np.zeros(self.num_edges),
         )
 
-    def _pieces(
+    def _physical_unwrapped(self, logical: np.ndarray) -> np.ndarray:
+        """Physical points ``(ndim, k)`` of logical ones, beyond periodic faces too."""
+        hierarchy = self.nodes.hierarchy
+        return np.array(
+            [
+                hierarchy.to_physical(axis, values)
+                for axis, values in enumerate(logical)
+            ],
+            dtype=float,
+        ).reshape(logical.shape)
+
+    def _lattice_unwrapped(self, points: np.ndarray) -> np.ndarray:
+        """``points`` ``(ndim, k)`` in units of the finest lattice, beyond periodic faces too."""
+        nodes = self.nodes
+        hierarchy = nodes.hierarchy
+        logical = np.array(
+            [hierarchy.to_logical(axis, values) for axis, values in enumerate(points)],
+            dtype=float,
+        ).reshape(points.shape)
+        return (logical - nodes._origin[:, None]) / nodes._spacing[:, None]
+
+    def _logical_paths(
         self, start: np.ndarray, end: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """The straight paths from ``start`` to ``end`` ``(ndim, k)``, cut at the finest lattice.
+        """The paths from ``start`` to ``end`` ``(ndim, k)`` as straight parts on the finest lattice.
 
-        Returns the path of every piece and its two ends ``(ndim, pieces)``. A
-        piece lies in one cell of the finest lattice, and so in one leaf cell.
+        On a graded axis the map from logical to physical coordinates is linear only
+        within a base cell, so a straight physical path is cut where it crosses a
+        base plane of a graded axis; each part is then straight in logical
+        coordinates. Returns the path of every part and its ends in finest-lattice
+        units from the origin, not wrapped. Without a graded axis, one part per path.
         """
+        nodes = self.nodes
+        hierarchy = nodes.hierarchy
+        count = start.shape[1]
+        if not hierarchy.graded:
+            return (
+                np.arange(count),
+                self._lattice_unwrapped(start),
+                self._lattice_unwrapped(end),
+            )
+        paths, times = [np.arange(count)] * 2, [np.zeros(count), np.ones(count)]
+        step = end - start
+        for axis in range(nodes.ndim):
+            if hierarchy.axis_nodes[axis] is None:
+                continue
+            lower = hierarchy.bounds[axis][0]
+            base = hierarchy.spacing(0)[axis]
+            a = (hierarchy.to_logical(axis, start[axis]) - lower) / base
+            b = (hierarchy.to_logical(axis, end[axis]) - lower) / base
+            first = np.floor(np.minimum(a, b)).astype(np.int64) + 1
+            last = np.ceil(np.maximum(a, b)).astype(np.int64) - 1
+            crossings = np.maximum(last - first + 1, 0)
+            path = np.repeat(np.arange(count), crossings)
+            offset = np.repeat(np.cumsum(crossings) - crossings, crossings)
+            plane = first[path] + np.arange(path.size) - offset
+            at = hierarchy.to_physical(axis, lower + plane * base)
+            paths.append(path)
+            times.append((at - start[axis, path]) / step[axis, path])
+        path = np.concatenate(paths)
+        time = np.clip(np.concatenate(times), 0.0, 1.0)
+        order = np.lexsort((time, path))
+        path, time = path[order], time[order]
+        same = path[1:] == path[:-1]
+        path, begin, finish = path[1:][same], time[:-1][same], time[1:][same]
+        keep = finish > begin
+        path, begin, finish = path[keep], begin[keep], finish[keep]
+        a = start[:, path] + begin * step[:, path]
+        b = start[:, path] + finish * step[:, path]
+        # the ends of a path exactly as given, so that consecutive parts meet
+        is_first = np.ones(path.size, dtype=bool)
+        is_first[1:] = path[1:] != path[:-1]
+        is_last = np.ones(path.size, dtype=bool)
+        is_last[:-1] = path[1:] != path[:-1]
+        a[:, is_first] = start[:, path[is_first]]
+        b[:, is_last] = end[:, path[is_last]]
+        return path, self._lattice_unwrapped(a), self._lattice_unwrapped(b)
+
+    def _uniform_pieces(
+        self, start: np.ndarray, end: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """`_pieces` of paths straight in logical coordinates, given as logical points."""
         nodes = self.nodes
         origin = nodes._origin[:, None]
         spacing = nodes._spacing[:, None]
@@ -643,6 +723,31 @@ class CompositeEdges:
             start[:, path] + begin * step[:, path],
             start[:, path] + finish * step[:, path],
         )
+
+    def _pieces(
+        self, start: np.ndarray, end: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The straight paths from ``start`` to ``end`` ``(ndim, k)``, cut at the finest lattice.
+
+        Returns the path of every piece and its two ends ``(ndim, pieces)``. A
+        piece lies in one cell of the finest lattice, and so in one leaf cell.
+        """
+        nodes = self.nodes
+        if nodes.hierarchy.graded:
+            # straight in logical coordinates between the base planes: cut there,
+            # then at the finest lattice, and map the pieces back
+            outer, a, b = self._logical_paths(start, end)
+            spacing = nodes._spacing[:, None]
+            origin = nodes._origin[:, None]
+            inner, a, b = self._uniform_pieces(
+                origin + a * spacing, origin + b * spacing
+            )
+            return (
+                outer[inner],
+                self._physical_unwrapped(a),
+                self._physical_unwrapped(b),
+            )
+        return self._uniform_pieces(start, end)
 
     def _deposit_pieces(
         self, start: np.ndarray, end: np.ndarray, charges: np.ndarray
@@ -812,9 +917,27 @@ class CompositeEdges:
         return np.concatenate(paths), np.hstack(starts), np.hstack(ends)
 
     def _lattice(self, points: np.ndarray) -> np.ndarray:
-        """``points`` ``(ndim, k)`` in units of the finest lattice, from the origin."""
+        """``points`` ``(ndim, k)`` in units of the finest lattice, from the origin (logical)."""
         nodes = self.nodes
-        return (points - nodes._origin[:, None]) / nodes._spacing[:, None]
+        return (nodes._logical(points) - nodes._origin[:, None]) / nodes._spacing[
+            :, None
+        ]
+
+    def _lattice_sizes(self, lattice: np.ndarray) -> np.ndarray:
+        """Physical sizes ``(ndim, k)`` of the finest-lattice cells at lattice points ``(ndim, k)``."""
+        nodes = self.nodes
+        hierarchy = nodes.hierarchy
+        sizes = np.empty_like(lattice)
+        for axis in range(nodes.ndim):
+            if hierarchy.axis_nodes[axis] is None:
+                sizes[axis] = nodes._spacing[axis]
+                continue
+            positions = hierarchy.node_positions(nodes._finest, axis)
+            cell = np.clip(
+                np.floor(lattice[axis]).astype(np.int64), 0, int(nodes._cells[axis]) - 1
+            )
+            sizes[axis] = positions[cell + 1] - positions[cell]
+        return sizes
 
     @method(
         equations={
@@ -868,7 +991,8 @@ class CompositeEdges:
         current = np.zeros(self.num_edges)
         if charges.size == 0:
             return current
-        a, b = self._lattice(start), self._lattice(end)
+        path_of, a, b = self._logical_paths(start, end)
+        charges = charges[path_of]
         for axis, wraps in enumerate(self.nodes._periodic):
             if wraps:  # starts into the first period: fewer images to clip
                 period = float(self.nodes._cells[axis])
@@ -912,6 +1036,8 @@ class CompositeEdges:
             if nodes._periodic[axis]:
                 lattice[axis] %= nodes._cells[axis]
         field = np.zeros_like(points)
+        # the gathered field is per lattice unit: divide by the lattice cell's size
+        sizes = self._lattice_sizes(lattice)
         owner = np.where(inside, cell_block[leaf], -1)
         for number in np.unique(owner[owner >= 0]):
             block = blocks[number]
@@ -923,5 +1049,5 @@ class CompositeEdges:
             WHITNEY.gather_block(
                 np.ascontiguousarray(lattice[:, mine]), block_values, result, block.grid
             )
-            field[:, mine] = result / nodes._spacing[:, None]
+            field[:, mine] = result / sizes[:, mine]
         return field

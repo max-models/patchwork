@@ -288,9 +288,21 @@ class NodalPoisson:
             return None
 
         span = smallest[cut_nodes]
-        spacing = span[:, None] * nodes._spacing  # (k, ndim)
-        # arm lengths and what each arm ends at: [axis][side] over the cut nodes
-        arm = np.stack([np.stack([spacing[:, axis]] * 2) for axis in range(ndim)])
+        # arm lengths (physical: they differ on a graded axis) and what each arm
+        # ends at: [axis][side] over the cut nodes
+        arm = np.stack(
+            [
+                np.stack(
+                    [
+                        nodes.arm_lengths(cut_nodes, axis, -span),
+                        nodes.arm_lengths(cut_nodes, axis, span),
+                    ]
+                )
+                for axis in range(ndim)
+            ]
+        )
+        # the control volume: half of each arm, before the surfaces shorten them
+        volume = np.prod(0.5 * (arm[:, 0] + arm[:, 1]), axis=0)
         body = np.full((ndim, 2, cut_nodes.size), -1, dtype=np.int64)
         neighbour = np.empty((ndim, 2, cut_nodes.size), dtype=np.int64)
         for axis in range(ndim):
@@ -312,7 +324,6 @@ class NodalPoisson:
 
         rows, columns, entries = [], [], []
         wall_rows, wall_columns, wall_entries = [], [], []
-        volume = np.prod(spacing, axis=1)
         radius = None
         if self.metric == "cylindrical":
             # the ring's volume, and the 1/r d/dr term on the radial arms

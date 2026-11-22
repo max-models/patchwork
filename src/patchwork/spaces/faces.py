@@ -211,7 +211,17 @@ class CompositeFaces:
             if nodes._periodic[axis]:  # the seam's faces at the lower end
                 self.lattice[:, axis] %= nodes._cells[axis]
         self.span = span.reshape(-1)[first]
-        sides = self.span[:, None] * nodes._spacing[None, :]
+        # physical side lengths of every face's run of finest-lattice cells
+        sides = np.column_stack(
+            [
+                nodes.lattice_lengths(
+                    self.lattice[:, axis],
+                    axis,
+                    np.where(self.normal == axis, 0, self.span),
+                )
+                for axis in range(ndim)
+            ]
+        )
         self.area = np.prod(
             np.where(np.arange(ndim)[None, :] == self.normal[:, None], 1.0, sides),
             axis=1,

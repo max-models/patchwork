@@ -206,7 +206,7 @@ def _gradient_problem() -> ConvergenceProblem:
         "energy": r"E(u) = \sum_{\text{faces } f} a_f\,c_f\,(v_f^\top u)^2 + \sum_{\text{cells } i} c_i V_i u_i^2, \qquad v_f^\top u = w_+ u_+ - w_- u_-, \qquad c_f = \frac{A_f}{d_f}",
         "azimuthal_conductance": r"w = r, \qquad c_f = \frac{A_f}{r_f\, r_m\, d_f} \quad \text{(radial face of } A_\phi\text{; } r_m \text{ the mean radius of the two values)}",
         "face_mean": r"a_f = \frac{2 a_- a_+}{a_- + a_+} \ \text{(harmonic, the default)}, \qquad a_f = \tfrac12(a_- + a_+) \ \text{(arithmetic)}",
-        "symmetric_coarse_fine": r"u^* = \tfrac12\delta(\delta - 1)\,u_\mathrm{below} + (1 - \delta^2)\,u_C + \tfrac12\delta(\delta + 1)\,u_\mathrm{above}, \qquad \delta = \frac{k + \frac12}{r} - \frac12, \qquad d_f = \tfrac12 (h_f + h_c)",
+        "symmetric_coarse_fine": r"u^* = \tfrac12\delta(\delta - 1)\,u_\mathrm{below} + (1 - \delta^2)\,u_C + \tfrac12\delta(\delta + 1)\,u_\mathrm{above}, \qquad \delta = \frac{k + \frac12}{r} - \frac12, \qquad d_f = \tfrac12 (h_f + h_c) \quad \text{(uniform; on a graded axis the Lagrange weights through the physical centres)}",
         "conservative_ghost": r"u_\mathrm{ghost} = \frac{1-r}{3+r}\,u_\mathrm{inner} + \frac{2(r-1)}{r+1}\,u_\mathrm{fine} + \frac{8}{(r+1)(r+3)}\,u^*, \qquad F = a_f A_f\,\frac{(wu)_\mathrm{ghost} - (wu)_\mathrm{fine}}{h_f}",
         "dirichlet_wall": r"A_{ii} \mathrel{+}= \frac{a A_f}{h/2}, \qquad b_i \mathrel{+}= \frac{a A_f}{h/2}\, u_D",
         "neumann_wall": r"b_i \mathrel{+}= a\,A_f\,g",
@@ -402,9 +402,13 @@ class CellOperator:
         other = 1 - axis
         span = cells.span[coarse]
         lattice = cells.lattice[coarse]
-        middle = start + 0.5 * count
-        centre = lattice[:, other] + 0.5 * span
-        delta = (middle - centre) / span
+        # physical positions along the face: its middle, the coarse centre and
+        # (below) its neighbours', which differ in size from it on a graded axis
+        positions = cells._positions[other]
+        middle = 0.5 * (positions[start] + positions[start + count])
+        centre = cells.centers[coarse, other]
+        size_centre = cells.sizes[coarse, other]
+        places = []
         neighbours = []
         for side, sign in enumerate((-1, 1)):
             spot = lattice.copy()
@@ -430,21 +434,31 @@ class CellOperator:
                 beyond = ~inside
                 valid |= beyond
                 factor[beyond] = mirror
-            neighbours.append((np.where(valid & inside, found, coarse), valid, factor))
+            neighbour = np.where(valid & inside, found, coarse)
+            neighbours.append((neighbour, valid, factor))
+            # the neighbour's centre (a mirror image has the coarse cell's size)
+            places.append(
+                centre + sign * 0.5 * (size_centre + cells.sizes[neighbour, other])
+            )
         (below, has_below, f_below), (above, has_above, f_above) = neighbours
+        x_below, x_above = places
         both = has_below & has_above
         only_below = has_below & ~has_above
         only_above = has_above & ~has_below
         w_centre = np.ones(coarse.size)
         w_below = np.zeros(coarse.size)
         w_above = np.zeros(coarse.size)
-        w_below[both] = 0.5 * delta[both] * (delta[both] - 1.0)
-        w_centre[both] = 1.0 - delta[both] ** 2
-        w_above[both] = 0.5 * delta[both] * (delta[both] + 1.0)
-        w_centre[only_below] = 1.0 + delta[only_below]
-        w_below[only_below] = -delta[only_below]
-        w_centre[only_above] = 1.0 - delta[only_above]
-        w_above[only_above] = delta[only_above]
+        # Lagrange weights at the middle of the face through the cell centres
+        x, b, c, a = middle[both], x_below[both], centre[both], x_above[both]
+        w_below[both] = (x - c) * (x - a) / ((b - c) * (b - a))
+        w_centre[both] = (x - b) * (x - a) / ((c - b) * (c - a))
+        w_above[both] = (x - b) * (x - c) / ((a - b) * (a - c))
+        x, b, c = middle[only_below], x_below[only_below], centre[only_below]
+        w_centre[only_below] = (x - b) / (c - b)
+        w_below[only_below] = (c - x) / (c - b)
+        x, c, a = middle[only_above], centre[only_above], x_above[only_above]
+        w_centre[only_above] = (a - x) / (a - c)
+        w_above[only_above] = (x - c) / (a - c)
         return (
             np.stack([coarse, below, above], axis=1),
             np.stack([w_centre, f_below * w_below, f_above * w_above], axis=1),
@@ -749,7 +763,9 @@ class CellOperator:
             on_axis = names == "x_lower"
             if self._azimuthal:
                 # the half cell between the axis and the first centre
-                length = boundary["count"] * cells._spacing[1]
+                start = boundary["start"]
+                z = cells._positions[1]
+                length = z[start + boundary["count"]] - z[start]
                 np.add.at(
                     diagonal,
                     cell[on_axis],

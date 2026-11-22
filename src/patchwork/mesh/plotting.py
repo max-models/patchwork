@@ -196,9 +196,9 @@ def plot_patches(
     for patch in hierarchy:
         ((x0, x1), (y0, y1)) = patch.physical_bounds(hierarchy)
         color = palette(patch.level)
-        dx, dy = hierarchy.spacing(patch.level)
-        x_edges = (x0 + np.arange(patch.shape[0] + 1) * dx) * scale
-        y_edges = (y0 + np.arange(patch.shape[1] + 1) * dy) * scale
+        x_edges, y_edges = (
+            edges * scale for edges in patch.node_coordinates(hierarchy)
+        )
         if field is not None:
             values = np.asarray(gathered[id(patch)])
             # node values sit on the cell corners and are shaded between them

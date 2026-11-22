@@ -105,9 +105,23 @@ class CompositeCells:
         self.span = np.concatenate(spans).astype(np.int64)
         self.lattice = self.index * self.span[:, None]
         self._spacing = np.asarray(hierarchy.spacing(finest), dtype=float)
-        lower = np.asarray(hierarchy.lower_bound, dtype=float)
-        self.sizes = self.span[:, None] * self._spacing
-        self.centers = lower + (self.lattice + 0.5 * self.span[:, None]) * self._spacing
+        # physical node positions of the finest lattice, per axis (graded or not)
+        self._positions = tuple(
+            np.asarray(hierarchy.node_positions(finest, axis))
+            for axis in range(hierarchy.ndim)
+        )
+        low = np.column_stack(
+            [self._positions[a][self.lattice[:, a]] for a in range(hierarchy.ndim)]
+        )
+        high = np.column_stack(
+            [
+                self._positions[a][self.lattice[:, a] + self.span]
+                for a in range(hierarchy.ndim)
+            ]
+        )
+        self.sizes = high - low
+        # the map is linear in every base cell: a leaf cell is a physical box
+        self.centers = 0.5 * (low + high)
         if hierarchy.cylindrical:
             self.volumes = (
                 2.0 * np.pi * self.centers[:, 0] * np.prod(self.sizes, axis=1)
@@ -127,6 +141,7 @@ class CompositeCells:
         upper faces of the domain to the last cell.
         """
         points = self.hierarchy.wrapped(np.asarray(points, dtype=float))
+        points = np.array(self.hierarchy.logical_points(tuple(points)), dtype=float)
         lower = np.asarray(self.hierarchy.lower_bound, dtype=float)
         shape = np.asarray(self.owner.shape)
         lattice = np.floor((points.T - lower) / self._spacing).astype(np.int64)
@@ -232,14 +247,12 @@ class CompositeCells:
         In 1D a face is a point of area 1 (per unit area) and the middle is 0.
         """
         hierarchy = self.hierarchy
-        lower = np.asarray(hierarchy.lower_bound, dtype=float)
-        h = self._spacing
-        position = lower[axis] + plane * h[axis]
+        position = self._positions[axis][plane]
         if hierarchy.ndim == 1:
             return np.ones(position.shape), position, np.zeros(position.shape)
         other = 1 - axis
-        t0 = lower[other] + start * h[other]
-        t1 = t0 + count * h[other]
+        t0 = self._positions[other][start]
+        t1 = self._positions[other][start + count]
         if not hierarchy.cylindrical:
             area = t1 - t0
         elif axis == 0:

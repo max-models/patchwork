@@ -100,12 +100,14 @@ def _rebuilt(
     base_shape: tuple[int, ...],
     base: list[tuple],
     patches: list[tuple],
+    axis_nodes: tuple | None = None,
 ) -> AMRHierarchy:
     """A hierarchy on the same domain and ranks as ``hierarchy``, without fields.
 
     ``base`` holds the base boxes and their ranks, ``patches`` the level, box
-    and ranks of the finer patches. The communicators of ``hierarchy`` are
-    reused, so building it is not collective.
+    and ranks of the finer patches; ``axis_nodes`` the base nodes of graded
+    axes (those of ``hierarchy`` by default). The communicators of ``hierarchy``
+    are reused, so building it is not collective.
     """
     from patchwork.mesh.hierarchy import AMRHierarchy
 
@@ -120,6 +122,7 @@ def _rebuilt(
         base_ranks=[ranks for _, ranks in base],
         comm=hierarchy.comm,
         geometry=hierarchy.geometry,
+        axis_nodes=hierarchy.axis_nodes if axis_nodes is None else axis_nodes,
     )
     for level, box, ranks in patches:
         new.add_patch(level, box, ranks=ranks)
@@ -142,7 +145,11 @@ def _halved(hierarchy: AMRHierarchy) -> AMRHierarchy | None:
         (tuple((lo // 2, hi // 2) for lo, hi in patch.box), patch.ranks)
         for patch in hierarchy.patches_at_level(0)
     ]
-    return _rebuilt(hierarchy, tuple(n // 2 for n in shape), base, [])
+    # a graded axis keeps every other base node
+    axis_nodes = tuple(
+        None if nodes is None else nodes[::2] for nodes in hierarchy.axis_nodes
+    )
+    return _rebuilt(hierarchy, tuple(n // 2 for n in shape), base, [], axis_nodes)
 
 
 def coarser_hierarchies(

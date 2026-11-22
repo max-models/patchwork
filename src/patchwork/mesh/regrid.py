@@ -53,15 +53,10 @@ Box = tuple[tuple[int, int], ...]
 
 def _centres(hierarchy: AMRHierarchy, level: int) -> list[np.ndarray]:
     """The cell centres of a whole level, one array of the level's shape per axis."""
-    axes = [
-        x0 + (np.arange(n) + 0.5) * h
-        for (x0, _), n, h in zip(
-            hierarchy.bounds,
-            hierarchy.level_shape(level),
-            hierarchy.spacing(level),
-            strict=True,
-        )
-    ]
+    axes = []
+    for axis in range(hierarchy.ndim):
+        nodes = hierarchy.node_positions(level, axis)
+        axes.append(0.5 * (nodes[:-1] + nodes[1:]))
     return list(np.meshgrid(*axes, indexing="ij"))
 
 

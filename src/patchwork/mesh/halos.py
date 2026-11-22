@@ -418,7 +418,8 @@ def conservative_from_below(
     average to its value (weighted by their volumes in r–z, where the radial
     offsets are measured from the cell's volume-weighted centre), no new
     extrema appear (a positive density stays positive), and a linear field is
-    reproduced away from walls.
+    reproduced away from walls (on a graded axis, where the coarse neighbours
+    have the coarse cell's size: the slope is per coarse cell).
     Arguments and result as for `interpolate_from_below`.
     """
     if not index[0].size:
@@ -432,8 +433,9 @@ def conservative_from_below(
         # In r–z the fine cells weigh with their radius: measure the radial
         # offsets from the volume-weighted centre of the coarse cell, so that the
         # volume-weighted mean of the fine cells is the coarse value.
-        spacing = hierarchy.spacing(patch.level - 1)[0]
-        radius = hierarchy.bounds[0][0] + (parent[0] + 0.5) * spacing
+        nodes = hierarchy.node_positions(patch.level - 1, 0)
+        spacing = nodes[parent[0] + 1] - nodes[parent[0]]
+        radius = 0.5 * (nodes[parent[0]] + nodes[parent[0] + 1])
         squares = np.sum((((np.arange(ratio) + 0.5) / ratio) - 0.5) ** 2)
         offsets[:, 0] -= spacing * squares / (ratio * radius)
     buffer_box = tuple((int(p.min()) - 1, int(p.max()) + 2) for p in parent)
@@ -740,7 +742,10 @@ class Restriction:
                 within = tuple(range(1, 2 * fine.ndim, 2))
                 if hierarchy.cylindrical:
                     n, m = counts
-                    weight = hierarchy.cell_volumes(level, first + np.arange(n * r))
+                    # the fine cells of a coarse cell differ only in their radius
+                    fine_r = hierarchy.node_positions(level, 0)
+                    i = first + np.arange(n * r)
+                    weight = fine_r[i] + fine_r[i + 1]
                     weighted = (fine * weight[:, None]).reshape(n, r, m, r)
                     # each coarse cell: r x r fine cells, r of each radial weight
                     total = r * weight.reshape(n, r).sum(axis=1)
