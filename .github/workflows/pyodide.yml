@@ -1,0 +1,15 @@
+name: Pyodide
+
+# patchwork in the browser: the wheel (with the devel branches of its max-models dependencies)
+# installed in Pyodide, every module imported and the live demo of the docs run.
+
+on:
+  push:
+    branches: ["main", "devel"]
+  pull_request:
+    branches: ["main", "devel"]
+  workflow_dispatch:
+
+jobs:
+  pyodide:
+    uses: max-models/starlight-theme/.github/workflows/pyodide.yml@v0

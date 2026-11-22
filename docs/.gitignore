@@ -6,3 +6,5 @@ node_modules/
 .cache/
 public/examples/
 src/content/docs/examples/*.mdx
+# the wheels the live demo installs, built by starlight-pyodide wheels
+public/pyodide/
