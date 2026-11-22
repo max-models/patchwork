@@ -375,7 +375,7 @@ class AMRHierarchy:
     def __init__(
         self,
         base_shape: tuple[int, ...],
-        bounds: PhysicalBounds | None = None,
+        bounds: Sequence[Sequence[float] | None] | None = None,
         *,
         refinement_ratio: int = 2,
         periodic: Sequence[bool] | None = None,
@@ -429,11 +429,10 @@ class AMRHierarchy:
                 raise ValueError(f"axis_nodes[{axis}] must increase strictly")
             nodes.setflags(write=False)
             graded.append(nodes)
-        if bounds is None:
-            bounds = (None,) * ndim
-        if len(bounds) == ndim:
-            filled = []
-            for axis, pair in enumerate(bounds):
+        given: Any = (None,) * ndim if bounds is None else bounds
+        if len(given) == ndim:
+            filled: list[Any] = []
+            for axis, pair in enumerate(given):
                 nodes = graded[axis]
                 if nodes is None:
                     filled.append((0.0, 1.0) if pair is None else pair)
@@ -447,14 +446,15 @@ class AMRHierarchy:
                         f"axis_nodes[{axis}]"
                     )
                 filled.append(ends)
-            bounds = tuple(filled)
-        if len(bounds) != ndim or any(len(axis) != 2 for axis in bounds):
+            given = tuple(filled)
+        bounds_pairs: Any = given
+        if len(bounds_pairs) != ndim or any(len(axis) != 2 for axis in bounds_pairs):
             expected = ", ".join(f"({a}_lower, {a}_upper)" for a in "xyz"[:ndim])
             raise ValueError(f"bounds must be ({expected},), one pair per axis")
-        if any(hi <= lo for lo, hi in bounds):
+        if any(hi <= lo for lo, hi in bounds_pairs):
             raise ValueError("each physical upper bound must exceed its lower bound")
         self.base_shape = tuple(int(n) for n in base_shape)
-        self.bounds = tuple(tuple(float(x) for x in axis) for axis in bounds)
+        self.bounds = tuple(tuple(float(x) for x in axis) for axis in bounds_pairs)
         self.axis_nodes: tuple[Any, ...] = tuple(graded)
         # physical node positions by (level, axis), see node_positions
         self._positions: dict[tuple[int, int], Any] = {}
