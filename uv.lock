@@ -889,8 +889,8 @@ toml = [
 
 [[package]]
 name = "cunumpy"
-version = "0.7.2"
-source = { git = "https://github.com/max-models/cunumpy?branch=devel#bd64a6aad5a1360983f3702fa54f8bf0d6d0a6c3" }
+version = "0.8.0"
+source = { git = "https://github.com/max-models/cunumpy?branch=devel#a25c7b31072823d31e0815f65efa0daa1212a403" }
 dependencies = [
     { name = "array-api-compat" },
     { name = "maybempi" },
@@ -2318,15 +2318,16 @@ mpi = [
 [[package]]
 name = "mpifield"
 version = "0.1.0"
-source = { git = "https://github.com/max-models/mpifield?branch=devel#45f93a7c3d41aaeccbf605f114057938bfc9bfc1" }
+source = { git = "https://github.com/max-models/mpifield?branch=devel#289781a9d4fb0b668cb66769f831f80639c764ac" }
 dependencies = [
     { name = "cunumpy" },
     { name = "maybempi" },
+    { name = "methodcard" },
     { name = "mpiarray" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "pyccel" },
+    { name = "pyccel", marker = "sys_platform != 'emscripten'" },
     { name = "scipy", version = "1.15.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
