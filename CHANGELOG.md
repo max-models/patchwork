@@ -14,7 +14,13 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   edge nodes (as at a bounded wall), so `accumulate_halos` drops nothing and the total is
   kept; `interpolate` stays the transpose of the deposit. `CompositeNodes` and
   `CompositeEdges` stay at degree 1 (leaf cells with hanging nodes).
-
+- patchwork runs in the browser with Pyodide, and a live demo page in the docs refines a mesh
+  there: controls for the charges, their width, the refinement threshold, the number of levels
+  and the longest patch side regrid a hierarchy around Gaussian charges and solve their
+  potential with `NodalPoisson`, drawn on the patches of every level. It uses
+  starlight-theme's `PyodideDemo`; the docs workflow builds the wheels it installs
+  (`pyodide: true`), and a Pyodide check in CI (`.github/workflows/pyodide.yml`) installs the
+  wheel, imports every module and runs the demo.
 - `CompositeEdges.gather(points, e)`: the field of an edge field at points, `evaluation`
   applied to `e` with mpifield's compiled edge gather (`mpifield.WHITNEY`) on the block of each
   point's patch.

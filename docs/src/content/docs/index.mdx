@@ -14,31 +14,18 @@ hero:
       variant: minimal
 ---
 
-import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
-
 ## What is included
 
-<CardGrid>
-	<Card title="Nested patches" icon="open-book">
-		Build aligned 1D or 2D refinement levels from half-open cell boxes.
-	</Card>
-	<Card title="mpiarray fields" icon="rocket">
-		Allocate cell-centered patch fields with halo storage. The same API works in serial without MPI.
-	</Card>
-	<Card title="Patch plots" icon="document">
-		Plot the active grid at each level or color patches by a field.
-	</Card>
-	<Card title="Small starting scope" icon="setting">
-		Includes a composite finite-volume Poisson solve; particle coupling and dynamic regridding are next.
-	</Card>
-</CardGrid>
+- **Nested patches.** Build aligned 1D or 2D refinement levels from half-open cell boxes.
+- **mpiarray fields.** Allocate cell-centered patch fields with halo storage. The same API works in serial without MPI.
+- **Patch plots.** Plot the active grid at each level or color patches by a field.
+- **Small starting scope.** Includes a composite finite-volume Poisson solve; particle coupling and dynamic regridding are next.
 
 ## Start here
 
-<CardGrid>
-	<LinkCard title="Installation" href="/patchwork/getting-started/installation/" description="Install Patchwork and its optional plotting tools." />
-	<LinkCard title="Quickstart" href="/patchwork/getting-started/quickstart/" description="Create and plot a two-level mesh." />
-	<LinkCard title="Examples" href="/patchwork/examples/" description="Executed notebooks with their outputs." />
-	<LinkCard title="MPI communication" href="/patchwork/guides/mpi-communication/" description="How the ranks exchange halos, restrict, deposit and regrid, with figures and an explorer." />
-	<LinkCard title="API reference" href="/patchwork/api/patchwork/" description="Generated from the docstrings." />
-</CardGrid>
+- [Installation](/patchwork/getting-started/installation/): install Patchwork and its optional plotting tools.
+- [Quickstart](/patchwork/getting-started/quickstart/): create and plot a two-level mesh.
+- [Live demo](/patchwork/getting-started/live-demo/): refine a mesh around charges and solve their potential in your browser.
+- [Examples](/patchwork/examples/): executed notebooks with their outputs.
+- [MPI communication](/patchwork/guides/mpi-communication/): how the ranks exchange halos, restrict, deposit and regrid, with figures and an explorer.
+- [API reference](/patchwork/api/patchwork/): generated from the docstrings.
