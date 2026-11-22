@@ -27,6 +27,10 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The halo and restriction schedules find a patch's neighbours through a bin index of each
+  level's boxes instead of testing every pair of patches: building them is linear in the number
+  of patches. The first `exchange_halos` with 1024 patches of a 2D level took 9.9 s, now 0.4 s;
+  512 patches in 3D 4.7 s, now 0.8 s (`benchmarks/amrex`, B4). The schedules are unchanged.
 - `CompositeEdges.deposit_paths` runs mpifield's compiled path deposit (`mpifield.WHITNEY`)
   patch by patch in 1D, 2D and 3D: each path is clipped to the leaf cells of every patch (its
   box without its children's, shifted by whole periods on a periodic axis) and integrated on
