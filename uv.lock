@@ -889,8 +889,8 @@ toml = [
 
 [[package]]
 name = "cunumpy"
-version = "0.7.2"
-source = { git = "https://github.com/max-models/cunumpy?branch=devel#bd64a6aad5a1360983f3702fa54f8bf0d6d0a6c3" }
+version = "0.8.0"
+source = { git = "https://github.com/max-models/cunumpy?branch=devel#a25c7b31072823d31e0815f65efa0daa1212a403" }
 dependencies = [
     { name = "array-api-compat" },
     { name = "maybempi" },
@@ -4149,8 +4149,8 @@ wheels = [
 
 [[package]]
 name = "scope-profiler"
-version = "0.7.5"
-source = { git = "https://github.com/max-models/scope-profiler?branch=devel#2abb4ca4fe74166be554d30c3b78af8041f930ae" }
+version = "0.8.0"
+source = { git = "https://github.com/max-models/scope-profiler?branch=devel#128eff380e0fb3b04e33c917614634e0a391d62b" }
 dependencies = [
     { name = "h5py" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
