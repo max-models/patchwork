@@ -22,6 +22,10 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   cuts a path where it crosses a base plane of a graded axis and keeps the charge to round-off,
   and `gather` divides by the physical cell size. The multigrid's coarse levels keep every other
   base node; the FFT backend and `solve_poisson` take uniform axes only. Tutorial "Graded axes".
+- `graded_nodes(lower, upper, spacing, through=...)`: the nodes of a graded axis whose cells
+  follow a local size (a function of `x` or `(x, dx)` pairs, linear between them), with
+  neighbouring cells that change smoothly, and nodes at the `through` positions (electrode
+  faces, aperture edges), each stretch between them graded on its own.
 - `PatchHierarchy.deposit` and `interpolate` take `splines=`, the B-spline degree of the shape
   (1, the default and the cloud-in-cell weights so far, 2 or 3) or an `mpifield.Splines`;
   the field needs a halo of `mpifield.splines(p).halo` nodes (2 from degree 2 on). From degree

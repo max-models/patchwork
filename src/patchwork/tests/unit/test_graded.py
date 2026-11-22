@@ -448,3 +448,44 @@ def test_the_face_areas_are_physical() -> None:
     faces = CompositeFaces(edges)
     flux = np.where(faces.normal == 0, faces.area, 0.0)  # a uniform flux along x
     np.testing.assert_allclose(faces.divergence @ flux, 0.0, atol=1e-13)
+
+
+# graded_nodes --------------------------------------------------------------------------- #
+
+
+def test_graded_nodes_follow_the_spacing() -> None:
+    from patchwork import graded_nodes
+
+    # 0.1 mm at the meniscus, 1 mm at the end of a 20 mm gap
+    nodes = graded_nodes(0.0, 20e-3, [(0.0, 0.1e-3), (20e-3, 1.0e-3)])
+    sizes = np.diff(nodes)
+    assert nodes[0] == 0.0 and nodes[-1] == 20e-3
+    assert sizes[0] == pytest.approx(0.1e-3, rel=0.05)
+    assert sizes[-1] == pytest.approx(1.0e-3, rel=0.05)
+    assert np.max(sizes[1:] / sizes[:-1]) < 1.1  # neighbours within 10 %
+    # the cell count is the integral of 1 / dx: 20 / 0.9 ln 10 cells
+    assert sizes.size == round(20.0 / 0.9 * np.log(10.0))
+    uniform = graded_nodes(0.0, 1.0, lambda x: 0.1)
+    np.testing.assert_allclose(uniform, np.linspace(0.0, 1.0, 11))
+    assert graded_nodes(0.0, 1.0, [(0.5, 0.1)], cells=4).size == 5
+    with pytest.raises(ValueError, match="positive"):
+        graded_nodes(0.0, 1.0, [(0.0, 0.1), (1.0, -0.1)])
+    with pytest.raises(ValueError, match="pairs"):
+        graded_nodes(0.0, 1.0, [0.1, 0.2])
+
+
+def test_graded_nodes_pass_through_given_positions() -> None:
+    from patchwork import graded_nodes
+
+    nodes = graded_nodes(
+        0.0, 0.04, [(0.0, 0.5e-3), (0.04, 0.25e-3)], through=(0.016, 0.033, 0.05)
+    )
+    for x in (0.016, 0.033):
+        assert np.min(np.abs(nodes - x)) == 0.0
+    assert nodes[0] == 0.0 and nodes[-1] == 0.04 and np.all(np.diff(nodes) > 0)
+    sizes = np.diff(nodes)
+    assert sizes[0] == pytest.approx(0.5e-3, rel=0.1) and sizes[-1] == pytest.approx(
+        0.25e-3, rel=0.1
+    )
+    with pytest.raises(ValueError, match="combined"):
+        graded_nodes(0.0, 1.0, [(0.0, 0.1)], cells=4, through=(0.5,))
