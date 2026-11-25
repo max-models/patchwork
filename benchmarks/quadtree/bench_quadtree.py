@@ -1,4 +1,4 @@
-"""Quadtree patches against clustered ones in a particle-in-cell cycle.
+r"""Quadtree patches against clustered ones in a particle-in-cell cycle.
 
 A beam of markers (a Gaussian of width ``--width``, ``--markers`` of them, on a uniform
 background) moves across the unit square on a ``--base`` x ``--base`` base, and every step
@@ -50,6 +50,7 @@ def beam(rng, count: int, width: float, centre: tuple[float, float]):
 
 
 def refined_cells(mesh) -> int:
+    """The cells of the patches above the base level."""
     return sum(
         int(np.prod([hi - lo for lo, hi in patch.box]))
         for patch in mesh.patches
@@ -58,6 +59,7 @@ def refined_cells(mesh) -> int:
 
 
 def main() -> None:
+    """Run the cycle and print the mesh of the run as one JSON line."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--method", choices=["cluster", "quadtree"], default="quadtree")
     parser.add_argument("--block-size", type=int, default=16)

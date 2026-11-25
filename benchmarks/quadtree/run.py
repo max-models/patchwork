@@ -72,6 +72,7 @@ def run_once(arguments: list[str], ranks: int, output: Path) -> tuple[dict, dict
 
 
 def main() -> None:
+    """Run every configuration and print the table."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--ranks", type=int, default=1)
