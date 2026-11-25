@@ -5,7 +5,8 @@ markers: tag (`marker_tags`), regrid, migrate, deposit, build the solver, solve,
 the halos and gather, each a scope-profiler region. `run.py` runs it for clustered patches
 (`method="cluster"`, with and without `max_patch_size`) and quadtree blocks of 8, 16 and 32
 cells, and prints a table; under MPI it compares `placement="balanced"` with
-`placement="morton"` (without the solve, which the LU backend does not distribute).
+`placement="morton"`, by cells and weighted by the markers (`cost`, a marker costing a
+tenth of a cell), without the solve, which the LU backend does not distribute.
 
 ```sh
 python benchmarks/quadtree/run.py --out /tmp/quadtree               # serial, with the solve

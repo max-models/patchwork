@@ -5,7 +5,8 @@ background) moves across the unit square on a ``--base`` x ``--base`` base, and 
 
 - ``tag``: `marker_tags` (more than ``--per-cell`` markers per cell, ``--levels`` levels);
 - ``regrid``: `regrid` with ``--method`` (``cluster`` or ``quadtree`` with ``--block-size``)
-  and ``--placement`` (``balanced`` or ``morton``);
+  and ``--placement`` (``balanced`` or ``morton``, with ``--marker-cost`` the Morton cuts
+  weighted by the markers: `marker_counts` times the cost of a marker against a cell);
 - ``migrate``, ``deposit``: the markers to their patches' ranks, cloud-in-cell deposit and
   `accumulate_halos`;
 - ``solver``, ``solve``: a new `NodalPoisson` on the new mesh and its solve (serial only,
@@ -33,7 +34,7 @@ import numpy as np
 import scope_profiler as sp
 from maybempi import MPI
 
-from patchwork import AMRHierarchy, NodalPoisson, marker_tags
+from patchwork import AMRHierarchy, NodalPoisson, marker_counts, marker_tags
 
 
 def beam(rng, count: int, width: float, centre: tuple[float, float]):
@@ -66,6 +67,12 @@ def main() -> None:
     parser.add_argument("--max-patch-size", type=int, default=None)
     parser.add_argument(
         "--placement", choices=["balanced", "morton"], default="balanced"
+    )
+    parser.add_argument(
+        "--marker-cost",
+        type=float,
+        default=0.0,
+        help="what a marker costs against a cell: weighs the Morton cuts (with morton)",
     )
     parser.add_argument("--base", type=int, default=64)
     parser.add_argument("--levels", type=int, default=3)
@@ -109,14 +116,22 @@ def main() -> None:
             **options,
         )
 
-    kept, patches, cells = [], [], []
+    kept, patches, cells, held = [], [], [], []
     previous = {(p.level, p.box) for p in mesh.patches if p.level}
     for step in range(1, args.steps + 1):
         x, y, q = markers(step)
         with sp.region("quadtree_bench.tag"):
-            tags = marker_tags(mesh, x, y, per_cell=args.per_cell, levels=args.levels)
+            counts = marker_counts(mesh, x, y, levels=args.levels + 1)
+            tags = {
+                level: counts[level] > args.per_cell for level in range(args.levels)
+            }
+            weigh = {}
+            if args.marker_cost and args.placement == "morton":
+                weigh["cost"] = {
+                    level: args.marker_cost * found for level, found in counts.items()
+                }
         with sp.region("quadtree_bench.regrid"):
-            mesh = mesh.regrid(tags, **options)
+            mesh = mesh.regrid(tags, **options, **weigh)
         boxes = {(p.level, p.box) for p in mesh.patches if p.level}
         kept.append(len(boxes & previous) / max(len(boxes), 1))
         previous = boxes
@@ -124,6 +139,7 @@ def main() -> None:
         cells.append(refined_cells(mesh))
         with sp.region("quadtree_bench.migrate"):
             mx, my, mq = mesh.migrate(x, y, q, name="rho")
+        held.append(comm.allgather(mx.size))
         with sp.region("quadtree_bench.deposit"):
             mesh.deposit(mx, my, mq, "rho")
             mesh.accumulate_halos("rho")
@@ -155,6 +171,9 @@ def main() -> None:
                     "refined_cells": float(np.mean(cells)),
                     "kept": float(np.mean(kept)),
                     "load_imbalance": max(load) / (sum(load) / len(load)),
+                    "marker_imbalance": float(
+                        np.mean([max(h) / (sum(h) / len(h)) for h in held])
+                    ),
                 }
             )
         )

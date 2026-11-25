@@ -269,3 +269,180 @@ def test_regrid_places_the_blocks_along_the_morton_curve() -> None:
     assert len(added.ranks) == 1
     with pytest.raises(ValueError, match="morton"):
         AMRHierarchy(base_shape=(4, 4), placement="hilbert")
+
+
+@pytest.mark.parametrize("centering", ["node", "cell"])
+def test_kept_patches_reuse_their_halo_geometry(centering, monkeypatch) -> None:
+    from patchwork.mesh import halos
+
+    def blob(cx):
+        return lambda x, y: np.hypot(x - cx, y - 0.5) < 0.12
+
+    mesh = AMRHierarchy(base_shape=(32, 32), placement="morton")
+    mesh.allocate_field("u", centering=centering, halo=2)
+    for _ in range(2):
+        mesh = mesh.regrid(
+            function_tags(mesh, blob(0.4), levels=2), method="quadtree", block_size=4
+        )
+    mesh.exchange_halos("u")  # the records of this mesh
+
+    built = []
+    record = halos.HaloExchange._record
+    monkeypatch.setattr(
+        halos.HaloExchange,
+        "_record",
+        lambda self, *args: built.append(args[1]) or record(self, *args),
+    )
+    moved = mesh.regrid(
+        function_tags(mesh, blob(0.42), levels=2), method="quadtree", block_size=4
+    )
+    kept = {(p.level, p.box) for p in mesh.patches} & {
+        (p.level, p.box) for p in moved.patches
+    }
+
+    def fill(hierarchy):
+        for patch in hierarchy.local_patches:
+            coordinates = (
+                patch.local_node_coordinates(hierarchy, "u")
+                if centering == "node"
+                else patch.local_cell_centers(hierarchy, "u")
+            )
+            patch.field("u").local[...] = (
+                1.0 + 2.0 * coordinates[0] - 3.0 * coordinates[1]
+            )
+
+    fill(moved)
+    moved.exchange_halos("u")
+    reused = len(moved.patches) - len(built)
+    assert 0 < reused <= len(kept)  # only kept patches can reuse their geometry
+    # the same halos as a hierarchy that finds every patch's geometry again
+    fresh = moved.regrid(
+        function_tags(mesh, blob(0.42), levels=2), method="quadtree", block_size=4
+    )
+    fresh._halo_records.clear()
+    assert [(p.level, p.box) for p in fresh.patches] == [
+        (p.level, p.box) for p in moved.patches
+    ]
+    fill(fresh)
+    fresh.exchange_halos("u")
+    for a, b in zip(moved.local_patches, fresh.local_patches, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(a.field("u").local_with_halos),
+            np.asarray(b.field("u").local_with_halos),
+        )
+
+
+def test_marker_weights_move_the_cuts_of_the_morton_curve() -> None:
+    from patchwork import box_costs, marker_counts
+
+    boxes = {
+        1: [((2 * i, 2 * i + 2), (0, 2)) for i in range(4)]
+    }  # four boxes of 4 cells
+    assert morton_ranks(boxes, 2) == {1: [0, 0, 1, 1]}
+    # the first box costs as much as the other three: it gets a rank to itself
+    heavy = {1: [12.0, 4.0, 4.0, 4.0]}
+    assert morton_ranks(boxes, 2, weights=heavy) == {1: [0, 1, 1, 1]}
+    with pytest.raises(ValueError, match="weights"):
+        morton_ranks(boxes, 2, weights={1: [1.0]})
+
+    mesh = AMRHierarchy(base_shape=(8, 8))
+    rank = WORLD.Get_rank()
+    # 64 markers in base cell (1, 1), shared out over the ranks
+    x = np.full(64, 0.19)[rank::SIZE]
+    y = np.full(64, 0.19)[rank::SIZE]
+    counts = marker_counts(mesh, x, y, levels=2)
+    assert counts[0][1, 1] == 64 and counts[0].sum() == 64
+    assert counts[1][3, 3] == 64
+    # level 1 covers base cells 0..3 x 0..1: the markers are on its leaf cells
+    new = {1: [((0, 8), (0, 4))]}
+    weights, load = box_costs(mesh, new, {0: counts[0], 1: counts[1]})
+    assert weights == {1: [32.0 + 64.0]}
+    assert sum(load) == 64.0  # the base's cells; the markers are on the finer patch
+    with pytest.raises(ValueError, match="shape"):
+        box_costs(mesh, new, {0: np.zeros((3, 3))})
+
+
+def test_regrid_with_marker_costs_gives_the_dense_patches_fewer_cells() -> None:
+    from patchwork import box_costs, marker_counts
+
+    mesh = AMRHierarchy(base_shape=(16, 16), placement="morton")
+    rng = np.random.default_rng(WORLD.Get_rank())
+    x = np.concatenate([rng.normal(0.3, 0.04, 4000), rng.uniform(0, 1, 1000)]) % 1
+    y = np.concatenate([rng.normal(0.3, 0.04, 4000), rng.uniform(0, 1, 1000)]) % 1
+    for _ in range(2):
+        tags = marker_tags(mesh, x, y, per_cell=8 * SIZE, levels=2)
+        mesh = mesh.regrid(tags, method="quadtree", block_size=4)
+    counts = marker_counts(mesh, x, y, levels=3)
+    cost = {level: 0.5 * found for level, found in counts.items()}
+    plain = mesh.regrid(tags, method="quadtree", block_size=4)
+    weighted = mesh.regrid(tags, method="quadtree", block_size=4, cost=cost)
+    assert [(p.level, p.box) for p in weighted.patches] == [
+        (p.level, p.box) for p in plain.patches
+    ]
+
+    def costs(hierarchy):  # cells plus half the markers of the leaf cells, per rank
+        boxes = {
+            level: [p.box for p in hierarchy.patches_at_level(level)]
+            for level in range(1, hierarchy.max_level + 1)
+        }
+        weights, load = box_costs(hierarchy, boxes, cost)
+        for level, values in weights.items():
+            patches = hierarchy.patches_at_level(level)
+            for patch, value in zip(patches, values, strict=True):
+                load[patch.ranks[0]] += value
+        return load
+
+    assert max(costs(weighted)) <= max(costs(plain)) + 1e-9
+    with pytest.raises(ValueError, match="morton"):
+        AMRHierarchy(base_shape=(4, 4)).regrid({0: np.ones((4, 4), bool)}, cost=cost)
+
+
+def test_rebalance_moves_the_patches_and_their_fields_to_the_weighted_ranks() -> None:
+    from patchwork import box_costs, marker_counts
+
+    mesh = AMRHierarchy(base_shape=(16, 16), placement="balanced")
+    mesh.allocate_field("u", centering="node")
+    mesh.allocate_field("c")
+    mesh = mesh.regrid(
+        function_tags(mesh, ring, levels=2), method="quadtree", block_size=4
+    )
+    mesh = mesh.regrid(
+        function_tags(mesh, ring, levels=2), method="quadtree", block_size=4
+    )
+
+    def plane(x, y):
+        return 1.0 + 2.0 * x - 3.0 * y
+
+    for patch in mesh.local_patches:
+        patch.field("u").local[...] = plane(*patch.local_node_coordinates(mesh, "u"))
+        patch.field("c").local[...] = plane(*patch.local_cell_centers(mesh, "c"))
+    x = np.full(100, 0.21)[WORLD.Get_rank() :: SIZE]
+    y = np.full(100, 0.5)[WORLD.Get_rank() :: SIZE]
+    cost = marker_counts(mesh, x, y, levels=3)
+    moved = mesh.rebalance(cost)
+
+    assert moved.placement == "morton"
+    assert [(p.level, p.box) for p in moved.patches] == [
+        (p.level, p.box) for p in mesh.patches
+    ]
+    boxes = {
+        level: [p.box for p in mesh.patches_at_level(level)]
+        for level in range(1, mesh.max_level + 1)
+    }
+    weights, load = box_costs(moved, boxes, cost)
+    expected = morton_ranks(boxes, SIZE, load=load, weights=weights)
+    for level in boxes:
+        ranks = [p.ranks for p in moved.patches_at_level(level)]
+        assert ranks == [(r,) for r in expected[level]]
+    for patch in moved.local_patches:
+        np.testing.assert_allclose(
+            patch.field("u").local,
+            plane(*patch.local_node_coordinates(moved, "u")),
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            patch.field("c").local,
+            plane(*patch.local_cell_centers(moved, "c")),
+            atol=1e-12,
+        )
+    assert mesh.rebalance().max_level == mesh.max_level  # by cells alone

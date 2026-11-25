@@ -4,57 +4,73 @@
 `bench_quadtree.py` defaults: a 64 x 64 base, 3 levels, 200,000 markers (four fifths in a
 Gaussian beam of width 0.06 moving by 0.01 per step), `per_cell=20`, 20 timed steps. Times
 are the median of 3 runs of the mean ms per step; under MPI on the rank where the part is
-largest. "kept" is the share of the patches of a regrid that were there before it.
+largest. "kept" is the share of the patches of a regrid that were there before it. "tag"
+counts the markers on one level more than it tags, for the cost of `morton, markers`.
 
 ## Serial, with the solve
 
+With the halo geometry of kept patches reused (patchwork 10c; the numbers in brackets are
+the halos without it, from the first run of this benchmark).
+
 | mesh | patches | refined cells | kept | tag | regrid | migrate | deposit | solver | solve | halos | gather | total |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| cluster | 8 | 27,864 | 0% | 73.9 | 10.3 | 22.0 | 57.8 | 114.1 | 6.2 | 4.7 | 31.2 | 320 |
-| cluster, `max_patch_size=16` | 134 | 27,864 | 2% | 73.2 | 98.6 | 43.6 | 132.7 | 133.8 | 13.1 | 100.0 | 78.2 | 673 |
-| quadtree, block 8 | 386 | 24,714 | 92% | 70.6 | 277.0 | 64.9 | 231.4 | 179.7 | 23.4 | 295.5 | 131.4 | 1274 |
-| quadtree, block 16 | 121 | 30,925 | 91% | 72.4 | 75.3 | 40.0 | 126.4 | 135.1 | 12.4 | 94.5 | 74.6 | 631 |
-| quadtree, block 32 | 49 | 50,330 | 94% | 72.3 | 26.0 | 31.2 | 88.6 | 204.6 | 13.0 | 43.0 | 53.5 | 532 |
+| cluster | 8 | 27,864 | 0% | 106.2 | 10.7 | 20.3 | 55.6 | 113.7 | 5.9 | 8.1 (4.7) | 30.1 | 351 |
+| cluster, `max_patch_size=16` | 134 | 27,864 | 2% | 101.5 | 85.5 | 38.7 | 130.8 | 124.3 | 12.5 | 120.7 (100.0) | 74.6 | 689 |
+| quadtree, block 8 | 386 | 24,714 | 92% | 105.6 | 284.7 | 65.1 | 229.2 | 184.0 | 23.9 | 273.7 (295.5) | 134.7 | 1301 |
+| quadtree, block 16 | 121 | 30,925 | 91% | 100.0 | 66.6 | 37.2 | 113.7 | 130.8 | 11.4 | 78.2 (94.5) | 68.2 | 606 |
+| quadtree, block 32 | 49 | 50,330 | 94% | 102.1 | 30.4 | 29.4 | 84.9 | 199.4 | 12.1 | 28.4 (43.0) | 50.9 | 538 |
 
 ## 4 ranks, without the solve
 
-| mesh | placement | imbalance | tag | regrid | migrate | deposit | halos | gather | total |
-|---|---|---|---|---|---|---|---|---|---|
-| cluster | balanced | 2.18 | 30.6 | 7.5 | 13.3 | 59.9 | 4.4 | 18.8 | 135 |
-| cluster | morton | 2.19 | 32.0 | 7.6 | 12.4 | 57.5 | 4.8 | 23.0 | 137 |
-| cluster, `max_patch_size=16` | balanced | 1.01 | 24.2 | 51.7 | 19.1 | 53.9 | 97.5 | 15.8 | 262 |
-| cluster, `max_patch_size=16` | morton | 1.01 | 29.9 | 46.3 | 18.4 | 61.7 | 101.4 | 20.1 | 278 |
-| quadtree, block 8 | balanced | 1.00 | 27.5 | 214.2 | 32.2 | 91.2 | 296.3 | 24.8 | 686 |
-| quadtree, block 8 | morton | 1.00 | 30.7 | 189.0 | 30.9 | 95.9 | 273.5 | 25.3 | 645 |
-| quadtree, block 16 | balanced | 1.02 | 24.6 | 39.4 | 17.8 | 60.5 | 96.6 | 16.6 | 256 |
-| quadtree, block 16 | morton | 1.02 | 27.4 | 47.1 | 19.6 | 56.8 | 95.9 | 18.1 | 265 |
-| quadtree, block 32 | balanced | 1.02 | 29.3 | 24.6 | 18.0 | 58.1 | 47.1 | 15.5 | 193 |
-| quadtree, block 32 | morton | 1.02 | 25.5 | 17.3 | 14.5 | 49.7 | 36.3 | 15.2 | 158 |
+`morton, markers` weighs the Morton cuts by `cost`: the markers of `marker_counts`, a marker
+costing a tenth of a cell.
 
-Imbalance: the largest cells per rank over the mean (the base level counted).
+| mesh | placement | cells imbalance | markers imbalance | tag | regrid | migrate | deposit | halos | gather | total |
+|---|---|---|---|---|---|---|---|---|---|---|
+| cluster | balanced | 2.18 | 3.04 | 45.5 | 8.0 | 10.6 | 59.7 | 5.5 | 19.2 | 149 |
+| cluster | morton | 2.19 | 3.04 | 46.4 | 9.8 | 10.9 | 62.1 | 5.6 | 23.6 | 159 |
+| cluster | morton, markers | 2.19 | 3.04 | 46.7 | 9.5 | 10.1 | 53.1 | 5.6 | 19.8 | 145 |
+| cluster, `max_patch_size=16` | balanced | 1.01 | 1.36 | 41.2 | 52.9 | 18.3 | 62.8 | 124.3 | 17.4 | 317 |
+| cluster, `max_patch_size=16` | morton | 1.01 | 1.35 | 41.9 | 49.9 | 20.8 | 61.4 | 110.7 | 18.9 | 303 |
+| cluster, `max_patch_size=16` | morton, markers | 1.11 | 1.22 | 40.5 | 55.3 | 19.3 | 60.7 | 128.7 | 17.2 | 322 |
+| quadtree, block 8 | balanced | 1.00 | 1.31 | 40.8 | 215.3 | 28.7 | 92.6 | 395.5 | 23.4 | 796 |
+| quadtree, block 8 | morton | 1.00 | 1.26 | 46.4 | 199.5 | 29.9 | 89.4 | 267.4 | 26.6 | 659 |
+| quadtree, block 8 | morton, markers | 1.09 | 1.16 | 46.2 | 220.1 | 31.7 | 90.8 | 297.3 | 29.7 | 716 |
+| quadtree, block 16 | balanced | 1.02 | 1.28 | 44.4 | 62.6 | 20.8 | 69.0 | 131.4 | 18.4 | 347 |
+| quadtree, block 16 | morton | 1.02 | 1.35 | 46.9 | 63.2 | 27.2 | 63.2 | 105.0 | 20.5 | 326 |
+| quadtree, block 16 | morton, markers | 1.13 | 1.24 | 48.6 | 67.4 | 21.0 | 68.1 | 104.0 | 18.0 | 327 |
+| quadtree, block 32 | balanced | 1.02 | 1.28 | 42.6 | 23.3 | 16.4 | 58.0 | 44.9 | 13.9 | 199 |
+| quadtree, block 32 | morton | 1.02 | 1.55 | 44.6 | 21.3 | 17.0 | 61.3 | 51.5 | 16.4 | 212 |
+| quadtree, block 32 | morton, markers | 1.18 | 1.41 | 46.7 | 26.6 | 19.3 | 57.9 | 40.3 | 16.3 | 207 |
+
+Imbalance: the largest cells (base level counted) or markers (after `migrate`) per rank over
+the mean.
 
 ## What they say
 
 - **The cost follows the number of patches, not how they are placed.** Regrid, halos,
-  deposit and gather grow with the patches: 8 clusters take 320 ms per step, 386 blocks of 8
-  cells 1274 ms. At about the same number of patches the quadtree is as fast as clusters
-  (block 16, 121 patches: 631 ms; clusters cut to 16 cells, 134 patches: 673 ms), its
-  regrid a little faster since most of its patches are copied, not interpolated.
-- **What the quadtree keeps is not reused yet.** 91-94% of its patches survive a regrid,
-  but the hierarchy is new, so the halo schedules (`build_schedule`, most of "halos"), the
-  composite node numbering and the solver are built again from scratch. Reusing them for
-  kept patches is where the quadtree could win; picnic's solver already reuses the grids and
-  probed operators of kept boxes (see picnic's `adaptive_rebuild_cost.py --method quadtree`).
+  deposit and gather grow with the patches: 8 clusters take 351 ms per step, 386 blocks of 8
+  cells 1301 ms. At about the same number of patches the quadtree is as fast as clusters
+  (block 16, 121 patches: 606 ms; clusters cut to 16 cells, 134 patches: 689 ms).
+- **Reusing the halo geometry of kept patches saves 7-34% of the halos** (block 8: 296 →
+  274 ms, block 16: 95 → 78 ms, block 32: 43 → 28 ms). Not more, for two reasons: about
+  a third of the patches still find their geometry again (kept patches whose neighbours or
+  coarse patches changed, and new ones), and building the `mpiarray.CopyPlan` of the
+  exchange from the copies is now the largest part (about 100 of 250 ms at 386 patches:
+  per-copy Python and a pickled `allgather`), and it is built for every new hierarchy. Next:
+  a cheaper `CopyPlan` in mpiarray (patchwork 8k). The clusters gain nothing, their patches are
+  recut every regrid, and pay a few ms for checking the signatures (8 clusters: 4.7 → 8.1 ms).
 - **Large blocks refine many cells**: blocks of 32 cover 50,330 cells for the 27,864 the
-  clusters need; the solver setup grows with them (205 ms against 114 ms).
-- **Morton and balanced placement are within the noise on one node** (about 10% between
-  repeats). Morton keeps neighbouring patches and the patches over them on one rank, which
-  saves messages between nodes; within a node the messages are cheap and the halo time is
-  the schedule, built in Python. The few large clusters cannot be balanced by either (2.2).
-- On four ranks tagging and gathering take about half as long as serially, but the deposit
-  does not get faster (58 ms serially, 50-96 ms on the slowest rank): the placements balance
-  cells, and the beam's patches hold most markers. Marker-weighted cuts of the Morton curve
-  are patchwork step 8e.
+  clusters need; the solver setup grows with them (199 ms against 114 ms).
+- **Morton placement**: on one node within the noise of `balanced` for most meshes (about
+  10% between repeats); the halos of blocks of 8 are faster with it (267 against 396 ms),
+  where the patches are small and many.
+- **Weighing the cuts by the markers** (`morton, markers`) lowers the marker imbalance (blocks
+  of 8: 1.26 → 1.16, 16: 1.35 → 1.24, 32: 1.55 → 1.41, clusters cut to 16: 1.35 → 1.22) for a
+  higher cell imbalance (1.09-1.18), as asked. The step time does not change measurably on
+  four ranks: with 200,000 markers the deposit and gather take 60-120 ms against the cells'
+  halos and regrid. It pays where the markers dominate (many markers per cell, the push of a
+  real simulation, many nodes). The 7 clusters cannot be balanced by any cut (2.2, 3.0).
 
 ## Fixed on the way
 

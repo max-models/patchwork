@@ -523,6 +523,40 @@ def _halo_problem() -> ConvergenceProblem:
     ),
     problem=_halo_problem,
 )
+def _key(patch: Patch) -> tuple:
+    """A patch as its level, box and ranks: the same in the hierarchies a regrid makes."""
+    return (patch.level, patch.box, patch.ranks)
+
+
+def _within(points: _Points, level: int, box: Box) -> tuple:
+    """The keys of the patches of ``level`` that overlap ``box`` or one of its periodic images."""
+    shifts = points.shifts(level)
+    return tuple(
+        _key(other)
+        for other in points.near(level, box)
+        if any(
+            _overlap(box, _shift(points.own(other), shift)) is not None
+            for shift in shifts
+        )
+    )
+
+
+class _HaloRecord:
+    """The halo geometry of one patch, its fields named by patch keys.
+
+    ``copies`` are ``(source, box, target, box)`` with each array a slot:
+    ``("field", key)``, ``("coarse", key)`` (the field interpolated from) or
+    ``("buffer", shape)``, the patch's buffer of coarse values; ``None`` where
+    this rank does not hold the array. ``interpolation`` is the buffer's shape,
+    the storage index, the buffer points and the weights of the halo points
+    interpolated from the level below, or ``None``.
+    """
+
+    def __init__(self, copies: list[tuple], interpolation: tuple | None) -> None:
+        self.copies = copies
+        self.interpolation = interpolation
+
+
 class HaloExchange:
     """Fill the halo of every patch of field ``name``; see the module docstring.
 
@@ -598,6 +632,112 @@ class HaloExchange:
         if interpolation is not None:
             self._interpolations.append(interpolation)
 
+    def _signature(self, points: _Points, patch: Patch) -> tuple:
+        """What a patch's halo geometry depends on: itself and the patches within reach.
+
+        The patches of its level that may overlap its halo, and those of the level
+        below that may hold the coarse points of its interpolation, each as
+        ``(level, box, ranks)``.
+        """
+        own = points.own(patch)
+        width = self._width
+        extended = tuple((lo - width, hi + width) for lo, hi in own)
+        same = _within(points, patch.level, extended)
+        if patch.level == 0:
+            return (_key(patch), same)
+        ratio = points.ratio
+        coarse = tuple((lo // ratio - 1, -(-hi // ratio) + 2) for lo, hi in extended)
+        return (_key(patch), same, _within(points, patch.level - 1, coarse))
+
+    def _record(self, points: _Points, patch: Patch, dtype: Any) -> _HaloRecord:
+        """The halo geometry of one patch, with its fields as patch keys."""
+        slots: dict[int, tuple] = {}
+        own_field, coarse_field = self._field, self._coarse_field
+
+        def field(other: Patch) -> Any:
+            array = own_field(other)
+            if array is not None:
+                slots[id(array)] = ("field", _key(other))
+            return array
+
+        def coarse(other: Patch) -> Any:
+            array = coarse_field(other)
+            if array is not None:
+                slots[id(array)] = ("coarse", _key(other))
+            return array
+
+        copies: list[tuple] = []
+        self._field, self._coarse_field = field, coarse  # type: ignore[method-assign]
+        try:
+            covered = self._same_level(points, patch, copies)
+            interpolations: list = []
+            if patch.level > 0:
+                before = self._interpolations
+                self._interpolations = interpolations
+                try:
+                    self._coarse_fine(points, patch, covered, dtype, copies)
+                finally:
+                    self._interpolations = before
+        finally:
+            del self._field, self._coarse_field  # back to the methods
+        buffer = None
+        interpolation = None
+        if interpolations:
+            (found,) = interpolations
+            buffer = found.buffer
+            slots[id(buffer)] = ("buffer", tuple(buffer.shape))
+            interpolation = (
+                tuple(buffer.shape),
+                found.index,
+                found.flat,
+                found.weights,
+            )
+        else:
+            for _, _, target, _ in copies:  # a buffer on a rank without points
+                if target is not None and id(target) not in slots:
+                    buffer = target
+                    slots[id(target)] = ("buffer", tuple(target.shape))
+        template = [
+            (
+                None if source is None else slots[id(source)],
+                source_box,
+                None if target is None else slots[id(target)],
+                target_box,
+            )
+            for source, source_box, target, target_box in copies
+        ]
+        return _HaloRecord(template, interpolation)
+
+    def _bind(
+        self, record: _HaloRecord, patch: Patch, patches: dict, dtype: Any
+    ) -> None:
+        """The copies and the interpolation of a record, on this hierarchy's arrays."""
+        buffer = None
+
+        def resolve(slot: tuple | None) -> Any:
+            nonlocal buffer
+            if slot is None:
+                return None
+            kind, key = slot
+            if kind == "buffer":
+                if buffer is None:
+                    buffer = mpa.zeros(key, dtype=dtype, split=None, comm=patch.comm)
+                return buffer
+            other = patches[key]
+            return self._field(other) if kind == "field" else self._coarse_field(other)
+
+        for source, source_box, target, target_box in record.copies:
+            self._copies.append(
+                (resolve(source), source_box, resolve(target), target_box)
+            )
+        if record.interpolation is not None:
+            shape, index, flat, weights = record.interpolation
+            if buffer is None:
+                buffer = mpa.zeros(shape, dtype=dtype, split=None, comm=patch.comm)
+            self._interpolations.append(
+                _Bilinear(self._field(patch), index, buffer, flat, weights)
+            )
+
     def __init__(
         self,
         hierarchy: AMRHierarchy,
@@ -610,6 +750,12 @@ class HaloExchange:
 
         With ``level``, only for the patches of that level; with ``below``,
         interpolating field ``below`` of the level below instead of ``name``.
+
+        The geometry of each patch's halo (which points come from which patch,
+        and the interpolation weights) is kept on the hierarchy, by centering,
+        width and type, and handed on by `AMRHierarchy.regrid`: a patch with the
+        same box and ranks, and the same patches within reach of its halo, reuses
+        it instead of finding it again.
         """
         spec = hierarchy._field_specs[name]
         self._hierarchy = hierarchy
@@ -617,16 +763,28 @@ class HaloExchange:
         self._below = name if below is None else below
         self._level = level
         self._width = int(spec["halo"])
-        points = _Points(hierarchy, spec["centering"] == "node")
-        copies: list[tuple] = []
+        nodal = spec["centering"] == "node"
+        points = _Points(hierarchy, nodal)
+        self._copies: list[tuple] = []
         self._interpolations: list[_Bilinear] = []
+        dtype = spec["dtype"]
+        kind = ("halo", nodal, self._width, np.dtype(dtype).str, repr(spec["split"]))
+        known = hierarchy._halo_records.get(kind, {})
+        used: dict[tuple, _HaloRecord] = {}
+        patches = {_key(patch): patch for patch in hierarchy.patches}
         for patch in hierarchy.patches if self._width else ():
             if level is not None and patch.level != level:
                 continue
-            covered = self._same_level(points, patch, copies)
-            if patch.level > 0:
-                self._coarse_fine(points, patch, covered, spec["dtype"], copies)
-        self._plan = mpa.CopyPlan(copies, comm=hierarchy.comm)
+            signature = self._signature(points, patch)
+            record = known.get(signature)
+            if record is None:
+                record = self._record(points, patch, dtype)
+            used[signature] = record
+            self._bind(record, patch, patches, dtype)
+        # keep the records of this mesh (all of them after a full build)
+        hierarchy._halo_records[kind] = used if level is None else {**known, **used}
+        self._plan = mpa.CopyPlan(self._copies, comm=hierarchy.comm)
+        del self._copies
 
     def execute(self) -> None:
         """Fill the halos. Collective over the hierarchy's communicator."""
