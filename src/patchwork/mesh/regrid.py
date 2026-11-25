@@ -33,6 +33,7 @@ from __future__ import annotations
 import itertools
 from typing import TYPE_CHECKING, Any
 
+import cunumpy as xp
 import mpiarray as mpa
 import numpy as np
 import scope_profiler as sp
@@ -50,7 +51,7 @@ from patchwork.mesh.halos import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Mapping, Sequence
 
     from patchwork.mesh.hierarchy import AMRHierarchy, IndexBox
 
@@ -715,6 +716,48 @@ def quadtree_boxes(
     return boxes
 
 
+@method(
+    equations={
+        "key": r"k(\mathbf i) = \sum_{b} \sum_{d=0}^{D-1} \mathrm{bit}_b(i_d)\, 2^{bD + d} \quad \text{(the lower corner of a patch)}",
+        "ranks": r"r(B) = \min\left(R - 1, \left\lfloor R\, \frac{C_{<B} + |B|/2}{C} \right\rfloor\right), \quad C_{<B} = \sum_{k(B') < k(B)} |B'|",
+    },
+    assumptions=(
+        "the patches of one level, sorted by the key of their lower corner, are cut into R pieces of about equal cells",
+        "a patch stays on one rank; the cells per rank differ by at most one patch",
+    ),
+    references=(
+        "[Morton, IBM technical report (1966)](https://dominoweb.draco.res.ibm.com/reports/Morton1966.pdf)",
+        "[Burstedde, Wilcox and Ghattas, SIAM J. Sci. Comput. 33, 1103 (2011)](https://doi.org/10.1137/100791634)",
+    ),
+)
+def morton_ranks(boxes: Sequence[IndexBox], size: int) -> list[int]:
+    """The rank of each box of one level: the boxes along a Morton curve, cut into ``size`` pieces.
+
+    The boxes are ordered by the Morton (Z-order) key of their lower corner,
+    which keeps boxes that are close in space close in the order, and the
+    order is cut where the running count of cells passes ``k / size`` of all
+    cells: each rank gets a run of neighbouring boxes with about the same
+    number of cells. Returns the ranks in the order of ``boxes``.
+    """
+    if size < 1:
+        raise ValueError(f"size must be at least 1, got {size}")
+    cells = [int(np.prod([hi - lo for lo, hi in box])) for box in boxes]
+    corners = np.array([[lo for lo, _ in box] for box in boxes], dtype=np.uint64)
+    if corners.size and corners.shape[1] > 1:
+        keys = xp.algorithms.morton_encode(*corners.T)  # 2D and 3D
+    else:  # 1D: the curve is the axis
+        keys = corners.reshape(-1)
+    order = sorted(range(len(boxes)), key=lambda n: (int(keys[n]), boxes[n]))
+    total = sum(cells)
+    ranks = [0] * len(boxes)
+    before = 0
+    for n in order:
+        middle = before + cells[n] / 2
+        ranks[n] = min(size - 1, int(size * middle / total)) if total else 0
+        before += cells[n]
+    return ranks
+
+
 @sp.profile("patchwork.regrid_transfer", tags=PROFILE_TAGS)
 def transfer(old: AMRHierarchy, new: AMRHierarchy, name: str) -> None:
     """Fill field ``name`` of ``new`` from ``old``, level by level (collective).
@@ -743,9 +786,10 @@ def transfer(old: AMRHierarchy, new: AMRHierarchy, name: str) -> None:
         for patch in new.patches_at_level(level):
             own = points.own(patch)
             origin = tuple(lo for lo, _ in own)
-            covered = np.zeros([hi - lo for lo, hi in own], dtype=bool)
+            # the old patches near this one (a bin index, not every pair)
+            mine = []
             for previous in (
-                old.patches_at_level(level) if level <= old.max_level else ()
+                old_points.near(level, own) if level <= old.max_level else ()
             ):
                 theirs = old_points.own(previous)
                 their_origin = tuple(lo for lo, _ in theirs)
@@ -758,11 +802,19 @@ def transfer(old: AMRHierarchy, new: AMRHierarchy, name: str) -> None:
                         tuple(-d - o for d, o in zip(shift, their_origin, strict=True)),
                     )
                     target = _shift(part, tuple(-o for o in origin))
-                    copies.append(
-                        (old_field(previous), source, new_field(patch), target)
-                    )
-                    covered[tuple(slice(s, e) for s, e in target)] = True
-            if level == 0:
+                    mine.append((old_field(previous), source, new_field(patch), target))
+            # the last copy of a point wins: drop the copies that later ones overwrite
+            # entirely (an old patch with the same box makes its neighbours' shared
+            # nodes redundant), so that a kept patch costs one copy, not one per neighbour
+            covered = np.zeros([hi - lo for lo, hi in own], dtype=bool)
+            kept = []
+            for copy in reversed(mine):
+                where = tuple(slice(s, e) for s, e in copy[3])
+                if not covered[where].all():
+                    kept.append(copy)
+                    covered[where] = True
+            copies.extend(reversed(kept))
+            if level == 0 or covered.all():
                 continue
             index = tuple(
                 values + o

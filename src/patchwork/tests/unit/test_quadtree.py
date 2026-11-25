@@ -9,7 +9,13 @@ import numpy as np
 import pytest
 from maybempi import MPI
 
-from patchwork import AMRHierarchy, function_tags, marker_tags, quadtree_boxes
+from patchwork import (
+    AMRHierarchy,
+    function_tags,
+    marker_tags,
+    morton_ranks,
+    quadtree_boxes,
+)
 from patchwork.mesh.regrid import combine_tags
 
 WORLD = MPI.COMM_WORLD
@@ -215,3 +221,46 @@ def test_quadtree_adds_no_level_where_every_cell_is_forbidden() -> None:
     tags = {0: np.ones((8, 8), dtype=bool)}
     new = mesh.regrid(tags, method="quadtree", block_size=4, forbid=lambda x, y: x > -1)
     assert new.max_level == 0
+
+
+def test_morton_ranks_follow_the_z_curve_with_equal_cells() -> None:
+    # sixteen 2 x 2 blocks of a 8 x 8 level: the Z curve visits the quadrants in turn
+    boxes = [
+        ((2 * i, 2 * i + 2), (2 * j, 2 * j + 2)) for i in range(4) for j in range(4)
+    ]
+    ranks = morton_ranks(boxes, 4)
+    for box, rank in zip(boxes, ranks, strict=True):
+        (i0, _), (j0, _) = box
+        assert rank == 2 * (i0 >= 4) + (j0 >= 4) or rank == (i0 >= 4) + 2 * (j0 >= 4)
+    assert sorted(ranks) == [r for r in range(4) for _ in range(4)]
+    # unequal boxes: the cells per rank differ by at most one box
+    boxes = [((0, 8), (0, 8)), ((8, 10), (0, 2)), ((8, 10), (2, 4)), ((10, 12), (0, 2))]
+    cells = [64, 4, 4, 4]
+    ranks = morton_ranks(boxes, 2)
+    load = [
+        sum(c for c, r in zip(cells, ranks, strict=True) if r == k) for k in range(2)
+    ]
+    assert sum(load) == 76 and max(load) - min(load) <= 64
+    assert morton_ranks(boxes, 1) == [0, 0, 0, 0]
+    assert morton_ranks([], 3) == []
+    with pytest.raises(ValueError, match="size"):
+        morton_ranks(boxes, 0)
+
+
+def test_regrid_places_the_blocks_along_the_morton_curve() -> None:
+    mesh = AMRHierarchy(base_shape=(16, 16), placement="morton")
+    mesh.allocate_field("u", centering="node")
+    tags = function_tags(mesh, ring, levels=2)
+    new = mesh.regrid(tags, method="quadtree", block_size=8)
+    assert new.placement == "morton"
+    for level in (1, 2):
+        patches = new.patches_at_level(level)
+        expected = morton_ranks([p.box for p in patches], SIZE)
+        assert [p.ranks for p in patches] == [(r,) for r in expected]
+    # the next regrid keeps the placement; a patch added by hand is balanced
+    again = new.regrid(tags, method="quadtree", block_size=8, fill_halos=True)
+    assert again.placement == "morton"
+    added = again.add_patch(3, ((40, 48), (40, 48)))
+    assert len(added.ranks) == 1
+    with pytest.raises(ValueError, match="morton"):
+        AMRHierarchy(base_shape=(4, 4), placement="hilbert")

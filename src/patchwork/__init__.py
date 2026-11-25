@@ -19,6 +19,7 @@ from patchwork.mesh import (
     graded_nodes,
     gradient_tags,
     marker_tags,
+    morton_ranks,
     plot_patches,
     quadtree_boxes,
 )
@@ -91,6 +92,7 @@ __all__ = [
     "graded_nodes",
     "gradient_tags",
     "marker_tags",
+    "morton_ranks",
     "plot_patches",
     "quadtree_boxes",
     "solve_nodal_poisson",
