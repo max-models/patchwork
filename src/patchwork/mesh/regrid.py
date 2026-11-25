@@ -4,11 +4,19 @@ Three steps, each usable on its own:
 
 1. **Tagging** marks the cells of each level that need the next finer level:
    `gradient_tags` where a field changes by more than a threshold across a
-   cell, `function_tags` where a function of the position says so, or any
+   cell, `function_tags` where a function of the position says so,
+   `marker_tags` where a cell holds more than a number of markers, or any
    boolean array of a level's shape.
-2. **Clustering** (`cluster`, the Berger-Rigoutsos algorithm) covers the
-   tagged cells of a level with few boxes (intervals in 1D, rectangles in 2D), each at least ``efficiency``
-   full of tagged cells and at most ``max_size`` cells long.
+2. **Placing the patches**, in one of two ways:
+
+   - clustering (`cluster`, the Berger-Rigoutsos algorithm) covers the
+     tagged cells of a level with few boxes (intervals in 1D, rectangles in 2D),
+     each at least ``efficiency`` full of tagged cells and at most ``max_size``
+     cells long;
+   - a quadtree (an octree in 3D, `quadtree_boxes`) cuts every level into
+     aligned square blocks of ``block_size`` cells and refines each block that
+     holds a tag: the blocks of level ``k + 1`` are the children of those of
+     level ``k``, and every patch is one block.
 3. `AMRHierarchy.regrid` builds the
    new hierarchy from the boxes, level by level from the coarsest, and moves the
    fields into it: copied where an old patch of the same level was, else
@@ -84,6 +92,44 @@ def function_tags(
         shape = hierarchy.level_shape(level)
         values = np.asarray(function(*_centres(hierarchy, level)), dtype=bool)
         tags[level] = np.broadcast_to(values, shape) & _domain_cells(hierarchy, level)
+    return tags
+
+
+def marker_tags(
+    hierarchy: AMRHierarchy, *coordinates: Any, per_cell: float, levels: int
+) -> dict[int, np.ndarray]:
+    """Tag the cells of levels ``0 .. levels - 1`` that hold more than ``per_cell`` markers.
+
+    ``marker_tags(x, ...)`` in 1D, ``marker_tags(x, y, ...)`` in 2D: the
+    positions of this rank's markers (arrays of one shape). The markers are
+    counted in the cells of every level, whether a patch covers them or not, and
+    the counts are added over the ranks (collective over ``comm``), so every
+    rank gets the same tags. Refinement driven by these tags stops where the
+    cells of a level hold at most ``per_cell`` markers each, as a particle tree
+    stops splitting at its leaf capacity. Markers outside the domain (and in the
+    notch of an L) are not counted.
+    """
+    if len(coordinates) != hierarchy.ndim:
+        raise ValueError(
+            f"marker_tags takes {hierarchy.ndim} coordinate arrays, "
+            f"got {len(coordinates)}"
+        )
+    if levels < 0:
+        raise ValueError("levels must not be negative")
+    points = np.stack([np.ravel(np.asarray(c, dtype=float)) for c in coordinates])
+    if any(hierarchy.periodic):
+        points = points.copy()
+        hierarchy.wrap(points)
+    tags = {}
+    for level in range(levels):
+        edges = [
+            hierarchy.node_positions(level, axis) for axis in range(points.shape[0])
+        ]
+        counts, _ = np.histogramdd(points.T, bins=edges)
+        mine = np.ascontiguousarray(counts)
+        everyone = np.empty_like(mine)
+        hierarchy.comm.Allreduce(mine, everyone, op=MPI.SUM)
+        tags[level] = (everyone > per_cell) & _domain_cells(hierarchy, level)
     return tags
 
 
@@ -532,6 +578,140 @@ def new_boxes(
         if not boxes[level + 1]:
             del boxes[level + 1]
             break
+    return boxes
+
+
+def _refine(mask: np.ndarray, ratio: int) -> np.ndarray:
+    """The fine cells of every true coarse cell: ``mask`` repeated ``ratio`` times per axis."""
+    for axis in range(mask.ndim):
+        mask = np.repeat(mask, ratio, axis=axis)
+    return mask
+
+
+def _blocks(mask: np.ndarray, size: int) -> np.ndarray:
+    """Which aligned blocks of ``size`` cells per axis hold a true cell (a partial last block counts)."""
+    padded = np.zeros([-(-n // size) * size for n in mask.shape], dtype=bool)
+    padded[tuple(slice(0, n) for n in mask.shape)] = mask
+    return _coarsen(padded, size)
+
+
+def _block_cells(blocks: np.ndarray, size: int, shape: tuple[int, ...]) -> np.ndarray:
+    """The cells of the true blocks, cut to ``shape``."""
+    cells = _refine(blocks, size)
+    return cells[tuple(slice(0, n) for n in shape)]
+
+
+@method(
+    equations={
+        "blocks": r"B^{k}_{\mathbf m} = \prod_{d} [\, m_d b,\ (m_d + 1) b \,) \text{ (cells of level } k\text{)}, \quad \text{refined} \iff B^{k}_{\mathbf m} \text{ holds a tag of level } k - 1",
+        "children": r"B^{k+1}_{\mathbf m'} \subset B^{k}_{\mathbf m} \iff \lfloor \mathbf m' / r \rfloor = \mathbf m \quad (2^d \text{ children for } r = 2)",
+    },
+    assumptions=(
+        "each patch is one block of `block_size` cells of its level, aligned to multiples of `block_size`; the last block of a level may be shorter, and a block that crosses the edge of the domain or a forbidden cell is cut into rectangles of its allowed cells",
+        "a level is refined, with a margin of `nesting` cells, wherever a finer block needs it, so the blocks are properly nested (a balanced tree)",
+    ),
+    references=(
+        "[MacNeice et al., Comput. Phys. Commun. 126, 330 (2000)](https://doi.org/10.1016/S0010-4655(99)00501-9)",
+        "[Burstedde, Wilcox and Ghattas, SIAM J. Sci. Comput. 33, 1103 (2011)](https://doi.org/10.1137/100791634)",
+    ),
+)
+def quadtree_boxes(
+    hierarchy: AMRHierarchy,
+    tags: Mapping[int, np.ndarray],
+    *,
+    block_size: int,
+    buffer: int,
+    nesting: int,
+    min_patch_size: int = 1,
+    forbid: Any = None,
+) -> dict[int, list[IndexBox]]:
+    """The boxes of every refined level as the blocks of a quadtree (an octree in 3D).
+
+    Every level is cut into aligned blocks of ``block_size`` cells per axis.
+    A block of level ``k + 1`` is a patch when a tag of level ``k``, grown by
+    ``buffer`` cells, lies under it, or when a finer block needs it: each block
+    keeps ``nesting`` cells of the level below between itself and that level's
+    edge (the edge of the domain excepted), so the level below is refined
+    around it too. With a refinement ratio of two, the blocks of level ``k + 1``
+    under a block of level ``k`` are its four children (eight in 3D): the
+    patches are the nodes of a tree, all of one size, and the tree is balanced.
+
+    A block that crosses the edge of the domain (the notch of an L), a
+    forbidden cell (``forbid`` as for `AMRHierarchy.regrid`) or the margin
+    the level below needs is cut into rectangles of its allowed cells, which may
+    then be narrower than ``block_size``; ``min_patch_size`` widens those
+    pieces as `cluster` does. ``block_size`` is in cells of the new level and
+    must be a multiple of the refinement ratio.
+    """
+    ratio = hierarchy.refinement_ratio
+    periodic = hierarchy.periodic
+    if int(block_size) != block_size or block_size < ratio or block_size % ratio:
+        raise ValueError(
+            f"block_size must be a multiple of the refinement ratio {ratio}, "
+            f"got {block_size}"
+        )
+    if buffer < 0 or nesting < 0:
+        raise ValueError("buffer and nesting must not be negative")
+    if min_patch_size < 1:
+        raise ValueError("min_patch_size must be at least 1")
+    size = int(block_size) // ratio  # a block of level k + 1, in cells of level k
+    levels = [level for level, values in tags.items() if values.any()]
+    top = max(levels) + 1 if levels else 0
+    # top down: the blocks each level needs, for its own tags and the finer blocks
+    refined: dict[int, np.ndarray] = {}  # level k + 1 -> its blocks, over level k
+    margin: np.ndarray | None = None  # cells of level k the finer blocks need
+    for level in range(top - 1, -1, -1):
+        domain = _domain_cells(hierarchy, level)
+        need = _grow(
+            tags.get(level, np.zeros(domain.shape, dtype=bool)),
+            buffer,
+            periodic,
+            outside=False,
+        )
+        if margin is not None:
+            need |= _coarsen(margin, ratio)
+        need &= domain
+        refined[level + 1] = _blocks(need, size)
+        cells = _block_cells(refined[level + 1], size, domain.shape) & domain
+        margin = _grow(cells, nesting, periodic, outside=False)
+    # bottom up: each needed block, cut to the cells where its level may go
+    boxes: dict[int, list[IndexBox]] = {}
+    covered = _domain_cells(hierarchy, 0)
+    min_size = -(-min_patch_size // ratio)
+    for level in range(top):
+        domain = _domain_cells(hierarchy, level)
+        allowed = _shrink(covered | ~domain, nesting, periodic) & covered
+        forbidden = _forbidden_cells(hierarchy, forbid, level + 1)
+        if forbidden is not None:
+            allowed &= ~_coarsen(forbidden, ratio)
+        found: list[IndexBox] = []
+        for index in zip(*np.nonzero(refined[level + 1]), strict=True):
+            block = tuple(
+                (int(m) * size, min((int(m) + 1) * size, n))
+                for m, n in zip(index, domain.shape, strict=True)
+            )
+            inside = allowed[tuple(slice(lo, hi) for lo, hi in block)]
+            if inside.all():
+                parts = [block]
+            elif inside.any():
+                parts = [
+                    tuple(
+                        (lo + a, lo + b)
+                        for (lo, _), (a, b) in zip(block, part, strict=True)
+                    )
+                    for part in cluster(inside, 1.0, None, inside, min_size)
+                ]
+            else:
+                continue
+            found.extend(parts)
+        if not found:
+            break
+        boxes[level + 1] = [
+            tuple((lo * ratio, hi * ratio) for lo, hi in box) for box in sorted(found)
+        ]
+        covered = np.zeros(hierarchy.level_shape(level + 1), dtype=bool)
+        for box in boxes[level + 1]:
+            covered[tuple(slice(lo, hi) for lo, hi in box)] = True
     return boxes
 
 

@@ -7,6 +7,16 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Quadtree regridding: `AMRHierarchy.regrid(method="quadtree", block_size=16)` places the
+  patches as the blocks of a quadtree (an octree in 3D) instead of Berger-Rigoutsos clusters:
+  every level is cut into aligned square blocks of `block_size` cells, a block holding a tag is
+  a patch, the blocks of a level are the children of those below, and the tree is balanced by
+  the nesting margin. Blocks at the edge of the domain or of forbidden cells are cut to their
+  allowed cells. `quadtree_boxes` gives the boxes on their own. More cells are refined than
+  with clusters, but all patches have one size and a regrid keeps most of them. Tutorial
+  "Quadtree patches".
+- `marker_tags(hierarchy, x, y, per_cell=..., levels=...)`: tag the cells that hold more than
+  `per_cell` markers, counted over all ranks.
 - Graded axes: `AMRHierarchy(axis_nodes=...)` takes, per axis, `None` (uniform) or the
   physical positions of the base nodes. The map from the logical coordinate (the one of the
   patches, levels and kernels) to the physical one is linear in every base cell, so every leaf

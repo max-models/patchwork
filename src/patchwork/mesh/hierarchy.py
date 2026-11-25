@@ -987,6 +987,8 @@ class AMRHierarchy:
         self,
         tags: Mapping[int, Any],
         *,
+        method: str = "cluster",
+        block_size: int = 16,
         efficiency: float = 0.7,
         buffer: int = 1,
         nesting: int = 1,
@@ -1005,9 +1007,19 @@ class AMRHierarchy:
         from the data it holds, and the tags are combined over the ranks.
 
         Level by level from the coarsest, the tagged cells, grown by
-        ``buffer`` cells, are covered with boxes by
-        `cluster` (at least ``efficiency`` of their
-        cells tagged, at most ``max_patch_size`` cells of the new level long).
+        ``buffer`` cells, are covered with boxes. ``method`` says how:
+
+        - ``"cluster"`` (the default): by `cluster`, the Berger-Rigoutsos
+          algorithm (at least ``efficiency`` of their cells tagged, at most
+          ``max_patch_size`` cells of the new level long): few patches, fitted
+          to the tags;
+        - ``"quadtree"``: by `quadtree_boxes`, the blocks of a quadtree (an
+          octree in 3D), square patches of ``block_size`` cells of their level,
+          aligned so that the blocks of a level are the children of those of the
+          level below: more patches, all of one size, and a block is added or
+          removed without moving the others. ``efficiency`` and
+          ``max_patch_size`` do not apply.
+
         A level also covers, with a margin, what the finer levels need, and
         each patch keeps ``nesting`` cells of the level below between itself
         and that level's edge (the edge of the domain excepted). The base level
@@ -1037,19 +1049,42 @@ class AMRHierarchy:
         the largest first. Collective over ``comm``; this hierarchy is left as
         it is, except for the restriction of conservative fields.
         """
-        from patchwork.mesh.regrid import combine_tags, new_boxes, transfer
-
-        combined = combine_tags(self, tags)
-        boxes = new_boxes(
-            self,
-            combined,
-            efficiency=efficiency,
-            buffer=buffer,
-            nesting=nesting,
-            max_patch_size=max_patch_size,
-            min_patch_size=min_patch_size,
-            forbid=forbid,
+        from patchwork.mesh.regrid import (
+            combine_tags,
+            new_boxes,
+            quadtree_boxes,
+            transfer,
         )
+
+        if method not in ("cluster", "quadtree"):
+            raise ValueError(f"method must be 'cluster' or 'quadtree', got {method!r}")
+        if method == "quadtree" and max_patch_size is not None:
+            raise ValueError(
+                "max_patch_size does not apply to method='quadtree': "
+                "every patch is one block of block_size cells"
+            )
+        combined = combine_tags(self, tags)
+        if method == "quadtree":
+            boxes = quadtree_boxes(
+                self,
+                combined,
+                block_size=block_size,
+                buffer=buffer,
+                nesting=nesting,
+                min_patch_size=min_patch_size,
+                forbid=forbid,
+            )
+        else:
+            boxes = new_boxes(
+                self,
+                combined,
+                efficiency=efficiency,
+                buffer=buffer,
+                nesting=nesting,
+                max_patch_size=max_patch_size,
+                min_patch_size=min_patch_size,
+                forbid=forbid,
+            )
         base = self.patches_at_level(0)
         new = AMRHierarchy.__new__(AMRHierarchy)
         new._communicators = self._communicators

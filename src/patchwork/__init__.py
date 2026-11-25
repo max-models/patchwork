@@ -18,7 +18,9 @@ from patchwork.mesh import (
     function_tags,
     graded_nodes,
     gradient_tags,
+    marker_tags,
     plot_patches,
+    quadtree_boxes,
 )
 from patchwork.solvers import (
     AMGBackend,
@@ -86,9 +88,11 @@ __all__ = [
     "cell_body",
     "cluster",
     "function_tags",
-    "gradient_tags",
     "graded_nodes",
+    "gradient_tags",
+    "marker_tags",
     "plot_patches",
+    "quadtree_boxes",
     "solve_nodal_poisson",
     "solve_poisson",
 ]

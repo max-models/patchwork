@@ -56,7 +56,9 @@ A hierarchy can also be the axisymmetric r–z plane
 `regrid` places the patches itself: tag the cells that need finer cells
 (by a field’s change across a cell, a function of the position, or by
 hand), and it covers them with properly nested patches (Berger-Rigoutsos
-clustering) and moves the fields over.
+clustering, or the blocks of a quadtree with `method="quadtree"`) and
+moves the fields over; `marker_tags` tags the cells that hold too many
+markers.
 
 Markers live on the patches too: `locate` finds the finest patch of each
 point (a compiled kernel with the `pyccel` extra), `owner` and `migrate`

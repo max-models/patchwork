@@ -35,6 +35,9 @@ Step by step, from a first hierarchy to stencils on patches:
 12. [Graded axes](/patchwork/examples/12-graded-axes/): cells that grow smoothly away from a wall
     (`axis_nodes`), a boundary layer resolved with a few dozen cells, and grading combined with
     patches.
+13. [Quadtree patches](/patchwork/examples/13-quadtree-patches/): `regrid(method="quadtree")`,
+    patches as the equal blocks of a quadtree, refinement by the number of markers per cell
+    (`marker_tags`), and how much of the mesh a regrid keeps.
 
 Every notebook in `tutorials/` is executed when the site is built and published here with its
 outputs. Download a notebook from its page to run the steps yourself.
