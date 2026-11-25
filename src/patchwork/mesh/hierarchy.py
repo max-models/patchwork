@@ -93,6 +93,26 @@ def _gather_blocks(
 _GATHER_TAG = 7311
 
 
+def _by_patch(found: Any) -> Iterator[tuple[int, Any]]:
+    """The markers of each patch: ``(patch number, their indices)``, in the order of the patches.
+
+    One stable sort of the patch numbers (``-1``, outside the domain, left out),
+    instead of a scan of all markers for every patch; the indices of a patch are
+    in increasing order.
+    """
+    import numpy as np
+
+    if not found.size:
+        return
+    order = np.argsort(found, kind="stable")
+    ordered = found[order]
+    numbers, starts = np.unique(ordered, return_index=True)
+    ends = np.append(starts[1:], ordered.size)
+    for number, start, end in zip(numbers, starts, ends, strict=True):
+        if number >= 0:
+            yield int(number), order[start:end]
+
+
 @dataclass
 class Patch:
     """One rectangular patch; its box uses level-local, half-open cell indices.
@@ -1399,15 +1419,14 @@ class AMRHierarchy:
         blocks = self._schedule("blocks", name, _gather_blocks)
         patches = self.patches
         result = np.full(found.shape, -1, dtype=np.int64)
-        for number in np.unique(found[found >= 0]):
-            members, replicated = blocks[int(number)]
+        for number, chosen in _by_patch(found):
+            members, replicated = blocks[number]
             if replicated:
                 raise ValueError(
                     f"field {name!r} is replicated (split=None) on the several ranks "
                     f"of the level-{patches[number].level} patch {patches[number].box}: "
                     "a point has no owner; allocate it with split=0"
                 )
-            chosen = np.flatnonzero(found == number)
             local = [
                 c[chosen] - lo
                 for c, (lo, _) in zip(cell, patches[number].box, strict=True)
@@ -1663,8 +1682,7 @@ class AMRHierarchy:
             for patch in self.local_patches:
                 patch.field(name).local_with_halos[...] = 0.0
         patches = self.patches
-        for number in np.unique(found[found >= 0]):
-            chosen = np.flatnonzero(found == number)
+        for number, chosen in _by_patch(found):
             storage, grid = self._patch_block(patches[number], name, shape.degree)
             positions = np.array([w[chosen] for w in wrapped])
             # the kernels take the nodes component-last: a view with one component
@@ -1707,8 +1725,7 @@ class AMRHierarchy:
             )
         values = np.zeros(flat[0].size)
         patches = self.patches
-        for number in np.unique(found[found >= 0]):
-            chosen = np.flatnonzero(found == number)
+        for number, chosen in _by_patch(found):
             storage, grid = self._patch_block(patches[number], name, weights.degree)
             positions = np.array([w[chosen] for w in wrapped])
             result = np.zeros((1, chosen.size))

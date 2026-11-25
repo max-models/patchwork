@@ -116,6 +116,18 @@ def main() -> None:
             **options,
         )
 
+    # one untimed cycle: the compiled kernels load at their first call
+    mx, my, mq = mesh.migrate(x, y, q, name="rho")
+    mesh.deposit(mx, my, mq, "rho")
+    mesh.accumulate_halos("rho")
+    field = "rho"
+    if args.solve:
+        solver = NodalPoisson(mesh)
+        solver.solve(solver.nodes.from_patches("rho"), potential="phi")
+        field = "phi"
+    mesh.exchange_halos(field)
+    mesh.interpolate(mx, my, field)
+
     kept, patches, cells, held = [], [], [], []
     previous = {(p.level, p.box) for p in mesh.patches if p.level}
     for step in range(1, args.steps + 1):
