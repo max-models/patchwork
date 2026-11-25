@@ -96,25 +96,36 @@ class Accumulation:
             members, replicated = blocks[number]
             if len(members) == 1 and not replicated:
                 single[number] = members[0][0]
-        # per local patch: the storage of the nodes that move, and where each goes
+        # per local patch: the storage of the nodes that move, and where each goes;
+        # the nodes of all local patches at once, then split by patch
         self._moves: list[dict[str, Any]] = []
-        for number, patch in enumerate(patches):
-            if not patch.is_local:
-                continue
-            array = patch.field(name)
-            node = np.meshgrid(
-                *(np.arange(b0, b1) for b0, b1 in array.layout.index_bounds),
-                indexing="ij",
+        local = [(n, p) for n, p in enumerate(patches) if p.is_local]
+        arrays = [patch.field(name) for _, patch in local]
+        if local:
+            numbers = np.array([n for n, _ in local], dtype=np.int64)
+            first = np.array(
+                [[b0 for b0, _ in a.layout.index_bounds] for a in arrays],
+                dtype=np.int64,
+            ).reshape(len(local), ndim)
+            shape = np.array(
+                [[b1 - b0 for b0, b1 in a.layout.index_bounds] for a in arrays],
+                dtype=np.int64,
+            ).reshape(len(local), ndim)
+            sizes_local = np.prod(shape, axis=1)
+            which = np.repeat(np.arange(len(local)), sizes_local)  # local patch
+            rest = np.arange(which.size) - np.repeat(
+                np.cumsum(sizes_local) - sizes_local, sizes_local
             )
-            index = [
-                lower[number][axis] + node[axis] for axis in range(ndim)
-            ]  # level indices
-            key = [
-                (index[axis] * span[number]) % lattice[axis]
-                if periodic[axis]
-                else index[axis] * span[number]
-                for axis in range(ndim)
-            ]
+            node = [np.empty(0, dtype=np.int64)] * ndim  # in the patch's indices
+            for axis in range(ndim - 1, -1, -1):
+                span_axis = shape[which, axis]
+                node[axis] = first[which, axis] + rest % span_axis
+                rest = rest // span_axis
+            number = numbers[which]
+            key = []
+            for axis in range(ndim):
+                value = (lower[number, axis] + node[axis]) * span[number]
+                key.append(value % lattice[axis] if periodic[axis] else value)
             owner = table[tuple(key)].astype(np.int64)
             if (owner < 0).any():
                 raise RuntimeError(
@@ -140,13 +151,12 @@ class Accumulation:
             moving = owner != number
             for axis in range(ndim):
                 moving |= target[axis] != node[axis]
-            where = np.nonzero(moving)
-            owners = owner[where]
-            at = [values[where] for values in target]
+            chosen_all = np.flatnonzero(moving)
+            owners_all = owner[chosen_all]
             # an owner on one rank: that rank; else the rank whose block has the node
-            destination = single[owners]
-            several = np.flatnonzero(destination < 0)
-            for held, part in _by_patch(owners[several]):
+            destination_all = single[owners_all]
+            several = np.flatnonzero(destination_all < 0)
+            for held, part in _by_patch(owners_all[several]):
                 chosen = several[part]
                 members, replicated = blocks[held]
                 if replicated:
@@ -156,22 +166,29 @@ class Accumulation:
                     )
                 for rank, bounds in members:
                     inside = np.ones(chosen.size, dtype=bool)
-                    for values, (a0, a1) in zip(at, bounds, strict=True):
-                        inside &= (values[chosen] >= a0) & (values[chosen] < a1)
-                    destination[chosen[inside]] = rank
-            halo = array.layout.halo
-            self._moves.append(
-                {
-                    "patch": number,
-                    "array": array,
-                    "storage": tuple(
-                        values + h for values, h in zip(where, halo, strict=True)
-                    ),
-                    "destination": destination,
-                    "owner": owners.astype(np.int64),
-                    "node": tuple(values.astype(np.int64) for values in at),
-                }
-            )
+                    for axis, (a0, a1) in enumerate(bounds):
+                        values = target[axis][chosen_all[chosen]]
+                        inside &= (values >= a0) & (values < a1)
+                    destination_all[chosen[inside]] = rank
+            bounds_of = np.searchsorted(which[chosen_all], np.arange(len(local) + 1))
+            for k, ((patch_number, _), array) in enumerate(
+                zip(local, arrays, strict=True)
+            ):
+                part = chosen_all[bounds_of[k] : bounds_of[k + 1]]
+                halo = array.layout.halo
+                self._moves.append(
+                    {
+                        "patch": patch_number,
+                        "array": array,
+                        "storage": tuple(
+                            node[axis][part] - first[k, axis] + halo[axis]
+                            for axis in range(ndim)
+                        ),
+                        "destination": destination_all[bounds_of[k] : bounds_of[k + 1]],
+                        "owner": owner[part],
+                        "node": tuple(target[axis][part] for axis in range(ndim)),
+                    }
+                )
         # where the received charge goes: the block of every local patch, as the
         # offset from a node's index in the patch to its place in the storage
         self._local: dict[int, tuple[Any, tuple[int, ...]]] = {}
