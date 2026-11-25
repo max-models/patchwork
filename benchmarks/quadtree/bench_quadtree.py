@@ -82,6 +82,11 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--speed", type=float, default=0.01, help="beam shift per step")
     parser.add_argument("--no-solve", dest="solve", action="store_false")
+    parser.add_argument(
+        "--move-fields",
+        action="store_true",
+        help="move the fields at every regrid (default: none, they are recomputed)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -93,6 +98,10 @@ def main() -> None:
         if args.method == "quadtree"
         else {"method": "cluster", "max_patch_size": args.max_patch_size}
     )
+    if (
+        not args.move_fields
+    ):  # the charge is deposited again and the potential solved for
+        options["fields"] = []
     mesh = AMRHierarchy(
         base_shape=(args.base, args.base),
         placement=args.placement,

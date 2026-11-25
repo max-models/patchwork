@@ -7,6 +7,12 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `regrid(..., fields=[...])`: the fields whose values are moved (default: all); the others
+  are allocated on the new hierarchy and zero.
+- `CompositeNodes` finds the cells under finer patches from one coverage mask per level (it
+  compared every patch with every patch of the next level); the `accumulate_halos` schedule
+  takes the rank of a node's owner from a table; halo copies between two patches are kept
+  per pair across regrids; `in_domain` is a bounds check where the domain fills its box.
 - `deposit`, `interpolate`, `owner` and `migrate` group the markers by patch with one sort
   instead of a scan of all markers per patch, and `marker_counts` histograms only the finest
   level and sums it into the coarser ones: the quadtree benchmark's cycle 20-27% faster

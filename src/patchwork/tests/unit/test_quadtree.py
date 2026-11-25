@@ -462,3 +462,24 @@ def test_marker_counts_of_every_level_are_its_own_histogram(graded) -> None:
         edges = [mesh.node_positions(level, a) for a in range(2)]
         expected, _ = np.histogramdd(np.stack([x, y]).T, bins=edges)
         np.testing.assert_array_equal(found, WORLD.allreduce(expected))
+
+
+def test_regrid_moves_only_the_fields_asked_for() -> None:
+    mesh = AMRHierarchy(base_shape=(8, 8))
+    mesh.allocate_field("u", centering="node")
+    mesh.allocate_field("rho", conservative=True)
+    for patch in mesh.local_patches:
+        patch.field("u").local[...] = 1.0
+        patch.field("rho").local[...] = 2.0
+    tags = function_tags(mesh, lambda x, y: x < 0.5, levels=1)
+    moved = mesh.regrid(tags, fields=["u"])
+    assert moved.field_names == mesh.field_names
+    for patch in moved.local_patches:
+        assert np.all(patch.field("u").local == 1.0)
+        assert not np.any(patch.field("rho").local)
+    assert all(
+        np.all(p.field("rho").local == 2.0)
+        for p in mesh.regrid(tags, fields=None).local_patches
+    )
+    with pytest.raises(KeyError, match="phi"):
+        mesh.regrid(tags, fields=["phi"])
