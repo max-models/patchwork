@@ -13,9 +13,12 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   the least loaded rank). `cost` may also map a patch `(level, box)` to a measured cost, which
   `deposit(..., times=...)` and `interpolate(..., times=...)` collect per patch;
   `rebalance(cost, placement=...)` places by any of them.
-- The cloud-in-cell `deposit` and `interpolate` add the markers of all patches in one pass
-  (one `bincount` into a buffer of the blocks; higher B-spline degrees keep mpifield's kernels
-  per patch); a marker's owner comes from a table where its patch is on one rank; the halo
+- `deposit` and `interpolate` add the markers of all patches in one pass into a buffer of the
+  blocks: cloud-in-cell by one `bincount`, the quadratic and cubic B-splines in one compiled
+  call (the new `scatter_blocks` and `gather_blocks` kernels, with mpifield's `spline_cell`;
+  10-35% faster than mpifield's kernels patch by patch); other shapes keep their kernels per
+  patch. The `accumulate_halos` schedule is built from the nodes of all local patches at once
+  (68 to 11 ms on the quadtree benchmark's 8-cell blocks); a marker's owner comes from a table where its patch is on one rank; the halo
   signatures test all patches of a level at once.
 - `regrid(..., fields=[...])`: the fields whose values are moved (default: all); the others
   are allocated on the new hierarchy and zero.
