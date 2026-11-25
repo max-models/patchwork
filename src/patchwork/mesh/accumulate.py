@@ -87,9 +87,15 @@ class Accumulation:
                 axes.append(index % lattice[axis] if periodic[axis] else index)
             table[np.ix_(*axes)] = number
 
-        from patchwork.mesh.hierarchy import _gather_blocks
+        from patchwork.mesh.hierarchy import _by_patch, _gather_blocks
 
         blocks = hierarchy._schedule("blocks", name, _gather_blocks)
+        # the rank of every patch held by one rank (-1 for several)
+        single = np.full(len(patches), -1, dtype=np.int64)
+        for number in range(len(patches)):
+            members, replicated = blocks[number]
+            if len(members) == 1 and not replicated:
+                single[number] = members[0][0]
         # per local patch: the storage of the nodes that move, and where each goes
         self._moves: list[dict[str, Any]] = []
         for number, patch in enumerate(patches):
@@ -137,15 +143,17 @@ class Accumulation:
             where = np.nonzero(moving)
             owners = owner[where]
             at = [values[where] for values in target]
-            destination = np.empty(owners.size, dtype=np.int64)
-            for held in np.unique(owners):
-                members, replicated = blocks[int(held)]
+            # an owner on one rank: that rank; else the rank whose block has the node
+            destination = single[owners]
+            several = np.flatnonzero(destination < 0)
+            for held, part in _by_patch(owners[several]):
+                chosen = several[part]
+                members, replicated = blocks[held]
                 if replicated:
                     raise ValueError(
                         f"field {name!r} is replicated (split=None) on the several ranks "
                         f"of a patch: allocate it with split=0 to accumulate"
                     )
-                chosen = np.flatnonzero(owners == held)
                 for rank, bounds in members:
                     inside = np.ones(chosen.size, dtype=bool)
                     for values, (a0, a1) in zip(at, bounds, strict=True):

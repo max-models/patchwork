@@ -997,6 +997,7 @@ class AMRHierarchy:
         placement: Any,
         cost: Mapping[int, Any] | None,
         fill_halos: bool,
+        fields: Sequence[str] | None = None,
     ) -> AMRHierarchy:
         """A hierarchy with this base and the refined ``boxes``, with the fields moved over."""
         from patchwork.mesh.regrid import transfer
@@ -1038,10 +1039,16 @@ class AMRHierarchy:
             for level in sorted(boxes):
                 for box in sorted(boxes[level], key=lambda b: -_shared_cells(b, b)):
                     new.add_patch(level, box)
+        moved = set(self._field_specs if fields is None else fields)
+        unknown = moved - set(self._field_specs)
+        if unknown:
+            raise KeyError(f"hierarchy has no field {sorted(unknown)[0]!r}")
         for name, spec in self._field_specs.items():
+            new.allocate_field(name, **spec)
+            if name not in moved:
+                continue  # allocated, zero
             if spec["conservative"]:
                 self.restrict(name)
-            new.allocate_field(name, **spec)
             transfer(self, new, name)
         if fill_halos:
             for name in new.field_names:
@@ -1085,6 +1092,7 @@ class AMRHierarchy:
         placement: str | Callable[[int, IndexBox], Any] | None = None,
         cost: Mapping[int, Any] | None = None,
         fill_halos: bool = False,
+        fields: Sequence[str] | None = None,
     ) -> AMRHierarchy:
         """A new hierarchy with patches over the tagged cells, and the fields moved to it.
 
@@ -1120,7 +1128,11 @@ class AMRHierarchy:
         fine cells of a coarse cell keep its mean: its `integral` is the
         same before and after. Halos are not filled unless ``fill_halos``
         (then `exchange_halos` runs for every field of the new
-        hierarchy).
+        hierarchy). ``fields`` names the fields whose values are moved
+        (default: all); the others are allocated on the new hierarchy and
+        zero, which saves the transfer of a field that is computed again
+        right after the regrid, such as a charge deposited from the markers
+        or a potential solved for.
 
         ``min_patch_size`` is the shortest side a patch may have, in cells of
         its own level (rounded up to whole cells of the level below): a patch
@@ -1178,7 +1190,7 @@ class AMRHierarchy:
                 min_patch_size=min_patch_size,
                 forbid=forbid,
             )
-        return self._rebuilt(boxes, placement, cost, fill_halos)
+        return self._rebuilt(boxes, placement, cost, fill_halos, fields)
 
     @sp.profile("patchwork.rebalance", tags=PROFILE_TAGS)
     def rebalance(

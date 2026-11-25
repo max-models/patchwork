@@ -370,20 +370,24 @@ class CompositeNodes:
         self._spacing = np.asarray(hierarchy.spacing(finest), dtype=float)
         self._origin = np.asarray(hierarchy.lower_bound, dtype=float)
 
+        # the cells of every level under a finer patch (one may lie over several patches)
+        under = {}
+        for level in range(finest):
+            mask = np.zeros(hierarchy.level_shape(level), dtype=bool)
+            for child in hierarchy.patches_at_level(level + 1):
+                mask[tuple(slice(c0 // ratio, c1 // ratio) for c0, c1 in child.box)] = (
+                    True
+                )
+            under[level] = mask
         lowers, spans, owners = [], [], []
         for patch in hierarchy.patches:
             span = ratio ** (finest - patch.level)
-            covered = np.zeros(patch.shape, dtype=bool)
-            for child in hierarchy.patches_at_level(patch.level + 1):
-                # a finer patch may lie over several patches of this level
-                covered[
-                    tuple(
-                        slice(
-                            max(c0 // ratio, i0) - i0, max(min(c1 // ratio, i1) - i0, 0)
-                        )
-                        for (c0, c1), (i0, i1) in zip(child.box, patch.box, strict=True)
-                    )
-                ] = True
+            if patch.level in under:
+                covered = under[patch.level][
+                    tuple(slice(i0, i1) for i0, i1 in patch.box)
+                ]
+            else:
+                covered = np.zeros(patch.shape, dtype=bool)
             index = np.nonzero(~covered)
             lowers.append(
                 np.column_stack(

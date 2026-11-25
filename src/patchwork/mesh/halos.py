@@ -120,6 +120,7 @@ class _Points:
         self.ratio = hierarchy.refinement_ratio
         self.periodic = hierarchy.periodic
         self._domains: dict[int, np.ndarray] = {}
+        self._wholes: dict[int, bool] = {}
         self._indices: dict[int, tuple[tuple[Patch, ...], _BoxIndex]] = {}
 
     def own(self, patch: Patch) -> Box:
@@ -164,6 +165,12 @@ class _Points:
             self._domains[level] = cells
         return self._domains[level]
 
+    def _whole(self, level: int) -> bool:
+        """Whether the domain fills the box of the level (no notch)."""
+        if level not in self._wholes:
+            self._wholes[level] = bool(self._domain(level).all())
+        return self._wholes[level]
+
     def in_domain(self, level: int, *index: np.ndarray) -> np.ndarray:
         """Whether points (level indices, possibly beyond the domain) are in it.
 
@@ -172,6 +179,13 @@ class _Points:
         """
         cells = self._domain(level)
         shape = cells.shape
+        if self._whole(level):  # the domain fills its box: a bounds check
+            inside = np.ones(index[0].shape, dtype=bool)
+            top = 1 if self.nodal else 0
+            for axis, values in enumerate(index):
+                if not self.periodic[axis]:
+                    inside &= (values >= 0) & (values < shape[axis] + top)
+            return inside
         offsets = (
             itertools.product((0, -1), repeat=len(index))
             if self.nodal
@@ -569,18 +583,25 @@ class HaloExchange:
     def _coarse_field(self, patch: Patch) -> Any:
         return patch.field(self._below) if patch.is_local else None
 
-    def _same_level(self, points: _Points, patch: Patch, copies: list) -> np.ndarray:
-        """Copies from the patches of the same level; the halo points they cover."""
-        own = points.own(patch)
-        width = self._width
-        extended = tuple((lo - width, hi + width) for lo, hi in own)
-        covered = np.zeros([hi - lo for lo, hi in extended], dtype=bool)
-        covered[(slice(width, -width),) * len(own)] = True
-        origin = tuple(lo for lo, _ in own)
-        for other in points.near(patch.level, extended):
+    def _pair(
+        self, points: _Points, patch: Patch, other: Patch, extended: Box
+    ) -> list[tuple]:
+        """The copies from ``other`` into the halo of ``patch`` (same level), found once.
+
+        ``(source box, target box, covered slices)`` for every part, across periodic
+        faces too. They depend on the two boxes only, so they are kept by the pair
+        on the hierarchy and handed on by `AMRHierarchy.regrid`.
+        """
+        key = (patch.level, patch.box, other.box)
+        found = self._pairs_known.get(key)
+        if found is None:
+            own = points.own(patch)
+            width = self._width
+            origin = tuple(lo for lo, _ in own)
             other_origin = tuple(lo for lo, _ in points.own(other))
+            found = []
             for shift in points.shifts(patch.level):
-                if other is patch and not any(shift):
+                if other.box == patch.box and not any(shift):
                     continue
                 theirs = _shift(points.own(other), shift)
                 for frame in _frame(own, width):
@@ -592,15 +613,25 @@ class HaloExchange:
                         tuple(-d - o for d, o in zip(shift, other_origin, strict=True)),
                     )
                     target = _shift(part, tuple(-o for o in origin))
-                    copies.append(
-                        (self._field(other), source, self._field(patch), target)
+                    cover = tuple(
+                        slice(s - e0, t - e0)
+                        for (s, t), (e0, _) in zip(part, extended, strict=True)
                     )
-                    covered[
-                        tuple(
-                            slice(s - e0, t - e0)
-                            for (s, t), (e0, _) in zip(part, extended, strict=True)
-                        )
-                    ] = True
+                    found.append((source, target, cover))
+        self._pairs_used[key] = found
+        return found
+
+    def _same_level(self, points: _Points, patch: Patch, copies: list) -> np.ndarray:
+        """Copies from the patches of the same level; the halo points they cover."""
+        own = points.own(patch)
+        width = self._width
+        extended = tuple((lo - width, hi + width) for lo, hi in own)
+        covered = np.zeros([hi - lo for lo, hi in extended], dtype=bool)
+        covered[(slice(width, -width),) * len(own)] = True
+        for other in points.near(patch.level, extended):
+            for source, target, cover in self._pair(points, patch, other, extended):
+                copies.append((self._field(other), source, self._field(patch), target))
+                covered[cover] = True
         return covered
 
     def _coarse_fine(
@@ -770,6 +801,8 @@ class HaloExchange:
         dtype = spec["dtype"]
         kind = ("halo", nodal, self._width, np.dtype(dtype).str, repr(spec["split"]))
         known = hierarchy._halo_records.get(kind, {})
+        self._pairs_known = hierarchy._halo_records.get(("pairs", *kind), {})
+        self._pairs_used: dict[tuple, list] = {}
         used: dict[tuple, _HaloRecord] = {}
         patches = {_key(patch): patch for patch in hierarchy.patches}
         for patch in hierarchy.patches if self._width else ():
@@ -783,6 +816,11 @@ class HaloExchange:
             self._bind(record, patch, patches, dtype)
         # keep the records of this mesh (all of them after a full build)
         hierarchy._halo_records[kind] = used if level is None else {**known, **used}
+        pairs = self._pairs_used
+        if level is not None:
+            pairs = {**self._pairs_known, **pairs}
+        hierarchy._halo_records[("pairs", *kind)] = pairs
+        del self._pairs_known, self._pairs_used
         self._plan = mpa.CopyPlan(self._copies, comm=hierarchy.comm)
         del self._copies
 
