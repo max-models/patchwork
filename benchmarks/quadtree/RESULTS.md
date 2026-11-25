@@ -170,6 +170,36 @@ other at once. Serial, median of 3 runs, ms per step:
   neighbourhood changed, one per patch, and their copies), the regrid (94: the boxes and
   the new hierarchy) and the deposit (70, of which the `accumulate_halos` schedule ~35).
 
+## Higher spline degrees and the accumulation schedule (2026-11-25, final)
+
+Serial, with the solve, 3 repeats each, `devel` against the branch that deposits and
+gathers the quadratic and cubic B-splines of all patches in one compiled call
+(`scatter_blocks`, `gather_blocks`) and builds the `accumulate_halos` schedule from the
+nodes of all local patches at once (times in ms per step):
+
+| mesh | | deposit | solver | halos | gather | total |
+|---|---|---|---|---|---|---|
+| cluster | before | 27.4 | 111.8 | 6.6 | 24.3 | 225 |
+| | after | 30.9 | 120.4 | 6.6 | 26.4 | 242 |
+| cluster, `max_patch_size=16` | before | 41.4 | 119.4 | 84.5 | 26.8 | 351 |
+| | after | 38.9 | 125.7 | 92.9 | 30.1 | 378 |
+| quadtree, block 8 | before | 65.0 | 108.3 | 101.2 | 27.7 | 465 |
+| | after | 48.2 | 108.5 | 109.1 | 27.7 | 460 |
+| quadtree, block 16 | before | 39.2 | 128.2 | 39.9 | 25.7 | 307 |
+| | after | 34.8 | 130.6 | 38.7 | 26.6 | 305 |
+| quadtree, block 32 | before | 33.5 | 212.5 | 17.8 | 25.1 | 355 |
+| | after | 34.5 | 217.5 | 16.7 | 26.7 | 363 |
+
+- The benchmark deposits cloud-in-cell, which keeps its `bincount` path; what changes there
+  is the accumulation schedule: the deposit of blocks of 8 goes from 65 to 48 ms (the
+  schedule from 68 to 11 ms when built alone). The other differences are noise: the solver
+  setup, which neither branch touches, differs by up to 8% between the runs.
+- With the quadratic and cubic B-splines (one rank, the 386 blocks of 8, 200 000 markers),
+  one compiled call over all patches against mpifield's kernels patch by patch: deposit
+  58 → 50 ms (degree 2) and 60 → 61 ms (degree 3), gather 74 → 49 and 57 → 51 ms. For
+  cloud-in-cell the compiled call lost to the `bincount` (gather 24 → 38 ms), so it is
+  used for degrees 2 and 3 only.
+
 ## Fixed on the way
 
 The regrid's transfer compared every new patch with every old one of its level, and copied
