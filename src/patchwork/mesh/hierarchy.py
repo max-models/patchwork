@@ -1839,9 +1839,10 @@ class AMRHierarchy:
                 found, wrapped, name, shape.degree
             )
             buffer = np.zeros(total)
-            scatter_blocks(
-                rel, count, stride, base, charge[inside], shape.degree, buffer
-            )
+            if inside.size:  # Pyccel's slices refuse empty arrays
+                scatter_blocks(
+                    rel, count, stride, base, charge[inside], shape.degree, buffer
+                )
             for _, offset, storage in blocks:
                 storage += buffer[offset : offset + storage.size].reshape(storage.shape)
             if times is not None:
@@ -1911,7 +1912,10 @@ class AMRHierarchy:
             for _, offset, storage in blocks:
                 buffer[offset : offset + storage.size] = np.asarray(storage).reshape(-1)
             gathered = np.zeros(inside.size)
-            gather_blocks(rel, count, stride, base, weights.degree, buffer, gathered)
+            if inside.size:  # Pyccel's slices refuse empty arrays
+                gather_blocks(
+                    rel, count, stride, base, weights.degree, buffer, gathered
+                )
             values[inside] = gathered
             if times is not None:
                 _share_time(times, patches, found[inside], time.perf_counter() - begin)

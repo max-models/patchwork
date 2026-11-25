@@ -493,3 +493,13 @@ def test_one_pass_deposit_and_gather_equal_the_kernels_patch_by_patch(
         )
         expected_gather[chosen] = result[0]
     np.testing.assert_allclose(gathered, expected_gather, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("degree", [1, 2, 3])
+def test_a_rank_without_markers_deposits_and_gathers_nothing(degree) -> None:
+    mesh = AMRHierarchy(base_shape=(8, 8))
+    mesh.allocate_field("q", centering="node", halo=2)
+    empty = np.zeros(0)
+    mesh.deposit(empty, empty, empty, "q", splines=degree)
+    assert mesh.interpolate(empty, empty, "q", splines=degree).size == 0
+    assert all(not np.any(p.field("q").local) for p in mesh.local_patches)
