@@ -4,7 +4,8 @@
     python benchmarks/quadtree/run.py --out /tmp/quadtree --ranks 4  # halos, deposit, regrid
 
 Every configuration runs ``--repeats`` times under ``scope-profiler run``; the table gives
-the median over the repeats of the mean time per step of each region (ms), and the mesh of
+the median over the repeats of the mean time per step of each region (ms; under MPI on the
+rank where it is largest), and the mesh of
 the JSON line of the run: patches, refined cells, the share of patches a regrid keeps and
 the load imbalance (largest cells per rank over the mean). Profiles are written to ``--out``.
 """
@@ -53,21 +54,20 @@ def run_once(arguments: list[str], ranks: int, output: Path) -> tuple[dict, dict
         for line in result.stdout.splitlines()
         if line.startswith("{") and '"method"' in line
     )
-    inspected = subprocess.run(
-        [str(PROFILER), "inspect", str(output), "--json", "--top", "50"],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    regions = json.loads(inspected.stdout)["regions"]["items"]
-    times = {}
-    for region in regions:
-        name = region["name"]
-        if name.startswith("quadtree_bench."):
-            # the slowest rank's mean per call
-            times[name.split(".", 1)[1]] = (
-                1e3 * region["max"] if ranks > 1 else 1e3 * region["avg"]
-            )
+    times: dict[str, float] = {}
+    for rank in range(ranks):  # the slowest rank's mean per step of each part
+        inspected = subprocess.run(
+            [str(PROFILER), "inspect", str(output), "--json", "--top", "50"]
+            + (["--ranks", str(rank)] if ranks > 1 else []),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        for region in json.loads(inspected.stdout)["regions"]["items"]:
+            name = region["name"]
+            if name.startswith("quadtree_bench."):
+                part = name.split(".", 1)[1]
+                times[part] = max(times.get(part, 0.0), 1e3 * region["avg"])
     return mesh, times
 
 

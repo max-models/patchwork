@@ -15,6 +15,11 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   allowed cells. `quadtree_boxes` gives the boxes on their own. More cells are refined than
   with clusters, but all patches have one size and a regrid keeps most of them. Tutorial
   "Quadtree patches".
+- `placement="morton"`: `regrid` puts the patches on the ranks along a Morton curve
+  (`morton_ranks`), all levels on one curve keyed in cells of the finest level, cut into runs
+  of about equal cells with the base level's cells counted.
+- Benchmark `benchmarks/quadtree`: clusters against quadtree blocks in a particle-in-cell
+  cycle, serially and under MPI with both placements (`RESULTS.md`).
 - `marker_tags(hierarchy, x, y, per_cell=..., levels=...)`: tag the cells that hold more than
   `per_cell` markers, counted over all ranks.
 - Graded axes: `AMRHierarchy(axis_nodes=...)` takes, per axis, `None` (uniform) or the
