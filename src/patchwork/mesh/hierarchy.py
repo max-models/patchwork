@@ -300,9 +300,10 @@ class AMRHierarchy:
     where a patch goes that is added without ``ranks``: ``"all"`` puts it on
     every rank, ``"balanced"`` on the one rank that holds the fewest cells so
     far, ``"morton"`` along a Morton (Z-order) curve when `regrid` places the
-    patches (each level's patches, in the order of the curve, cut into
-    pieces of about equal cells, one piece per rank, so that neighbouring
-    patches tend to share a rank; a patch added by `add_patch` goes where
+    patches (`morton_ranks`: the patches of all levels in the order of the
+    curve, cut into runs of about equal cells with the base level counted,
+    one run per rank, so that neighbouring patches and the patches over them
+    tend to share a rank; a patch added by `add_patch` goes where
     ``"balanced"`` would put it), or a function ``placement(level, box)`` that
     returns the ranks (as ``ranks`` of `add_patch` takes them). With
     ``max_cells_per_rank``, a ``"balanced"`` patch with more cells than that is
@@ -1110,9 +1111,14 @@ class AMRHierarchy:
         if new.placement == "morton":
             from patchwork.mesh.regrid import morton_ranks
 
+            ranks = morton_ranks(
+                boxes,
+                self.comm.Get_size(),
+                ratio=self.refinement_ratio,
+                load=new.cells_on_rank,  # the base level
+            )
             for level in sorted(boxes):
-                ranks = morton_ranks(boxes[level], self.comm.Get_size())
-                for box, rank in zip(boxes[level], ranks, strict=True):
+                for box, rank in zip(boxes[level], ranks[level], strict=True):
                     new.add_patch(level, box, ranks=rank)
         else:
             for level in sorted(boxes):

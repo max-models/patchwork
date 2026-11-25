@@ -228,23 +228,23 @@ def test_morton_ranks_follow_the_z_curve_with_equal_cells() -> None:
     boxes = [
         ((2 * i, 2 * i + 2), (2 * j, 2 * j + 2)) for i in range(4) for j in range(4)
     ]
-    ranks = morton_ranks(boxes, 4)
+    ranks = morton_ranks({1: boxes}, 4)[1]
     for box, rank in zip(boxes, ranks, strict=True):
         (i0, _), (j0, _) = box
-        assert rank == 2 * (i0 >= 4) + (j0 >= 4) or rank == (i0 >= 4) + 2 * (j0 >= 4)
-    assert sorted(ranks) == [r for r in range(4) for _ in range(4)]
-    # unequal boxes: the cells per rank differ by at most one box
-    boxes = [((0, 8), (0, 8)), ((8, 10), (0, 2)), ((8, 10), (2, 4)), ((10, 12), (0, 2))]
-    cells = [64, 4, 4, 4]
-    ranks = morton_ranks(boxes, 2)
-    load = [
-        sum(c for c, r in zip(cells, ranks, strict=True) if r == k) for k in range(2)
-    ]
-    assert sum(load) == 76 and max(load) - min(load) <= 64
-    assert morton_ranks(boxes, 1) == [0, 0, 0, 0]
-    assert morton_ranks([], 3) == []
+        assert rank == (i0 >= 4) + 2 * (j0 >= 4)  # the first axis is the lowest bit
+    # a rank that holds the base already takes fewer patches
+    loaded = morton_ranks({1: boxes}, 2, load=[32, 0])[1]
+    assert loaded.count(0) == 4 and loaded.count(1) == 12
+    # a patch and the finer patch over it are neighbours on the curve
+    levels = {1: [((0, 4), (0, 4)), ((4, 8), (4, 8))], 2: [((0, 4), (0, 4))]}
+    assert morton_ranks(levels, 2) == {1: [0, 1], 2: [0]}
+    assert morton_ranks({1: boxes}, 1)[1] == [0] * 16
+    assert morton_ranks({}, 3) == {}
+    assert morton_ranks({1: [((0, 4),), ((4, 8),)]}, 2) == {1: [0, 1]}  # 1D
     with pytest.raises(ValueError, match="size"):
-        morton_ranks(boxes, 0)
+        morton_ranks({1: boxes}, 0)
+    with pytest.raises(ValueError, match="load"):
+        morton_ranks({1: boxes}, 2, load=[1.0])
 
 
 def test_regrid_places_the_blocks_along_the_morton_curve() -> None:
@@ -253,10 +253,15 @@ def test_regrid_places_the_blocks_along_the_morton_curve() -> None:
     tags = function_tags(mesh, ring, levels=2)
     new = mesh.regrid(tags, method="quadtree", block_size=8)
     assert new.placement == "morton"
+    boxes = {level: [p.box for p in new.patches_at_level(level)] for level in (1, 2)}
+    base = AMRHierarchy(base_shape=(16, 16), placement="morton").cells_on_rank
+    expected = morton_ranks(boxes, SIZE, load=base)
     for level in (1, 2):
         patches = new.patches_at_level(level)
-        expected = morton_ranks([p.box for p in patches], SIZE)
-        assert [p.ranks for p in patches] == [(r,) for r in expected]
+        assert [p.ranks for p in patches] == [(r,) for r in expected[level]]
+    # the cells per rank differ by less than the largest patch
+    load = new.cells_on_rank
+    assert max(load) - min(load) <= max(256, max(base))
     # the next regrid keeps the placement; a patch added by hand is balanced
     again = new.regrid(tags, method="quadtree", block_size=8, fill_halos=True)
     assert again.placement == "morton"
