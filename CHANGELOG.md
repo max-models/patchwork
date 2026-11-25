@@ -33,7 +33,7 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with clusters, but all patches have one size and a regrid keeps most of them. Tutorial
   "Quadtree patches".
 - `placement="morton"`: `regrid` puts the patches on the ranks along a Morton curve
-  (`morton_ranks`), all levels on one curve keyed in cells of the finest level, cut into runs
+  (`curve_ranks`), all levels on one curve keyed in cells of the finest level, cut into runs
   of about equal cells with the base level's cells counted.
 - Morton cuts weighted by cost: `regrid(..., placement="morton", cost=...)` weighs every patch
   by its cells plus the cost of its leaf cells (`box_costs`), e.g. the markers of

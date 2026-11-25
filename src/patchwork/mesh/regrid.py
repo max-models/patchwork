@@ -738,41 +738,127 @@ def quadtree_boxes(
     return boxes
 
 
+def _curve_keys(items: list[tuple], ratio: int, curve: str) -> list[int]:
+    """The key of every ``(level, n, box)`` on a curve: its lower corner in finest cells."""
+    top = max(level for level, _, _ in items)
+    corners = np.array(
+        [[lo * ratio ** (top - level) for lo, _ in box] for level, _, box in items],
+        dtype=np.uint64,
+    )
+    if corners.shape[1] == 1:  # 1D: the curve is the axis
+        return corners.reshape(-1).tolist()
+    if curve == "morton":
+        return xp.algorithms.morton_encode(*corners.T).tolist()
+    levels = max(1, int(corners.max()).bit_length())
+    return xp.algorithms.hilbert_encode(*corners.T, levels=levels).tolist()
+
+
+def _costs(
+    boxes: Mapping[int, Sequence[IndexBox]],
+    items: list[tuple],
+    weights: Mapping[int, Sequence[float]] | None,
+) -> list[float]:
+    """The cost of every item: its cells, or its weight."""
+    if weights is None:
+        return [float(np.prod([hi - lo for lo, hi in box])) for _, _, box in items]
+    for level in boxes:
+        if len(weights[level]) != len(boxes[level]):
+            raise ValueError(f"weights of level {level} need one value per box")
+    return [float(weights[level][n]) for level, n, _ in items]
+
+
 @method(
     equations={
-        "key": r"k(B) = \sum_{b} \sum_{d=0}^{D-1} \mathrm{bit}_b\big(r^{L - \ell}\, i_d\big)\, 2^{bD + d} \quad \text{(the lower corner } \mathbf i \text{ of } B \text{ on level } \ell\text{, in cells of the finest level } L\text{)}",
-        "ranks": r"\text{along the curve, rank } q \text{ takes boxes while } w_q + |B|/2 \le T, \quad T = \frac{1}{R}\Big(\sum_q w_q^{0} + \sum_B |B|\Big)",
+        "morton": r"k(B) = \sum_{b} \sum_{d=0}^{D-1} \mathrm{bit}_b\big(r^{L - \ell}\, i_d\big)\, 2^{bD + d} \quad \text{(the lower corner } \mathbf i \text{ of } B \text{ on level } \ell\text{, in cells of the finest level } L\text{)}",
+        "hilbert": r"k(B) = H\big(r^{L - \ell}\, \mathbf i\big), \quad H \text{ the Hilbert index (Skilling's construction): consecutive keys are neighbouring cells}",
+        "ranks": r"\text{along the curve, rank } q \text{ takes boxes while } w_q + c_B/2 \le T, \quad T = \frac{1}{R}\Big(\sum_q w_q^{0} + \sum_B c_B\Big)",
     },
     assumptions=(
         "the patches of all refined levels on one curve, a coarse patch before the finer ones at the same corner, so that a patch and the patches over it tend to share a rank",
-        "the load a rank already has (the base level) counts: such a rank takes fewer patches",
+        "the cost $c_B$ of a box is its cells, or its weight (`box_costs`); the load a rank already has (the base level) counts",
         "a patch stays on one rank",
     ),
     references=(
         "[Morton, IBM technical report (1966)](https://dominoweb.draco.res.ibm.com/reports/Morton1966.pdf)",
+        "[Skilling, AIP Conf. Proc. 707, 381 (2004)](https://doi.org/10.1063/1.1751381)",
         "[Burstedde, Wilcox and Ghattas, SIAM J. Sci. Comput. 33, 1103 (2011)](https://doi.org/10.1137/100791634)",
     ),
 )
-def morton_ranks(
+def curve_ranks(
     boxes: Mapping[int, Sequence[IndexBox]],
     size: int,
     *,
+    curve: str = "morton",
     ratio: int = 2,
     load: Sequence[float] | None = None,
     weights: Mapping[int, Sequence[float]] | None = None,
 ) -> dict[int, list[int]]:
-    """The rank of each box: the boxes of all levels along a Morton curve, cut into ``size`` runs.
+    """The rank of each box: the boxes of all levels along a space-filling curve, cut into ``size`` runs.
 
-    ``boxes`` maps a level to its boxes. Every box gets the Morton (Z-order)
-    key of its lower corner in cells of the finest level, so that boxes close
-    in space are close on the curve whatever their level, and a box comes
-    before the finer boxes at the same corner. Walking the curve, a rank takes
-    boxes until its cells, with the ``load`` it already has (the cells of the
-    base level, say), reach an equal share of all cells; then the next rank
-    goes on. ``weights`` (per level, one per box) replaces the cells of a box
-    by its cost, in the units of ``load``: with `box_costs`, the cells plus the
-    markers on them. Returns, per level, the ranks in the order of
+    ``boxes`` maps a level to its boxes. Every box gets the key of its lower
+    corner, in cells of the finest level, on the ``curve``: ``"morton"`` (the
+    Z-order curve) or ``"hilbert"`` (without the Z's jumps, so that the run of
+    a rank is more compact). Boxes close in space are close on the curve
+    whatever their level, and a box comes before the finer boxes at the same
+    corner. Walking the curve, a rank takes boxes until its cost, with the
+    ``load`` it already has (the cells of the base level, say), reaches an equal
+    share of all costs; then the next rank goes on. The cost of a box is its
+    cells, or ``weights`` (per level, one per box, in the units of ``load``;
+    see `box_costs`). Returns, per level, the ranks in the order of
     ``boxes[level]``.
+    """
+    if size < 1:
+        raise ValueError(f"size must be at least 1, got {size}")
+    if curve not in ("morton", "hilbert"):
+        raise ValueError(f"curve must be 'morton' or 'hilbert', got {curve!r}")
+    loads = [0.0] * size if load is None else [float(w) for w in load]
+    if len(loads) != size:
+        raise ValueError(f"load needs {size} values, got {len(loads)}")
+    items = [
+        (level, n, box) for level in sorted(boxes) for n, box in enumerate(boxes[level])
+    ]
+    result: dict[int, list[int]] = {level: [0] * len(boxes[level]) for level in boxes}
+    if not items:
+        return result
+    keys = _curve_keys(items, ratio, curve)
+    costs = _costs(boxes, items, weights)
+    share = (sum(loads) + sum(costs)) / size
+    rank = 0
+    for k in sorted(range(len(items)), key=lambda k: (keys[k], items[k][0])):
+        while rank < size - 1 and loads[rank] + costs[k] / 2 > share:
+            rank += 1
+        level, n, _ = items[k]
+        result[level][n] = rank
+        loads[rank] += costs[k]
+    return result
+
+
+@method(
+    equations={
+        "greedy": r"c_{B_1} \ge c_{B_2} \ge \dots, \qquad r(B_k) = \arg\min_q w_q \text{ (the lowest such rank)}, \quad w_{r(B_k)} \mathrel{+}= c_{B_k}",
+    },
+    assumptions=(
+        "the greedy (longest processing time first) solution of the knapsack-like partition: the largest cost at most 4/3 of the best possible",
+        "no locality: neighbouring patches may land on any ranks",
+    ),
+    references=(
+        "[Graham, SIAM J. Appl. Math. 17, 416 (1969)](https://doi.org/10.1137/0117039)",
+    ),
+)
+def knapsack_ranks(
+    boxes: Mapping[int, Sequence[IndexBox]],
+    size: int,
+    *,
+    load: Sequence[float] | None = None,
+    weights: Mapping[int, Sequence[float]] | None = None,
+) -> dict[int, list[int]]:
+    """The rank of each box: the largest cost first, each to the rank with the least so far.
+
+    The greedy solution of cutting the boxes into ``size`` sets of equal cost,
+    what ``placement="balanced"`` does with cells, here with the ``weights`` of
+    `box_costs` and the ``load`` the ranks already have. Balances better than a
+    curve, but neighbouring boxes may land on different ranks. Returns, per
+    level, the ranks in the order of ``boxes[level]``.
     """
     if size < 1:
         raise ValueError(f"size must be at least 1, got {size}")
@@ -783,29 +869,11 @@ def morton_ranks(
         (level, n, box) for level in sorted(boxes) for n, box in enumerate(boxes[level])
     ]
     result: dict[int, list[int]] = {level: [0] * len(boxes[level]) for level in boxes}
-    if not items:
-        return result
-    top = max(level for level, _, _ in items)
-    corners = np.array(
-        [[lo * ratio ** (top - level) for lo, _ in box] for level, _, box in items],
-        dtype=np.uint64,
-    )
-    if corners.shape[1] > 1:
-        keys = xp.algorithms.morton_encode(*corners.T)  # 2D and 3D
-    else:  # 1D: the curve is the axis
-        keys = corners.reshape(-1)
-    if weights is None:
-        costs = [float(np.prod([hi - lo for lo, hi in box])) for _, _, box in items]
-    else:
-        for level in boxes:
-            if len(weights[level]) != len(boxes[level]):
-                raise ValueError(f"weights of level {level} need one value per box")
-        costs = [float(weights[level][n]) for level, n, _ in items]
-    share = (sum(loads) + sum(costs)) / size
-    rank = 0
-    for k in sorted(range(len(items)), key=lambda k: (int(keys[k]), items[k][0])):
-        while rank < size - 1 and loads[rank] + costs[k] / 2 > share:
-            rank += 1
+    costs = _costs(boxes, items, weights)
+    for k in sorted(
+        range(len(items)), key=lambda k: (-costs[k], items[k][0], items[k][2])
+    ):
+        rank = min(range(size), key=lambda q: (loads[q], q))
         level, n, _ = items[k]
         result[level][n] = rank
         loads[rank] += costs[k]
@@ -817,16 +885,47 @@ def box_costs(
     boxes: Mapping[int, Sequence[IndexBox]],
     cost: Mapping[int, Any],
 ) -> tuple[dict[int, list[float]], list[float]]:
-    """The cost of each new box and of each rank's base patches: cells plus the cost of the leaf cells.
+    """The cost of each new box and of each rank's base patches.
 
-    ``cost`` maps a level to a per-cell cost of that level's shape, in units of
-    one cell (``0.5 * marker_counts(...)[level]`` if a marker costs half a cell;
-    a missing level costs nothing beyond its cells). A cell's cost goes to the
-    box where it is a leaf, not covered by a finer box, since that is where its
-    markers deposit and gather. ``hierarchy`` holds the base level (the patches
-    of level 0 with their ranks). Returns the weights of ``boxes`` per level and
-    the load of every rank from the base level, for `morton_ranks`.
+    ``cost`` is one of two things:
+
+    - a mapping from a level to a per-cell cost of that level's shape, in units
+      of one cell (``0.5 * marker_counts(...)[level]`` if a marker costs half a
+      cell; a missing level costs nothing beyond its cells): a box costs its
+      cells plus the cost of its leaf cells, the cells no finer box covers,
+      since that is where their markers deposit and gather;
+    - a mapping from a patch, ``(level, box)``, to its cost, e.g. the seconds
+      measured with ``deposit(..., times=...)`` and ``interpolate(...,
+      times=...)``: a box costs its own value, and a box without one the mean
+      cost per cell of those that have one.
+
+    ``hierarchy`` holds the base level (the patches of level 0 with their
+    ranks). Returns the weights of ``boxes`` per level and the load of every
+    rank from the base level, for `curve_ranks` and `knapsack_ranks`.
     """
+    if any(isinstance(key, tuple) for key in cost):
+        measured = {
+            (int(level), tuple(tuple(side) for side in box)): float(value)
+            for (level, box), value in cost.items()
+        }
+        cells = sum(float(np.prod([hi - lo for lo, hi in box])) for _, box in measured)
+        per_cell = sum(measured.values()) / cells if cells else 0.0
+
+        def measured_weight(level: int, box: IndexBox) -> float:
+            found = measured.get((level, box))
+            if found is not None:
+                return found
+            return per_cell * float(np.prod([hi - lo for lo, hi in box]))
+
+        weights = {
+            level: [measured_weight(level, box) for box in boxes[level]]
+            for level in boxes
+        }
+        load = [0.0] * hierarchy.comm.Get_size()
+        for patch in hierarchy.patches_at_level(0):
+            for rank in patch.ranks:
+                load[rank] += measured_weight(0, patch.box) / len(patch.ranks)
+        return weights, load
     ratio = hierarchy.refinement_ratio
     top = max(boxes, default=0)
     leaf_cost = {}

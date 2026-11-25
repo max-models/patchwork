@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -88,6 +89,9 @@ def _gather_blocks(
         result[number] = (members, replicated)
     return result
 
+
+#: The placements a hierarchy takes by name (besides a function of the patch).
+_PLACEMENTS = ("all", "balanced", "morton", "hilbert")
 
 #: Tag of the messages that carry a gathered patch field to another rank.
 _GATHER_TAG = 7311
@@ -319,16 +323,17 @@ class AMRHierarchy:
     on several, over which mpiarray splits its fields. ``placement`` says
     where a patch goes that is added without ``ranks``: ``"all"`` puts it on
     every rank, ``"balanced"`` on the one rank that holds the fewest cells so
-    far, ``"morton"`` along a Morton (Z-order) curve when `regrid` places the
-    patches (`morton_ranks`: the patches of all levels in the order of the
-    curve, cut into runs of about equal cells with the base level counted,
-    one run per rank, so that neighbouring patches and the patches over them
-    tend to share a rank; a patch added by `add_patch` goes where
+    far, ``"morton"`` or ``"hilbert"`` along that space-filling curve when
+    `regrid` places the patches (`curve_ranks`: the patches of all levels in
+    the order of the curve, cut into runs of about equal cells with the base
+    level counted, one run per rank, so that neighbouring patches and the
+    patches over them tend to share a rank; the Hilbert curve has no jumps, so
+    its runs are more compact; a patch added by `add_patch` goes where
     ``"balanced"`` would put it), or a function ``placement(level, box)`` that
     returns the ranks (as ``ranks`` of `add_patch` takes them). With
     ``max_cells_per_rank``, a ``"balanced"`` patch with more cells than that is
     split over as many of the least loaded ranks as it needs (at most all of
-    them); a ``"morton"`` patch stays on one rank.
+    them); a patch placed along a curve stays on one rank.
 
     The domain is the rectangle of ``base_shape`` cells, or with ``base_boxes``
     the union of those boxes of base cells: an L, a T, a rectangle with a notch.
@@ -503,10 +508,10 @@ class AMRHierarchy:
                 )
         self.geometry = geometry
         self.comm = mpa.default_comm() if comm is None else comm
-        if not callable(placement) and placement not in ("all", "balanced", "morton"):
+        if not callable(placement) and placement not in _PLACEMENTS:
             raise ValueError(
-                "placement must be 'all', 'balanced', 'morton' or a function, "
-                f"got {placement!r}"
+                f"placement must be one of {', '.join(map(repr, _PLACEMENTS))} "
+                f"or a function, got {placement!r}"
             )
         if max_cells_per_rank is not None and int(max_cells_per_rank) < 1:
             raise ValueError("max_cells_per_rank must be at least 1")
@@ -1019,19 +1024,26 @@ class AMRHierarchy:
             geometry=self.geometry,
             axis_nodes=self.axis_nodes,
         )
-        if new.placement == "morton":
-            from patchwork.mesh.regrid import box_costs, morton_ranks
+        if new.placement in ("morton", "hilbert") or (
+            new.placement == "balanced" and cost is not None
+        ):
+            from patchwork.mesh.regrid import box_costs, curve_ranks, knapsack_ranks
 
             weights, load = None, list(new.cells_on_rank)  # the base level
             if cost is not None:
                 weights, load = box_costs(new, boxes, cost)
-            ranks = morton_ranks(
-                boxes,
-                self.comm.Get_size(),
-                ratio=self.refinement_ratio,
-                load=load,
-                weights=weights,
-            )
+            size = self.comm.Get_size()
+            if new.placement == "balanced":
+                ranks = knapsack_ranks(boxes, size, load=load, weights=weights)
+            else:
+                ranks = curve_ranks(
+                    boxes,
+                    size,
+                    curve=new.placement,
+                    ratio=self.refinement_ratio,
+                    load=load,
+                    weights=weights,
+                )
             for level in sorted(boxes):
                 for box, rank in zip(boxes[level], ranks[level], strict=True):
                     new.add_patch(level, box, ranks=rank)
@@ -1145,24 +1157,32 @@ class AMRHierarchy:
         is used for every refined level. Tags that would need a forbidden cell
         are dropped, as are those that would need patches too close to it.
 
-        New patches are placed by ``placement`` (default: this hierarchy's),
-        the largest first, or along a Morton curve with ``"morton"``. With
-        ``"morton"``, ``cost`` weighs the patches by more than their cells: a
-        mapping from a level to a per-cell cost of that level's shape, in units
-        of one cell (the markers of `marker_counts` times what a marker costs
-        against a cell), counted in the patch where the cell is a leaf
-        (`box_costs`), so that a rank with a dense beam gets fewer cells. Collective over ``comm``; this hierarchy is left as
+        New patches are placed by ``placement`` (default: this hierarchy's):
+        the largest first with ``"balanced"``, or along a space-filling curve
+        with ``"morton"`` or ``"hilbert"``. With these three, ``cost`` weighs
+        the patches by more than their cells (`box_costs`): a mapping from a
+        level to a per-cell cost of that level's shape, in units of one cell
+        (the markers of `marker_counts` times what a marker costs against a
+        cell), counted in the patch where the cell is a leaf, or a mapping from
+        a patch ``(level, box)`` to a measured cost (``deposit(...,
+        times=...)``). ``"balanced"`` with a cost is the greedy knapsack
+        (`knapsack_ranks`): the most even, without locality. Collective over ``comm``; this hierarchy is left as
         it is, except for the restriction of conservative fields.
         """
         from patchwork.mesh.regrid import combine_tags, new_boxes, quadtree_boxes
 
         if method not in ("cluster", "quadtree"):
             raise ValueError(f"method must be 'cluster' or 'quadtree', got {method!r}")
-        if (
-            cost is not None
-            and (self.placement if placement is None else placement) != "morton"
+        if cost is not None and (
+            self.placement if placement is None else placement
+        ) not in (
+            "balanced",
+            "morton",
+            "hilbert",
         ):
-            raise ValueError("cost weighs the patches of placement='morton' only")
+            raise ValueError(
+                "cost weighs the patches of placement 'balanced', 'morton' or 'hilbert'"
+            )
         if method == "quadtree" and max_patch_size is not None:
             raise ValueError(
                 "max_patch_size does not apply to method='quadtree': "
@@ -1194,22 +1214,34 @@ class AMRHierarchy:
 
     @sp.profile("patchwork.rebalance", tags=PROFILE_TAGS)
     def rebalance(
-        self, cost: Mapping[int, Any] | None = None, *, fill_halos: bool = False
+        self,
+        cost: Mapping[int, Any] | None = None,
+        *,
+        placement: str = "morton",
+        fill_halos: bool = False,
     ) -> AMRHierarchy:
-        """The same patches placed again along the Morton curve, by ``cost``; fields moved.
+        """The same patches placed again by ``cost``; fields moved.
 
-        Every refined patch goes to a rank by `morton_ranks`, weighed by its
-        cells plus the ``cost`` of its leaf cells as in `regrid` (`box_costs`;
-        without ``cost`` by its cells). The base level stays where it is. Every
-        field is copied to the patches' new ranks; send the markers after them
-        with `migrate`. The new hierarchy places its regrids along the curve as
-        well (``placement="morton"``). Collective over ``comm``.
+        Every refined patch goes to a rank along a space-filling curve
+        (``placement`` ``"morton"`` or ``"hilbert"``, `curve_ranks`) or by the
+        greedy knapsack (``"balanced"``, `knapsack_ranks`), weighed by its cells
+        plus the ``cost`` of its leaf cells, or by measured costs per patch, as
+        in `regrid` (`box_costs`; without ``cost`` by its cells). The base
+        level stays where it is. Every field is copied to the patches' new
+        ranks; send the markers after them with `migrate`. The new hierarchy
+        places its regrids the same way. Collective over ``comm``.
         """
+        if placement not in ("balanced", "morton", "hilbert"):
+            raise ValueError(
+                f"rebalance places by 'balanced', 'morton' or 'hilbert', got {placement!r}"
+            )
         boxes = {
             level: [patch.box for patch in self.patches_at_level(level)]
             for level in range(1, self.max_level + 1)
         }
-        return self._rebuilt(boxes, "morton", cost, fill_halos)
+        if placement == "balanced" and cost is None:
+            cost = {}  # by cells: the knapsack, not the order of add_patch
+        return self._rebuilt(boxes, placement, cost, fill_halos)
 
     def integral(self, name: str) -> float:
         """The integral of field ``name`` over the domain, from the finest values.
@@ -1643,6 +1675,7 @@ class AMRHierarchy:
         name: str | None = None,
         reset: bool = True,
         splines: Any = 1,
+        times: dict | None = None,
     ) -> None:
         """Deposit the charge of markers on the node-centered field ``name``, patch by patch.
 
@@ -1667,6 +1700,10 @@ class AMRHierarchy:
         ``mpifield.splines(p).halo`` nodes (2 from degree 2 on). Where the
         stencil would reach past the edge of the marker's patch it folds onto the
         patch's edge nodes, so the total is kept; such charge stays on the patch.
+
+        ``times``, a dict, collects the seconds spent on the markers of every
+        patch, added to the value of its ``(level, box)``: costs measured on
+        this rank, for `regrid` and `rebalance` (sum them over the ranks first).
         """
         import numpy as np
 
@@ -1695,16 +1732,24 @@ class AMRHierarchy:
                 patch.field(name).local_with_halos[...] = 0.0
         patches = self.patches
         for number, chosen in _by_patch(found):
+            start = time.perf_counter()
             storage, grid = self._patch_block(patches[number], name, shape.degree)
             positions = np.array([w[chosen] for w in wrapped])
             # the kernels take the nodes component-last: a view with one component
             shape.nodes.scatter_block(
                 positions, charge[chosen], storage[..., None], grid
             )
+            if times is not None:
+                key = (patches[number].level, patches[number].box)
+                times[key] = times.get(key, 0.0) + time.perf_counter() - start
 
     @sp.profile("patchwork.interpolate", tags=PROFILE_TAGS)
     def interpolate(
-        self, *arguments: Any, name: str | None = None, splines: Any = 1
+        self,
+        *arguments: Any,
+        name: str | None = None,
+        splines: Any = 1,
+        times: dict | None = None,
     ) -> Any:
         """Interpolate the node-centered field ``name`` at markers, each in its own patch.
 
@@ -1721,6 +1766,8 @@ class AMRHierarchy:
         ``splines`` is the B-spline degree of the weights (1, 2 or 3) or an
         `mpifield.Splines`, as for `deposit`, whose transpose this is for the same
         degree, the fold at the patch edges included.
+
+        ``times`` collects the seconds spent per patch, as in `deposit`.
         """
         import numpy as np
 
@@ -1738,11 +1785,15 @@ class AMRHierarchy:
         values = np.zeros(flat[0].size)
         patches = self.patches
         for number, chosen in _by_patch(found):
+            start = time.perf_counter()
             storage, grid = self._patch_block(patches[number], name, weights.degree)
             positions = np.array([w[chosen] for w in wrapped])
             result = np.zeros((1, chosen.size))
             weights.nodes.gather_block(positions, storage[..., None], result, grid)
             values[chosen] = result[0]
+            if times is not None:
+                key = (patches[number].level, patches[number].box)
+                times[key] = times.get(key, 0.0) + time.perf_counter() - start
         return values.reshape(shape)
 
     @sp.profile("patchwork.accumulate_halos", tags=PROFILE_TAGS)

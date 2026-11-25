@@ -11,9 +11,9 @@ from maybempi import MPI
 
 from patchwork import (
     AMRHierarchy,
+    curve_ranks,
     function_tags,
     marker_tags,
-    morton_ranks,
     quadtree_boxes,
 )
 from patchwork.mesh.regrid import combine_tags
@@ -223,28 +223,28 @@ def test_quadtree_adds_no_level_where_every_cell_is_forbidden() -> None:
     assert new.max_level == 0
 
 
-def test_morton_ranks_follow_the_z_curve_with_equal_cells() -> None:
+def test_curve_ranks_follow_the_z_curve_with_equal_cells() -> None:
     # sixteen 2 x 2 blocks of a 8 x 8 level: the Z curve visits the quadrants in turn
     boxes = [
         ((2 * i, 2 * i + 2), (2 * j, 2 * j + 2)) for i in range(4) for j in range(4)
     ]
-    ranks = morton_ranks({1: boxes}, 4)[1]
+    ranks = curve_ranks({1: boxes}, 4)[1]
     for box, rank in zip(boxes, ranks, strict=True):
         (i0, _), (j0, _) = box
         assert rank == (i0 >= 4) + 2 * (j0 >= 4)  # the first axis is the lowest bit
     # a rank that holds the base already takes fewer patches
-    loaded = morton_ranks({1: boxes}, 2, load=[32, 0])[1]
+    loaded = curve_ranks({1: boxes}, 2, load=[32, 0])[1]
     assert loaded.count(0) == 4 and loaded.count(1) == 12
     # a patch and the finer patch over it are neighbours on the curve
     levels = {1: [((0, 4), (0, 4)), ((4, 8), (4, 8))], 2: [((0, 4), (0, 4))]}
-    assert morton_ranks(levels, 2) == {1: [0, 1], 2: [0]}
-    assert morton_ranks({1: boxes}, 1)[1] == [0] * 16
-    assert morton_ranks({}, 3) == {}
-    assert morton_ranks({1: [((0, 4),), ((4, 8),)]}, 2) == {1: [0, 1]}  # 1D
+    assert curve_ranks(levels, 2) == {1: [0, 1], 2: [0]}
+    assert curve_ranks({1: boxes}, 1)[1] == [0] * 16
+    assert curve_ranks({}, 3) == {}
+    assert curve_ranks({1: [((0, 4),), ((4, 8),)]}, 2) == {1: [0, 1]}  # 1D
     with pytest.raises(ValueError, match="size"):
-        morton_ranks({1: boxes}, 0)
+        curve_ranks({1: boxes}, 0)
     with pytest.raises(ValueError, match="load"):
-        morton_ranks({1: boxes}, 2, load=[1.0])
+        curve_ranks({1: boxes}, 2, load=[1.0])
 
 
 def test_regrid_places_the_blocks_along_the_morton_curve() -> None:
@@ -255,7 +255,7 @@ def test_regrid_places_the_blocks_along_the_morton_curve() -> None:
     assert new.placement == "morton"
     boxes = {level: [p.box for p in new.patches_at_level(level)] for level in (1, 2)}
     base = AMRHierarchy(base_shape=(16, 16), placement="morton").cells_on_rank
-    expected = morton_ranks(boxes, SIZE, load=base)
+    expected = curve_ranks(boxes, SIZE, load=base)
     for level in (1, 2):
         patches = new.patches_at_level(level)
         assert [p.ranks for p in patches] == [(r,) for r in expected[level]]
@@ -268,7 +268,7 @@ def test_regrid_places_the_blocks_along_the_morton_curve() -> None:
     added = again.add_patch(3, ((40, 48), (40, 48)))
     assert len(added.ranks) == 1
     with pytest.raises(ValueError, match="morton"):
-        AMRHierarchy(base_shape=(4, 4), placement="hilbert")
+        AMRHierarchy(base_shape=(4, 4), placement="peano")
 
 
 @pytest.mark.parametrize("centering", ["node", "cell"])
@@ -338,12 +338,12 @@ def test_marker_weights_move_the_cuts_of_the_morton_curve() -> None:
     boxes = {
         1: [((2 * i, 2 * i + 2), (0, 2)) for i in range(4)]
     }  # four boxes of 4 cells
-    assert morton_ranks(boxes, 2) == {1: [0, 0, 1, 1]}
+    assert curve_ranks(boxes, 2) == {1: [0, 0, 1, 1]}
     # the first box costs as much as the other three: it gets a rank to itself
     heavy = {1: [12.0, 4.0, 4.0, 4.0]}
-    assert morton_ranks(boxes, 2, weights=heavy) == {1: [0, 1, 1, 1]}
+    assert curve_ranks(boxes, 2, weights=heavy) == {1: [0, 1, 1, 1]}
     with pytest.raises(ValueError, match="weights"):
-        morton_ranks(boxes, 2, weights={1: [1.0]})
+        curve_ranks(boxes, 2, weights={1: [1.0]})
 
     mesh = AMRHierarchy(base_shape=(8, 8))
     rank = WORLD.Get_rank()
@@ -430,7 +430,7 @@ def test_rebalance_moves_the_patches_and_their_fields_to_the_weighted_ranks() ->
         for level in range(1, mesh.max_level + 1)
     }
     weights, load = box_costs(moved, boxes, cost)
-    expected = morton_ranks(boxes, SIZE, load=load, weights=weights)
+    expected = curve_ranks(boxes, SIZE, load=load, weights=weights)
     for level in boxes:
         ranks = [p.ranks for p in moved.patches_at_level(level)]
         assert ranks == [(r,) for r in expected[level]]
@@ -483,3 +483,96 @@ def test_regrid_moves_only_the_fields_asked_for() -> None:
     )
     with pytest.raises(KeyError, match="phi"):
         mesh.regrid(tags, fields=["phi"])
+
+
+def test_hilbert_runs_are_contiguous_and_balanced() -> None:
+    from patchwork import curve_ranks
+
+    boxes = [
+        ((2 * i, 2 * i + 2), (2 * j, 2 * j + 2)) for i in range(8) for j in range(8)
+    ]
+    ranks = curve_ranks({1: boxes}, 3, curve="hilbert")[1]
+    assert sorted(set(ranks)) == [0, 1, 2]
+    counts = [ranks.count(r) for r in range(3)]
+    assert max(counts) - min(counts) <= 1
+    # every rank's boxes are connected through shared faces: the curve has no jumps
+    for rank in range(3):
+        mine = {
+            (b[0][0] // 2, b[1][0] // 2)
+            for b, r in zip(boxes, ranks, strict=True)
+            if r == rank
+        }
+        seen, todo = set(), [next(iter(mine))]
+        while todo:
+            cell = todo.pop()
+            if cell in seen:
+                continue
+            seen.add(cell)
+            i, j = cell
+            todo += [
+                c for c in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)) if c in mine
+            ]
+        assert seen == mine
+    with pytest.raises(ValueError, match="curve"):
+        curve_ranks({1: boxes}, 3, curve="peano")
+
+
+def test_knapsack_balances_the_weights() -> None:
+    from patchwork import knapsack_ranks
+
+    boxes = {1: [((2 * i, 2 * i + 2), (0, 2)) for i in range(6)]}
+    weights = {1: [7.0, 5.0, 4.0, 3.0, 3.0, 2.0]}
+    ranks = knapsack_ranks(boxes, 2, weights=weights)[1]
+    load = [
+        sum(w for w, r in zip(weights[1], ranks, strict=True) if r == q)
+        for q in range(2)
+    ]
+    assert sorted(load) == [12.0, 12.0]
+    assert knapsack_ranks(boxes, 2, load=[100.0, 0.0])[1] == [1] * 6
+    with pytest.raises(ValueError, match="load"):
+        knapsack_ranks(boxes, 2, load=[1.0])
+    with pytest.raises(ValueError, match="size"):
+        knapsack_ranks(boxes, 0)
+
+
+def test_measured_times_per_patch_weigh_the_placement() -> None:
+    from patchwork import box_costs
+
+    mesh = AMRHierarchy(base_shape=(16, 16), placement="hilbert")
+    mesh.allocate_field("rho", centering="node")
+    mesh = mesh.regrid(
+        function_tags(mesh, ring, levels=1), method="quadtree", block_size=8
+    )
+    rng = np.random.default_rng(WORLD.Get_rank())
+    x, y = rng.uniform(0.2, 0.4, (2, 500))
+    q = np.ones(x.size)
+    mx, my, mq = mesh.migrate(x, y, q, name="rho")
+    times: dict = {}
+    mesh.deposit(mx, my, mq, "rho", times=times)
+    mesh.interpolate(mx, my, "rho", times=times)
+    # a rank may hold no markers: count over all ranks (and fail on all of them)
+    assert WORLD.allreduce(len(times)) > 0
+    assert all(value >= 0.0 for value in times.values())
+    assert all(
+        (level, box) in {(p.level, p.box) for p in mesh.patches} for level, box in times
+    )
+    # a patch with a cost gets it, one without the mean per cell
+    boxes = {1: [p.box for p in mesh.patches_at_level(1)]}
+    known = boxes[1][0]
+    weights, load = box_costs(mesh, boxes, {(1, known): 640.0})
+    assert weights[1][0] == 640.0
+    assert np.allclose(weights[1][1:], 640.0 / 64 * 64)
+    moved = mesh.rebalance(
+        {(p.level, p.box): float(n) for n, p in enumerate(mesh.patches)}
+    )
+    assert moved.placement == "morton"
+    for placement in ("balanced", "hilbert"):
+        again = mesh.rebalance(placement=placement)
+        assert [(p.level, p.box) for p in again.patches] == [
+            (p.level, p.box) for p in mesh.patches
+        ]
+        assert again.placement == placement
+    with pytest.raises(ValueError, match="rebalance"):
+        mesh.rebalance(placement="all")
+    with pytest.raises(ValueError, match="cost weighs"):
+        AMRHierarchy(base_shape=(4, 4)).regrid({0: np.ones((4, 4), bool)}, cost={})
