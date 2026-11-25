@@ -890,7 +890,7 @@ toml = [
 [[package]]
 name = "cunumpy"
 version = "0.8.0"
-source = { git = "https://github.com/max-models/cunumpy?branch=devel#a25c7b31072823d31e0815f65efa0daa1212a403" }
+source = { git = "https://github.com/max-models/cunumpy?branch=devel#e18126964f48342bfbf9bd7764914aa19c7ecebe" }
 dependencies = [
     { name = "array-api-compat" },
     { name = "maybempi" },
@@ -2301,7 +2301,7 @@ wheels = [
 [[package]]
 name = "mpiarray"
 version = "0.2.1"
-source = { git = "https://github.com/max-models/mpiarray?branch=devel#7d3490a566ebbc2489c5172d5cd09282fae87efe" }
+source = { git = "https://github.com/max-models/mpiarray?branch=devel#59884298fd49826a07f0d2321c8c85f93965f388" }
 dependencies = [
     { name = "cunumpy" },
     { name = "maybempi" },

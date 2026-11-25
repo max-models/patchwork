@@ -98,6 +98,13 @@ _PLACEMENTS = ("all", "balanced", "morton", "hilbert")
 _GATHER_TAG = 7311
 
 
+def _built_in(shape: Any) -> bool:
+    """Whether ``shape`` is one of mpifield's built-in splines (degree 1 to 3)."""
+    from mpifield.splines import SPLINES
+
+    return any(shape is built for degree, built in SPLINES.items() if 1 <= degree <= 3)
+
+
 def _share_time(
     times: dict, patches: Sequence[Any], owner: Any, seconds: float
 ) -> None:
@@ -1733,6 +1740,75 @@ class AMRHierarchy:
             corners.append((where, weight))
         return inside, corners, blocks, offset
 
+    def _block_markers(
+        self, found: Any, wrapped: Any, name: str, degree: int
+    ) -> tuple[Any, Any, Any, Any, Any, list[tuple[int, int, Any]], int]:
+        """The markers of all patches, placed in one flat buffer of their patches' blocks.
+
+        The stored blocks (`_stored_block`) of the patches with markers lie end to end
+        in one buffer. A marker's stencil is on the block of `_patch_block`: the stored
+        block for degree 1, without the halo nodes outside the patch for higher degrees
+        (where mpifield's ``spline_cell`` folds a stencil onto the edge nodes). Returns
+        the markers in the domain; per marker and axis its position in nodes from the
+        first node of that block, the block's nodes and the buffer stride; per marker the
+        buffer index of the block's first node; ``(patch number, offset, storage)`` per
+        block; and the buffer's size: the arguments of the ``scatter_blocks`` and
+        ``gather_blocks`` kernels.
+        """
+        import numpy as np
+
+        patches = self.patches
+        ndim = self.ndim
+        inside = np.flatnonzero(found >= 0)
+        numbers = np.flatnonzero(np.bincount(found[inside], minlength=len(patches)))
+        blocks = []
+        offset = 0
+        first = np.zeros((len(patches), ndim), dtype=np.int64)  # level index
+        count = np.ones((len(patches), ndim), dtype=np.int64)
+        strides = np.zeros((len(patches), ndim), dtype=np.int64)
+        start = np.zeros(len(patches), dtype=np.int64)
+        scale = np.ones((len(patches), ndim))
+        for number in numbers.tolist():
+            patch = patches[number]
+            array = patch.field(name)
+            layout = array.layout
+            storage = array.local_with_halos
+            blocks.append((number, offset, storage))
+            stride = 1
+            for axis in range(ndim - 1, -1, -1):
+                strides[number, axis] = stride
+                stride *= storage.shape[axis]
+            begin = offset
+            for axis in range(ndim):
+                stored = layout.index_bounds[axis][0] - layout.halo[axis]
+                lower, upper = 0, storage.shape[axis]
+                if degree > 1:  # the block of `_patch_block`
+                    lower = max(0, -stored)
+                    upper = min(upper, patch.node_shape[axis] - stored)
+                first[number, axis] = patch.box[axis][0] + stored + lower
+                count[number, axis] = upper - lower
+                begin += lower * strides[number, axis]
+            start[number] = begin
+            scale[number] = 1.0 / np.asarray(self.spacing(patch.level), dtype=float)
+            offset += storage.size
+        owner = found[inside]
+        origin = np.asarray(self.lower_bound, dtype=float)
+        rel = np.empty((ndim, inside.size))
+        for axis in range(ndim):
+            rel[axis] = (np.asarray(wrapped[axis])[inside] - origin[axis]) * scale[
+                owner, axis
+            ] - first[owner, axis]
+        return (
+            inside,
+            rel,
+            # copies, not views: the transpose of one column has a stride Pyccel rejects
+            count[owner].T.copy(),
+            strides[owner].T.copy(),
+            start[owner],
+            blocks,
+            offset,
+        )
+
     def _shape(self, name: str, splines: Any, what: str) -> Any:
         """The `mpifield.Splines` of ``splines`` (a degree or one), checked against the halo."""
         from mpifield import splines as resolve
@@ -1781,9 +1857,11 @@ class AMRHierarchy:
         bilinear (cloud-in-cell) weights: the same weights as
         `CompositeNodes.deposit`,
         whose transposed interpolation the field gather is, and of
-        `interpolate`. These weights are added for the markers of all patches at
-        once (one ``bincount`` into a buffer of the blocks); a higher degree runs
-        mpifield's compiled kernels patch by patch. The values are
+        `interpolate`. With mpifield's built-in splines the markers of all patches are
+        deposited at once into a buffer of the blocks: the cloud-in-cell weights by
+        one ``bincount``, degrees 2 and 3 in one compiled call (``scatter_blocks``,
+        with mpifield's ``spline_cell``); another shape runs its own kernels patch by
+        patch. The values are
         charges, not a density. The markers must be on the ranks that
         `owner` gives (use `migrate`), so that the corners fall in
         the block or its halo, and the field needs a halo of at least one node.
@@ -1829,7 +1907,7 @@ class AMRHierarchy:
             for patch in self.local_patches:
                 patch.field(name).local_with_halos[...] = 0.0
         patches = self.patches
-        if shape.degree == 1:  # all patches in one pass over the markers
+        if _built_in(shape) and shape.degree == 1:  # all patches in one pass
             begin = time.perf_counter()
             inside, corners, blocks, total = self._linear_corners(
                 found, cell, wrapped, name
@@ -1838,6 +1916,23 @@ class AMRHierarchy:
             buffer = np.zeros(total)
             for flat, weight in corners:
                 buffer += np.bincount(flat, weights=charges * weight, minlength=total)
+            for _, offset, storage in blocks:
+                storage += buffer[offset : offset + storage.size].reshape(storage.shape)
+            if times is not None:
+                _share_time(times, patches, found[inside], time.perf_counter() - begin)
+            return
+        if _built_in(shape):  # all patches in one compiled call
+            from patchwork.kernels.scatter_blocks import kernel as scatter_blocks
+
+            begin = time.perf_counter()
+            inside, rel, count, stride, base, blocks, total = self._block_markers(
+                found, wrapped, name, shape.degree
+            )
+            buffer = np.zeros(total)
+            if inside.size:  # Pyccel's slices refuse empty arrays
+                scatter_blocks(
+                    rel, count, stride, base, charge[inside], shape.degree, buffer
+                )
             for _, offset, storage in blocks:
                 storage += buffer[offset : offset + storage.size].reshape(storage.shape)
             if times is not None:
@@ -1896,7 +1991,7 @@ class AMRHierarchy:
             )
         values = np.zeros(flat[0].size)
         patches = self.patches
-        if weights.degree == 1:  # all patches in one pass over the markers
+        if _built_in(weights) and weights.degree == 1:  # all patches in one pass
             begin = time.perf_counter()
             inside, corners, blocks, total = self._linear_corners(
                 found, cell, wrapped, name
@@ -1907,6 +2002,25 @@ class AMRHierarchy:
             gathered = np.zeros(inside.size)
             for where, weight in corners:
                 gathered += weight * buffer[where]
+            values[inside] = gathered
+            if times is not None:
+                _share_time(times, patches, found[inside], time.perf_counter() - begin)
+            return values.reshape(shape)
+        if _built_in(weights):  # all patches in one compiled call
+            from patchwork.kernels.gather_blocks import kernel as gather_blocks
+
+            begin = time.perf_counter()
+            inside, rel, count, stride, base, blocks, total = self._block_markers(
+                found, wrapped, name, weights.degree
+            )
+            buffer = np.empty(total)
+            for _, offset, storage in blocks:
+                buffer[offset : offset + storage.size] = np.asarray(storage).reshape(-1)
+            gathered = np.zeros(inside.size)
+            if inside.size:  # Pyccel's slices refuse empty arrays
+                gather_blocks(
+                    rel, count, stride, base, weights.degree, buffer, gathered
+                )
             values[inside] = gathered
             if times is not None:
                 _share_time(times, patches, found[inside], time.perf_counter() - begin)

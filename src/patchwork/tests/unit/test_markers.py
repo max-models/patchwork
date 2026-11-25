@@ -455,29 +455,30 @@ def test_the_node_grid_of_a_patch_holds_its_nodes() -> None:
         assert grid.geometry == (i0 * dx, j0 * dy, dx, dy, *patch.node_shape, 0, 0)
 
 
+@pytest.mark.parametrize("degree", [1, 2, 3])
 @pytest.mark.parametrize("periodic", [(False, False), (True, False)])
-def test_one_pass_linear_deposit_and_gather_equal_the_kernels_patch_by_patch(
-    periodic,
+def test_one_pass_deposit_and_gather_equal_the_kernels_patch_by_patch(
+    periodic, degree
 ) -> None:
     from mpifield import splines
 
     mesh = AMRHierarchy(base_shape=(8, 8), periodic=periodic)
     mesh.add_patch(1, ((4, 12), (4, 12)), ranks=0)
     mesh.add_patch(2, ((10, 18), (8, 16)), ranks=0)
-    mesh.allocate_field("q", centering="node")
+    mesh.allocate_field("q", centering="node", halo=2)
     rng = np.random.default_rng(WORLD.Get_rank())
     x, y = rng.uniform(0, 1, (2, 2000))
     charge = rng.uniform(0.5, 1.5, x.size)
     x, y, charge = mesh.migrate(x, y, charge, name="q")
-    mesh.deposit(x, y, charge, "q")
-    gathered = mesh.interpolate(x, y, "q")
+    mesh.deposit(x, y, charge, "q", splines=degree)
+    gathered = mesh.interpolate(x, y, "q", splines=degree)
     # the same with mpifield's compiled kernels, one patch at a time
-    linear = splines(1)
+    linear = splines(degree)
     flat, _ = mesh._points((x, y))
     found, _, wrapped = mesh._cells(flat)
     expected_gather = np.zeros(x.size)
     for patch in mesh.local_patches:
-        storage, grid = mesh._patch_block(patch, "q", 1)
+        storage, grid = mesh._patch_block(patch, "q", degree)
         reference = np.zeros_like(np.asarray(storage))
         number = mesh.patches.index(patch)
         chosen = np.flatnonzero(found == number)
@@ -492,3 +493,13 @@ def test_one_pass_linear_deposit_and_gather_equal_the_kernels_patch_by_patch(
         )
         expected_gather[chosen] = result[0]
     np.testing.assert_allclose(gathered, expected_gather, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("degree", [1, 2, 3])
+def test_a_rank_without_markers_deposits_and_gathers_nothing(degree) -> None:
+    mesh = AMRHierarchy(base_shape=(8, 8))
+    mesh.allocate_field("q", centering="node", halo=2)
+    empty = np.zeros(0)
+    mesh.deposit(empty, empty, empty, "q", splines=degree)
+    assert mesh.interpolate(empty, empty, "q", splines=degree).size == 0
+    assert all(not np.any(p.field("q").local) for p in mesh.local_patches)
