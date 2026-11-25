@@ -7,7 +7,9 @@ Every configuration runs ``--repeats`` times under ``scope-profiler run``; the t
 the median over the repeats of the mean time per step of each region (ms; under MPI on the
 rank where it is largest), and the mesh of
 the JSON line of the run: patches, refined cells, the share of patches a regrid keeps and
-the load imbalance (largest cells per rank over the mean). Profiles are written to ``--out``.
+the load imbalance (largest cells per rank over the mean) and the marker imbalance (largest
+markers per rank over the mean, after `migrate`). ``morton, markers`` weighs the Morton cuts
+with the markers, a marker costing a tenth of a cell. Profiles are written to ``--out``.
 """
 
 from __future__ import annotations
@@ -25,6 +27,13 @@ HERE = Path(__file__).parent
 BENCH = HERE / "bench_quadtree.py"
 PROFILER = Path(sys.executable).with_name("scope-profiler")
 PARTS = ("tag", "regrid", "migrate", "deposit", "solver", "solve", "halos", "gather")
+
+#: the placements compared under MPI, and their arguments
+PLACEMENTS = {
+    "balanced": ["--placement", "balanced"],
+    "morton": ["--placement", "morton"],
+    "morton, markers": ["--placement", "morton", "--marker-cost", "0.1"],
+}
 
 #: (label, arguments) of the meshes compared
 MESHES = [
@@ -81,7 +90,7 @@ def main() -> None:
     args, bench = parser.parse_known_args()
     args.out.mkdir(parents=True, exist_ok=True)
     placements = args.placements or (
-        ["balanced", "morton"] if args.ranks > 1 else ["balanced"]
+        list(PLACEMENTS) if args.ranks > 1 else ["balanced"]
     )
     extra = list(bench) + ([] if args.ranks == 1 else ["--no-solve"])
 
@@ -92,6 +101,7 @@ def main() -> None:
         "refined",
         "kept",
         "imbalance",
+        "markers",
         *PARTS,
         "total",
     ]
@@ -101,10 +111,11 @@ def main() -> None:
         for placement in placements:
             runs = []
             for repeat in range(args.repeats):
-                name = f"{label.replace(', ', '_').replace(' ', '')}_{placement}_{args.ranks}_{repeat}.h5"
+                name = f"{label}_{placement}_{args.ranks}_{repeat}".replace(", ", "_")
+                name = name.replace(" ", "") + ".h5"
                 runs.append(
                     run_once(
-                        [*arguments, "--placement", placement, *extra],
+                        [*arguments, *PLACEMENTS[placement], *extra],
                         args.ranks,
                         args.out / name,
                     )
@@ -120,6 +131,7 @@ def main() -> None:
                 f"{mesh['refined_cells']:.0f}",
                 f"{mesh['kept']:.0%}",
                 f"{mesh['load_imbalance']:.2f}",
+                f"{mesh['marker_imbalance']:.2f}",
                 *(f"{times[part]:.1f}" if times[part] else "-" for part in PARTS),
                 f"{total:.1f}",
             ]

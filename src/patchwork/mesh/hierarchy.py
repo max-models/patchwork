@@ -501,6 +501,9 @@ class AMRHierarchy:
         self._cells_on_rank = [0.0] * self.comm.Get_size()
         # halo exchanges and restrictions, by kind and field; rebuilt after add_patch
         self._schedules: dict[tuple[str, str], Any] = {}
+        # the halo geometry of each patch, kept across add_patch and regrid (halos.py)
+        if not hasattr(self, "_halo_records"):
+            self._halo_records: dict[tuple, dict] = {}
         # which patch owns each cell of every level, rebuilt after add_patch (locate)
         self._locators: tuple[Any, ...] | None = None
         self._field_specs: dict[str, dict[str, Any]] = {}
@@ -1003,6 +1006,7 @@ class AMRHierarchy:
         min_patch_size: int = 1,
         forbid: Any = None,
         placement: str | Callable[[int, IndexBox], Any] | None = None,
+        cost: Mapping[int, Any] | None = None,
         fill_halos: bool = False,
     ) -> AMRHierarchy:
         """A new hierarchy with patches over the tagged cells, and the fields moved to it.
@@ -1053,7 +1057,12 @@ class AMRHierarchy:
         are dropped, as are those that would need patches too close to it.
 
         New patches are placed by ``placement`` (default: this hierarchy's),
-        the largest first, or along a Morton curve with ``"morton"``. Collective over ``comm``; this hierarchy is left as
+        the largest first, or along a Morton curve with ``"morton"``. With
+        ``"morton"``, ``cost`` weighs the patches by more than their cells: a
+        mapping from a level to a per-cell cost of that level's shape, in units
+        of one cell (the markers of `marker_counts` times what a marker costs
+        against a cell), counted in the patch where the cell is a leaf
+        (`box_costs`), so that a rank with a dense beam gets fewer cells. Collective over ``comm``; this hierarchy is left as
         it is, except for the restriction of conservative fields.
         """
         from patchwork.mesh.regrid import (
@@ -1065,6 +1074,11 @@ class AMRHierarchy:
 
         if method not in ("cluster", "quadtree"):
             raise ValueError(f"method must be 'cluster' or 'quadtree', got {method!r}")
+        if (
+            cost is not None
+            and (self.placement if placement is None else placement) != "morton"
+        ):
+            raise ValueError("cost weighs the patches of placement='morton' only")
         if method == "quadtree" and max_patch_size is not None:
             raise ValueError(
                 "max_patch_size does not apply to method='quadtree': "
@@ -1095,6 +1109,7 @@ class AMRHierarchy:
         base = self.patches_at_level(0)
         new = AMRHierarchy.__new__(AMRHierarchy)
         new._communicators = self._communicators
+        new._halo_records = dict(self._halo_records)  # the kept patches reuse theirs
         new.__init__(  # type: ignore[misc]
             self.base_shape,  # type: ignore[arg-type]
             self.bounds,  # type: ignore[arg-type]
@@ -1109,13 +1124,17 @@ class AMRHierarchy:
             axis_nodes=self.axis_nodes,
         )
         if new.placement == "morton":
-            from patchwork.mesh.regrid import morton_ranks
+            from patchwork.mesh.regrid import box_costs, morton_ranks
 
+            weights, load = None, list(new.cells_on_rank)  # the base level
+            if cost is not None:
+                weights, load = box_costs(new, boxes, cost)
             ranks = morton_ranks(
                 boxes,
                 self.comm.Get_size(),
                 ratio=self.refinement_ratio,
-                load=new.cells_on_rank,  # the base level
+                load=load,
+                weights=weights,
             )
             for level in sorted(boxes):
                 for box, rank in zip(boxes[level], ranks[level], strict=True):

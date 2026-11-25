@@ -96,23 +96,23 @@ def function_tags(
     return tags
 
 
-def marker_tags(
-    hierarchy: AMRHierarchy, *coordinates: Any, per_cell: float, levels: int
+def marker_counts(
+    hierarchy: AMRHierarchy, *coordinates: Any, levels: int
 ) -> dict[int, np.ndarray]:
-    """Tag the cells of levels ``0 .. levels - 1`` that hold more than ``per_cell`` markers.
+    """The number of markers in every cell of levels ``0 .. levels - 1``, over all ranks.
 
-    ``marker_tags(x, ...)`` in 1D, ``marker_tags(x, y, ...)`` in 2D: the
-    positions of this rank's markers (arrays of one shape). The markers are
-    counted in the cells of every level, whether a patch covers them or not, and
-    the counts are added over the ranks (collective over ``comm``), so every
-    rank gets the same tags. Refinement driven by these tags stops where the
-    cells of a level hold at most ``per_cell`` markers each, as a particle tree
-    stops splitting at its leaf capacity. Markers outside the domain (and in the
-    notch of an L) are not counted.
+    ``marker_counts(x, ...)`` in 1D, ``marker_counts(x, y, ...)`` in 2D: the
+    positions of this rank's markers (arrays of one shape). Every level is
+    counted whole, whether a patch covers a cell or not, and the counts are
+    added over the ranks (collective over ``comm``): every rank gets the same
+    arrays, of the levels' shapes (`AMRHierarchy.level_shape`). Markers
+    outside the domain (and in the notch of an L) are not counted. The counts
+    make the tags of `marker_tags` and, scaled to the cost of a marker, the
+    ``cost`` of `AMRHierarchy.regrid`.
     """
     if len(coordinates) != hierarchy.ndim:
         raise ValueError(
-            f"marker_tags takes {hierarchy.ndim} coordinate arrays, "
+            f"marker counts take {hierarchy.ndim} coordinate arrays, "
             f"got {len(coordinates)}"
         )
     if levels < 0:
@@ -121,17 +121,32 @@ def marker_tags(
     if any(hierarchy.periodic):
         points = points.copy()
         hierarchy.wrap(points)
-    tags = {}
+    counts = {}
     for level in range(levels):
         edges = [
             hierarchy.node_positions(level, axis) for axis in range(points.shape[0])
         ]
-        counts, _ = np.histogramdd(points.T, bins=edges)
-        mine = np.ascontiguousarray(counts)
+        found, _ = np.histogramdd(points.T, bins=edges)
+        mine = np.ascontiguousarray(found)
         everyone = np.empty_like(mine)
         hierarchy.comm.Allreduce(mine, everyone, op=MPI.SUM)
-        tags[level] = (everyone > per_cell) & _domain_cells(hierarchy, level)
-    return tags
+        counts[level] = np.where(_domain_cells(hierarchy, level), everyone, 0.0)
+    return counts
+
+
+def marker_tags(
+    hierarchy: AMRHierarchy, *coordinates: Any, per_cell: float, levels: int
+) -> dict[int, np.ndarray]:
+    """Tag the cells of levels ``0 .. levels - 1`` that hold more than ``per_cell`` markers.
+
+    ``marker_tags(x, ...)`` in 1D, ``marker_tags(x, y, ...)`` in 2D, counted
+    by `marker_counts` (collective over ``comm``, the same tags on every
+    rank). Refinement driven by these tags stops where the cells of a level
+    hold at most ``per_cell`` markers each, as a particle tree stops splitting
+    at its leaf capacity.
+    """
+    counts = marker_counts(hierarchy, *coordinates, levels=levels)
+    return {level: found > per_cell for level, found in counts.items()}
 
 
 @sp.profile("patchwork.gradient_tags", tags=PROFILE_TAGS)
@@ -737,6 +752,7 @@ def morton_ranks(
     *,
     ratio: int = 2,
     load: Sequence[float] | None = None,
+    weights: Mapping[int, Sequence[float]] | None = None,
 ) -> dict[int, list[int]]:
     """The rank of each box: the boxes of all levels along a Morton curve, cut into ``size`` runs.
 
@@ -746,13 +762,16 @@ def morton_ranks(
     before the finer boxes at the same corner. Walking the curve, a rank takes
     boxes until its cells, with the ``load`` it already has (the cells of the
     base level, say), reach an equal share of all cells; then the next rank
-    goes on. Returns, per level, the ranks in the order of ``boxes[level]``.
+    goes on. ``weights`` (per level, one per box) replaces the cells of a box
+    by its cost, in the units of ``load``: with `box_costs`, the cells plus the
+    markers on them. Returns, per level, the ranks in the order of
+    ``boxes[level]``.
     """
     if size < 1:
         raise ValueError(f"size must be at least 1, got {size}")
-    weights = [0.0] * size if load is None else [float(w) for w in load]
-    if len(weights) != size:
-        raise ValueError(f"load needs {size} values, got {len(weights)}")
+    loads = [0.0] * size if load is None else [float(w) for w in load]
+    if len(loads) != size:
+        raise ValueError(f"load needs {size} values, got {len(loads)}")
     items = [
         (level, n, box) for level in sorted(boxes) for n, box in enumerate(boxes[level])
     ]
@@ -768,16 +787,68 @@ def morton_ranks(
         keys = xp.algorithms.morton_encode(*corners.T)  # 2D and 3D
     else:  # 1D: the curve is the axis
         keys = corners.reshape(-1)
-    cells = [float(np.prod([hi - lo for lo, hi in box])) for _, _, box in items]
-    share = (sum(weights) + sum(cells)) / size
+    if weights is None:
+        costs = [float(np.prod([hi - lo for lo, hi in box])) for _, _, box in items]
+    else:
+        for level in boxes:
+            if len(weights[level]) != len(boxes[level]):
+                raise ValueError(f"weights of level {level} need one value per box")
+        costs = [float(weights[level][n]) for level, n, _ in items]
+    share = (sum(loads) + sum(costs)) / size
     rank = 0
     for k in sorted(range(len(items)), key=lambda k: (int(keys[k]), items[k][0])):
-        while rank < size - 1 and weights[rank] + cells[k] / 2 > share:
+        while rank < size - 1 and loads[rank] + costs[k] / 2 > share:
             rank += 1
         level, n, _ = items[k]
         result[level][n] = rank
-        weights[rank] += cells[k]
+        loads[rank] += costs[k]
     return result
+
+
+def box_costs(
+    hierarchy: AMRHierarchy,
+    boxes: Mapping[int, Sequence[IndexBox]],
+    cost: Mapping[int, Any],
+) -> tuple[dict[int, list[float]], list[float]]:
+    """The cost of each new box and of each rank's base patches: cells plus the cost of the leaf cells.
+
+    ``cost`` maps a level to a per-cell cost of that level's shape, in units of
+    one cell (``0.5 * marker_counts(...)[level]`` if a marker costs half a cell;
+    a missing level costs nothing beyond its cells). A cell's cost goes to the
+    box where it is a leaf, not covered by a finer box, since that is where its
+    markers deposit and gather. ``hierarchy`` holds the base level (the patches
+    of level 0 with their ranks). Returns the weights of ``boxes`` per level and
+    the load of every rank from the base level, for `morton_ranks`.
+    """
+    ratio = hierarchy.refinement_ratio
+    top = max(boxes, default=0)
+    leaf_cost = {}
+    for level in range(top + 1):
+        shape = hierarchy.level_shape(level)
+        values = cost.get(level)
+        if values is None:
+            values = np.zeros(shape)
+        values = np.asarray(values, dtype=float)
+        if values.shape != shape:
+            raise ValueError(
+                f"cost of level {level} has the shape {values.shape}, not {shape}"
+            )
+        leaf = np.ones(shape, dtype=bool)
+        for box in boxes.get(level + 1, ()):
+            leaf[tuple(slice(lo // ratio, hi // ratio) for lo, hi in box)] = False
+        leaf_cost[level] = np.where(leaf, values, 0.0)
+
+    def weight(level: int, box: IndexBox) -> float:
+        where = tuple(slice(lo, hi) for lo, hi in box)
+        cells = float(np.prod([hi - lo for lo, hi in box]))
+        return cells + float(leaf_cost[level][where].sum())
+
+    weights = {level: [weight(level, box) for box in boxes[level]] for level in boxes}
+    load = [0.0] * hierarchy.comm.Get_size()
+    for patch in hierarchy.patches_at_level(0):
+        for rank in patch.ranks:
+            load[rank] += weight(0, patch.box) / len(patch.ranks)
+    return weights, load
 
 
 @sp.profile("patchwork.regrid_transfer", tags=PROFILE_TAGS)
