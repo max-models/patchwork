@@ -88,9 +88,13 @@ def locate_points(
         if fine_z > finest_cells[2] - 1:
             fine_z = finest_cells[2] - 1
         for level in range(num_levels - 1, -1, -1):
-            index_x = fine_x // span[level]
-            index_y = fine_y // span[level]
-            index_z = fine_z // span[level]
+            # fine_x // span[level], in double precision: the indices are not negative
+            # and far below 2**26, so the quotient truncates to the same integer, and a
+            # floating-point division costs a few cycles where Pyccel's integer floor
+            # division (py_floor_div_int64_t) takes tens; half the time of this kernel
+            index_x = int(fine_x / span[level])
+            index_y = int(fine_y / span[level])
+            index_z = int(fine_z / span[level])
             offset_x = index_x - table_corner[level, 0]
             offset_y = index_y - table_corner[level, 1]
             offset_z = index_z - table_corner[level, 2]

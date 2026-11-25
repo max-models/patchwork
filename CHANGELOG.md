@@ -5,6 +5,13 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- `locate_points` (Pyccel) is about twice as fast (35.7 to 15.9 ns per point on a two-level
+  hierarchy of picnic's extraction case), with the same results: the cell on each level is the
+  finest cell divided by the level's span in double precision instead of Pyccel's integer floor
+  division, which takes tens of cycles per division.
+
 ### Added
 
 - Quadtree regridding: `AMRHierarchy.regrid(method="quadtree", block_size=16)` places the
