@@ -446,3 +446,19 @@ def test_rebalance_moves_the_patches_and_their_fields_to_the_weighted_ranks() ->
             atol=1e-12,
         )
     assert mesh.rebalance().max_level == mesh.max_level  # by cells alone
+
+
+@pytest.mark.parametrize("graded", [False, True])
+def test_marker_counts_of_every_level_are_its_own_histogram(graded) -> None:
+    from patchwork import graded_nodes, marker_counts
+
+    axis = graded_nodes(0.0, 1.0, [(0.0, 0.05), (1.0, 0.2)]) if graded else None
+    shape = (len(axis) - 1, 8) if graded else (8, 8)
+    mesh = AMRHierarchy(base_shape=shape, axis_nodes=(axis, None))
+    rng = np.random.default_rng(WORLD.Get_rank())
+    x, y = rng.uniform(0, 1, (2, 3000))
+    counts = marker_counts(mesh, x, y, levels=3)
+    for level, found in counts.items():
+        edges = [mesh.node_positions(level, a) for a in range(2)]
+        expected, _ = np.histogramdd(np.stack([x, y]).T, bins=edges)
+        np.testing.assert_array_equal(found, WORLD.allreduce(expected))

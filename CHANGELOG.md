@@ -7,6 +7,10 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `deposit`, `interpolate`, `owner` and `migrate` group the markers by patch with one sort
+  instead of a scan of all markers per patch, and `marker_counts` histograms only the finest
+  level and sums it into the coarser ones: the quadtree benchmark's cycle 20-27% faster
+  (with mpiarray's faster `CopyPlan`).
 - `locate_points` (Pyccel) is about twice as fast (35.7 to 15.9 ns per point on a two-level
   hierarchy of picnic's extraction case), with the same results: the cell on each level is the
   finest cell divided by the level's span in double precision instead of Pyccel's integer floor

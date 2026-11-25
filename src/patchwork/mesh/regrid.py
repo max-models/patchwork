@@ -121,17 +121,24 @@ def marker_counts(
     if any(hierarchy.periodic):
         points = points.copy()
         hierarchy.wrap(points)
-    counts = {}
-    for level in range(levels):
-        edges = [
-            hierarchy.node_positions(level, axis) for axis in range(points.shape[0])
-        ]
-        found, _ = np.histogramdd(points.T, bins=edges)
-        mine = np.ascontiguousarray(found)
-        everyone = np.empty_like(mine)
-        hierarchy.comm.Allreduce(mine, everyone, op=MPI.SUM)
+    counts: dict[int, np.ndarray] = {}
+    if not levels:
+        return counts
+    # one histogram on the finest level; a coarser cell is the sum of its fine cells
+    top = levels - 1
+    edges = [hierarchy.node_positions(top, axis) for axis in range(points.shape[0])]
+    found, _ = np.histogramdd(points.T, bins=edges)
+    mine = np.ascontiguousarray(found)
+    everyone = np.empty_like(mine)
+    hierarchy.comm.Allreduce(mine, everyone, op=MPI.SUM)
+    ratio = hierarchy.refinement_ratio
+    for level in range(top, -1, -1):
+        if level < top:
+            blocks = [part for n in everyone.shape for part in (n // ratio, ratio)]
+            axes = tuple(range(1, 2 * everyone.ndim, 2))
+            everyone = everyone.reshape(blocks).sum(axis=axes)
         counts[level] = np.where(_domain_cells(hierarchy, level), everyone, 0.0)
-    return counts
+    return dict(sorted(counts.items()))
 
 
 def marker_tags(

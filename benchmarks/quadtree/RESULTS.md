@@ -72,6 +72,39 @@ the mean.
   halos and regrid. It pays where the markers dominate (many markers per cell, the push of a
   real simulation, many nodes). The 7 clusters cannot be balanced by any cut (2.2, 3.0).
 
+## Per-patch costs, before and after (2026-11-25, later)
+
+The same benchmark (now with an untimed first cycle: the compiled kernels load at their first
+call, which the runs above counted in their first step, ~30 ms per step in the deposit), on
+`devel` and with three changes: mpiarray builds a `CopyPlan` with array operations over the
+copies (116 → 43 ms for the 4422 copies of 392 patches), `deposit`, `interpolate` and the
+owners group the markers by patch with one sort instead of a scan of all markers per patch,
+and `marker_counts` histograms the finest level once and sums it into the coarser ones.
+Serial, median of 3 runs, ms per step:
+
+| mesh | | tag | regrid | migrate | deposit | solver | solve | halos | gather | total |
+|---|---|---|---|---|---|---|---|---|---|---|
+| cluster | before | 107.1 | 12.4 | 20.4 | 32.1 | 112.3 | 5.9 | 5.6 | 31.2 | 327 |
+| | after | 36.6 | 15.1 | 17.8 | 27.6 | 111.4 | 6.1 | 5.6 | 26.2 | 246 (−25%) |
+| cluster, `max_patch_size=16` | before | 105.4 | 94.5 | 40.5 | 103.5 | 127.1 | 12.5 | 124.0 | 74.5 | 682 |
+| | after | 35.1 | 78.8 | 29.8 | 76.9 | 124.5 | 12.8 | 101.3 | 51.7 | 511 (−25%) |
+| quadtree, block 8 | before | 105.6 | 285.9 | 65.9 | 206.4 | 180.2 | 22.7 | 265.8 | 130.9 | 1263 |
+| | after | 35.8 | 239.1 | 35.7 | 140.3 | 182.8 | 21.9 | 203.6 | 69.1 | 928 (−27%) |
+| quadtree, block 16 | before | 106.5 | 83.9 | 39.1 | 96.8 | 136.2 | 12.7 | 72.3 | 73.6 | 621 |
+| | after | 36.6 | 65.9 | 29.5 | 77.2 | 138.4 | 12.4 | 56.8 | 50.9 | 468 (−25%) |
+| quadtree, block 32 | before | 103.3 | 25.9 | 29.4 | 63.8 | 208.0 | 12.1 | 31.3 | 50.9 | 525 |
+| | after | 35.8 | 27.7 | 26.6 | 54.0 | 200.1 | 11.7 | 20.7 | 42.3 | 419 (−20%) |
+
+- Tagging is three times faster everywhere (one histogram instead of one per level).
+- Gather, migrate and deposit lose their scan per patch: blocks of 8 gather in 69 ms instead
+  of 131, migrate in 36 instead of 66.
+- Halos and the regrid gain from the cheaper `CopyPlan` (blocks of 8: 266 → 204 and
+  286 → 239 ms).
+- What is left with blocks of 8: the regrid (239 ms, mostly the transfer's geometry per
+  patch), the halos (204, the geometry of the patches that do not reuse theirs), the solver
+  setup (183, mostly the composite node numbering) and the deposit (140, of which ~65 the
+  schedule of `accumulate_halos`, built per hierarchy like the halos').
+
 ## Fixed on the way
 
 The regrid's transfer compared every new patch with every old one of its level, and copied
