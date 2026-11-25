@@ -25,6 +25,13 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `placement="morton"`: `regrid` puts the patches on the ranks along a Morton curve
   (`morton_ranks`), all levels on one curve keyed in cells of the finest level, cut into runs
   of about equal cells with the base level's cells counted.
+- Morton cuts weighted by cost: `regrid(..., placement="morton", cost=...)` weighs every patch
+  by its cells plus the cost of its leaf cells (`box_costs`), e.g. the markers of
+  `marker_counts` times what a marker costs against a cell; `rebalance(cost)` places the
+  patches of a hierarchy again by them and moves the fields.
+- The halo geometry of every patch (its copies and interpolation weights) is kept on the
+  hierarchy and handed on by `regrid`: a patch with the same box and ranks and the same
+  patches within reach of its halo reuses it instead of finding it again.
 - Benchmark `benchmarks/quadtree`: clusters against quadtree blocks in a particle-in-cell
   cycle, serially and under MPI with both placements (`RESULTS.md`).
 - `marker_tags(hierarchy, x, y, per_cell=..., levels=...)`: tag the cells that hold more than

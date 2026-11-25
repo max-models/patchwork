@@ -971,6 +971,63 @@ class AMRHierarchy:
 
         self._schedule("restrict", name, Restriction).execute(level=level)
 
+    def _rebuilt(
+        self,
+        boxes: Mapping[int, Sequence[IndexBox]],
+        placement: Any,
+        cost: Mapping[int, Any] | None,
+        fill_halos: bool,
+    ) -> AMRHierarchy:
+        """A hierarchy with this base and the refined ``boxes``, with the fields moved over."""
+        from patchwork.mesh.regrid import transfer
+
+        base = self.patches_at_level(0)
+        new = AMRHierarchy.__new__(AMRHierarchy)
+        new._communicators = self._communicators
+        new._halo_records = dict(self._halo_records)  # the kept patches reuse theirs
+        new.__init__(  # type: ignore[misc]
+            self.base_shape,  # type: ignore[arg-type]
+            self.bounds,  # type: ignore[arg-type]
+            refinement_ratio=self.refinement_ratio,
+            periodic=self.periodic,
+            base_boxes=[patch.box for patch in base],
+            base_ranks=[patch.ranks for patch in base],
+            placement=self.placement if placement is None else placement,
+            max_cells_per_rank=self.max_cells_per_rank,
+            comm=self.comm,
+            geometry=self.geometry,
+            axis_nodes=self.axis_nodes,
+        )
+        if new.placement == "morton":
+            from patchwork.mesh.regrid import box_costs, morton_ranks
+
+            weights, load = None, list(new.cells_on_rank)  # the base level
+            if cost is not None:
+                weights, load = box_costs(new, boxes, cost)
+            ranks = morton_ranks(
+                boxes,
+                self.comm.Get_size(),
+                ratio=self.refinement_ratio,
+                load=load,
+                weights=weights,
+            )
+            for level in sorted(boxes):
+                for box, rank in zip(boxes[level], ranks[level], strict=True):
+                    new.add_patch(level, box, ranks=rank)
+        else:
+            for level in sorted(boxes):
+                for box in sorted(boxes[level], key=lambda b: -_shared_cells(b, b)):
+                    new.add_patch(level, box)
+        for name, spec in self._field_specs.items():
+            if spec["conservative"]:
+                self.restrict(name)
+            new.allocate_field(name, **spec)
+            transfer(self, new, name)
+        if fill_halos:
+            for name in new.field_names:
+                new.exchange_halos(name)
+        return new
+
     @sp.profile("patchwork.mesh.regrid", tags=PROFILE_TAGS)
     @method(
         equations={
@@ -1065,12 +1122,7 @@ class AMRHierarchy:
         (`box_costs`), so that a rank with a dense beam gets fewer cells. Collective over ``comm``; this hierarchy is left as
         it is, except for the restriction of conservative fields.
         """
-        from patchwork.mesh.regrid import (
-            combine_tags,
-            new_boxes,
-            quadtree_boxes,
-            transfer,
-        )
+        from patchwork.mesh.regrid import combine_tags, new_boxes, quadtree_boxes
 
         if method not in ("cluster", "quadtree"):
             raise ValueError(f"method must be 'cluster' or 'quadtree', got {method!r}")
@@ -1106,52 +1158,26 @@ class AMRHierarchy:
                 min_patch_size=min_patch_size,
                 forbid=forbid,
             )
-        base = self.patches_at_level(0)
-        new = AMRHierarchy.__new__(AMRHierarchy)
-        new._communicators = self._communicators
-        new._halo_records = dict(self._halo_records)  # the kept patches reuse theirs
-        new.__init__(  # type: ignore[misc]
-            self.base_shape,  # type: ignore[arg-type]
-            self.bounds,  # type: ignore[arg-type]
-            refinement_ratio=self.refinement_ratio,
-            periodic=self.periodic,
-            base_boxes=[patch.box for patch in base],
-            base_ranks=[patch.ranks for patch in base],
-            placement=self.placement if placement is None else placement,
-            max_cells_per_rank=self.max_cells_per_rank,
-            comm=self.comm,
-            geometry=self.geometry,
-            axis_nodes=self.axis_nodes,
-        )
-        if new.placement == "morton":
-            from patchwork.mesh.regrid import box_costs, morton_ranks
+        return self._rebuilt(boxes, placement, cost, fill_halos)
 
-            weights, load = None, list(new.cells_on_rank)  # the base level
-            if cost is not None:
-                weights, load = box_costs(new, boxes, cost)
-            ranks = morton_ranks(
-                boxes,
-                self.comm.Get_size(),
-                ratio=self.refinement_ratio,
-                load=load,
-                weights=weights,
-            )
-            for level in sorted(boxes):
-                for box, rank in zip(boxes[level], ranks[level], strict=True):
-                    new.add_patch(level, box, ranks=rank)
-        else:
-            for level in sorted(boxes):
-                for box in sorted(boxes[level], key=lambda b: -_shared_cells(b, b)):
-                    new.add_patch(level, box)
-        for name, spec in self._field_specs.items():
-            if spec["conservative"]:
-                self.restrict(name)
-            new.allocate_field(name, **spec)
-            transfer(self, new, name)
-        if fill_halos:
-            for name in new.field_names:
-                new.exchange_halos(name)
-        return new
+    @sp.profile("patchwork.rebalance", tags=PROFILE_TAGS)
+    def rebalance(
+        self, cost: Mapping[int, Any] | None = None, *, fill_halos: bool = False
+    ) -> AMRHierarchy:
+        """The same patches placed again along the Morton curve, by ``cost``; fields moved.
+
+        Every refined patch goes to a rank by `morton_ranks`, weighed by its
+        cells plus the ``cost`` of its leaf cells as in `regrid` (`box_costs`;
+        without ``cost`` by its cells). The base level stays where it is. Every
+        field is copied to the patches' new ranks; send the markers after them
+        with `migrate`. The new hierarchy places its regrids along the curve as
+        well (``placement="morton"``). Collective over ``comm``.
+        """
+        boxes = {
+            level: [patch.box for patch in self.patches_at_level(level)]
+            for level in range(1, self.max_level + 1)
+        }
+        return self._rebuilt(boxes, "morton", cost, fill_halos)
 
     def integral(self, name: str) -> float:
         """The integral of field ``name`` over the domain, from the finest values.

@@ -395,3 +395,54 @@ def test_regrid_with_marker_costs_gives_the_dense_patches_fewer_cells() -> None:
     assert max(costs(weighted)) <= max(costs(plain)) + 1e-9
     with pytest.raises(ValueError, match="morton"):
         AMRHierarchy(base_shape=(4, 4)).regrid({0: np.ones((4, 4), bool)}, cost=cost)
+
+
+def test_rebalance_moves_the_patches_and_their_fields_to_the_weighted_ranks() -> None:
+    from patchwork import box_costs, marker_counts
+
+    mesh = AMRHierarchy(base_shape=(16, 16), placement="balanced")
+    mesh.allocate_field("u", centering="node")
+    mesh.allocate_field("c")
+    mesh = mesh.regrid(
+        function_tags(mesh, ring, levels=2), method="quadtree", block_size=4
+    )
+    mesh = mesh.regrid(
+        function_tags(mesh, ring, levels=2), method="quadtree", block_size=4
+    )
+
+    def plane(x, y):
+        return 1.0 + 2.0 * x - 3.0 * y
+
+    for patch in mesh.local_patches:
+        patch.field("u").local[...] = plane(*patch.local_node_coordinates(mesh, "u"))
+        patch.field("c").local[...] = plane(*patch.local_cell_centers(mesh, "c"))
+    x = np.full(100, 0.21)[WORLD.Get_rank() :: SIZE]
+    y = np.full(100, 0.5)[WORLD.Get_rank() :: SIZE]
+    cost = marker_counts(mesh, x, y, levels=3)
+    moved = mesh.rebalance(cost)
+
+    assert moved.placement == "morton"
+    assert [(p.level, p.box) for p in moved.patches] == [
+        (p.level, p.box) for p in mesh.patches
+    ]
+    boxes = {
+        level: [p.box for p in mesh.patches_at_level(level)]
+        for level in range(1, mesh.max_level + 1)
+    }
+    weights, load = box_costs(moved, boxes, cost)
+    expected = morton_ranks(boxes, SIZE, load=load, weights=weights)
+    for level in boxes:
+        ranks = [p.ranks for p in moved.patches_at_level(level)]
+        assert ranks == [(r,) for r in expected[level]]
+    for patch in moved.local_patches:
+        np.testing.assert_allclose(
+            patch.field("u").local,
+            plane(*patch.local_node_coordinates(moved, "u")),
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(
+            patch.field("c").local,
+            plane(*patch.local_cell_centers(moved, "c")),
+            atol=1e-12,
+        )
+    assert mesh.rebalance().max_level == mesh.max_level  # by cells alone
