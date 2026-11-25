@@ -105,6 +105,37 @@ Serial, median of 3 runs, ms per step:
   setup (183, mostly the composite node numbering) and the deposit (140, of which ~65 the
   schedule of `accumulate_halos`, built per hierarchy like the halos').
 
+## Node numbering, accumulation, halo pairs and `regrid(fields=...)` (2026-11-25, later)
+
+Against `devel` after the changes above. `CompositeNodes` finds the cells under finer
+patches from one coverage mask per level instead of every patch against every patch of the
+next level; the schedule of `accumulate_halos` takes the rank of a node's owner from a table
+where the owner is on one rank; the halo copies between two patches of a level are kept per
+pair; `in_domain` is a bounds check where the domain fills its box; and `regrid` takes
+`fields`, the fields to move (the others are new and zero). Serial, median of 3 runs, ms per
+step, total:
+
+| mesh | devel (all fields moved) | this, all fields moved | this, `fields=[]` |
+|---|---|---|---|
+| cluster | 241 | 245 | 225 (−7%) |
+| cluster, `max_patch_size=16` | 496 | 495 | 430 (−13%) |
+| quadtree, block 8 | 938 | 837 (−11%) | 632 (−33%) |
+| quadtree, block 16 | 474 | 455 (−4%) | 388 (−18%) |
+| quadtree, block 32 | 427 | 442 (within the noise) | 401 (−6%) |
+
+- With many patches the node numbering was quadratic: blocks of 8, solver setup 180 →
+  111 ms (the numbering itself 143 → 24 ms); the rest of the setup is the assembly and the
+  LU factorisation, which do not depend on the patches.
+- The deposit's accumulation schedule: 141 → 112 ms with blocks of 8.
+- Not moving the fields that are computed again after the regrid (the charge, deposited;
+  the potential, solved for) leaves the regrid with the boxes and the new hierarchy:
+  blocks of 8, 253 → 84 ms; clusters, 14 → 3 ms.
+- The halos did not get faster from the pair cache (195 → 186 ms with blocks of 8, within
+  the noise): what is left of their schedule is the `CopyPlan` (~65 ms), the coarse-to-fine
+  interpolation of the patches whose neighbourhood changed (~35 ms) and the signatures
+  (~33 ms). The next step there: keep the `CopyPlan` of the kept patches, or set up the
+  interpolation of all patches at once.
+
 ## Fixed on the way
 
 The regrid's transfer compared every new patch with every old one of its level, and copied
