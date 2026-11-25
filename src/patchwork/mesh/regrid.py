@@ -33,6 +33,7 @@ from __future__ import annotations
 import itertools
 from typing import TYPE_CHECKING, Any
 
+import cunumpy as xp
 import mpiarray as mpa
 import numpy as np
 import scope_profiler as sp
@@ -50,7 +51,7 @@ from patchwork.mesh.halos import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Mapping, Sequence
 
     from patchwork.mesh.hierarchy import AMRHierarchy, IndexBox
 
@@ -715,6 +716,70 @@ def quadtree_boxes(
     return boxes
 
 
+@method(
+    equations={
+        "key": r"k(B) = \sum_{b} \sum_{d=0}^{D-1} \mathrm{bit}_b\big(r^{L - \ell}\, i_d\big)\, 2^{bD + d} \quad \text{(the lower corner } \mathbf i \text{ of } B \text{ on level } \ell\text{, in cells of the finest level } L\text{)}",
+        "ranks": r"\text{along the curve, rank } q \text{ takes boxes while } w_q + |B|/2 \le T, \quad T = \frac{1}{R}\Big(\sum_q w_q^{0} + \sum_B |B|\Big)",
+    },
+    assumptions=(
+        "the patches of all refined levels on one curve, a coarse patch before the finer ones at the same corner, so that a patch and the patches over it tend to share a rank",
+        "the load a rank already has (the base level) counts: such a rank takes fewer patches",
+        "a patch stays on one rank",
+    ),
+    references=(
+        "[Morton, IBM technical report (1966)](https://dominoweb.draco.res.ibm.com/reports/Morton1966.pdf)",
+        "[Burstedde, Wilcox and Ghattas, SIAM J. Sci. Comput. 33, 1103 (2011)](https://doi.org/10.1137/100791634)",
+    ),
+)
+def morton_ranks(
+    boxes: Mapping[int, Sequence[IndexBox]],
+    size: int,
+    *,
+    ratio: int = 2,
+    load: Sequence[float] | None = None,
+) -> dict[int, list[int]]:
+    """The rank of each box: the boxes of all levels along a Morton curve, cut into ``size`` runs.
+
+    ``boxes`` maps a level to its boxes. Every box gets the Morton (Z-order)
+    key of its lower corner in cells of the finest level, so that boxes close
+    in space are close on the curve whatever their level, and a box comes
+    before the finer boxes at the same corner. Walking the curve, a rank takes
+    boxes until its cells, with the ``load`` it already has (the cells of the
+    base level, say), reach an equal share of all cells; then the next rank
+    goes on. Returns, per level, the ranks in the order of ``boxes[level]``.
+    """
+    if size < 1:
+        raise ValueError(f"size must be at least 1, got {size}")
+    weights = [0.0] * size if load is None else [float(w) for w in load]
+    if len(weights) != size:
+        raise ValueError(f"load needs {size} values, got {len(weights)}")
+    items = [
+        (level, n, box) for level in sorted(boxes) for n, box in enumerate(boxes[level])
+    ]
+    result: dict[int, list[int]] = {level: [0] * len(boxes[level]) for level in boxes}
+    if not items:
+        return result
+    top = max(level for level, _, _ in items)
+    corners = np.array(
+        [[lo * ratio ** (top - level) for lo, _ in box] for level, _, box in items],
+        dtype=np.uint64,
+    )
+    if corners.shape[1] > 1:
+        keys = xp.algorithms.morton_encode(*corners.T)  # 2D and 3D
+    else:  # 1D: the curve is the axis
+        keys = corners.reshape(-1)
+    cells = [float(np.prod([hi - lo for lo, hi in box])) for _, _, box in items]
+    share = (sum(weights) + sum(cells)) / size
+    rank = 0
+    for k in sorted(range(len(items)), key=lambda k: (int(keys[k]), items[k][0])):
+        while rank < size - 1 and weights[rank] + cells[k] / 2 > share:
+            rank += 1
+        level, n, _ = items[k]
+        result[level][n] = rank
+        weights[rank] += cells[k]
+    return result
+
+
 @sp.profile("patchwork.regrid_transfer", tags=PROFILE_TAGS)
 def transfer(old: AMRHierarchy, new: AMRHierarchy, name: str) -> None:
     """Fill field ``name`` of ``new`` from ``old``, level by level (collective).
@@ -743,9 +808,10 @@ def transfer(old: AMRHierarchy, new: AMRHierarchy, name: str) -> None:
         for patch in new.patches_at_level(level):
             own = points.own(patch)
             origin = tuple(lo for lo, _ in own)
-            covered = np.zeros([hi - lo for lo, hi in own], dtype=bool)
+            # the old patches near this one (a bin index, not every pair)
+            mine = []
             for previous in (
-                old.patches_at_level(level) if level <= old.max_level else ()
+                old_points.near(level, own) if level <= old.max_level else ()
             ):
                 theirs = old_points.own(previous)
                 their_origin = tuple(lo for lo, _ in theirs)
@@ -758,11 +824,19 @@ def transfer(old: AMRHierarchy, new: AMRHierarchy, name: str) -> None:
                         tuple(-d - o for d, o in zip(shift, their_origin, strict=True)),
                     )
                     target = _shift(part, tuple(-o for o in origin))
-                    copies.append(
-                        (old_field(previous), source, new_field(patch), target)
-                    )
-                    covered[tuple(slice(s, e) for s, e in target)] = True
-            if level == 0:
+                    mine.append((old_field(previous), source, new_field(patch), target))
+            # the last copy of a point wins: drop the copies that later ones overwrite
+            # entirely (an old patch with the same box makes its neighbours' shared
+            # nodes redundant), so that a kept patch costs one copy, not one per neighbour
+            covered = np.zeros([hi - lo for lo, hi in own], dtype=bool)
+            kept = []
+            for copy in reversed(mine):
+                where = tuple(slice(s, e) for s, e in copy[3])
+                if not covered[where].all():
+                    kept.append(copy)
+                    covered[where] = True
+            copies.extend(reversed(kept))
+            if level == 0 or covered.all():
                 continue
             index = tuple(
                 values + o

@@ -299,10 +299,16 @@ class AMRHierarchy:
     on several, over which mpiarray splits its fields. ``placement`` says
     where a patch goes that is added without ``ranks``: ``"all"`` puts it on
     every rank, ``"balanced"`` on the one rank that holds the fewest cells so
-    far, or a function ``placement(level, box)`` that returns the ranks (as
-    ``ranks`` of `add_patch` takes them). With ``max_cells_per_rank``, a
-    ``"balanced"`` patch with more cells than that is split over as many of
-    the least loaded ranks as it needs (at most all of them).
+    far, ``"morton"`` along a Morton (Z-order) curve when `regrid` places the
+    patches (`morton_ranks`: the patches of all levels in the order of the
+    curve, cut into runs of about equal cells with the base level counted,
+    one run per rank, so that neighbouring patches and the patches over them
+    tend to share a rank; a patch added by `add_patch` goes where
+    ``"balanced"`` would put it), or a function ``placement(level, box)`` that
+    returns the ranks (as ``ranks`` of `add_patch` takes them). With
+    ``max_cells_per_rank``, a ``"balanced"`` patch with more cells than that is
+    split over as many of the least loaded ranks as it needs (at most all of
+    them); a ``"morton"`` patch stays on one rank.
 
     The domain is the rectangle of ``base_shape`` cells, or with ``base_boxes``
     the union of those boxes of base cells: an L, a T, a rectangle with a notch.
@@ -477,9 +483,10 @@ class AMRHierarchy:
                 )
         self.geometry = geometry
         self.comm = mpa.default_comm() if comm is None else comm
-        if not callable(placement) and placement not in ("all", "balanced"):
+        if not callable(placement) and placement not in ("all", "balanced", "morton"):
             raise ValueError(
-                f"placement must be 'all', 'balanced' or a function, got {placement!r}"
+                "placement must be 'all', 'balanced', 'morton' or a function, "
+                f"got {placement!r}"
             )
         if max_cells_per_rank is not None and int(max_cells_per_rank) < 1:
             raise ValueError("max_cells_per_rank must be at least 1")
@@ -1046,7 +1053,7 @@ class AMRHierarchy:
         are dropped, as are those that would need patches too close to it.
 
         New patches are placed by ``placement`` (default: this hierarchy's),
-        the largest first. Collective over ``comm``; this hierarchy is left as
+        the largest first, or along a Morton curve with ``"morton"``. Collective over ``comm``; this hierarchy is left as
         it is, except for the restriction of conservative fields.
         """
         from patchwork.mesh.regrid import (
@@ -1101,9 +1108,22 @@ class AMRHierarchy:
             geometry=self.geometry,
             axis_nodes=self.axis_nodes,
         )
-        for level in sorted(boxes):
-            for box in sorted(boxes[level], key=lambda b: -_shared_cells(b, b)):
-                new.add_patch(level, box)
+        if new.placement == "morton":
+            from patchwork.mesh.regrid import morton_ranks
+
+            ranks = morton_ranks(
+                boxes,
+                self.comm.Get_size(),
+                ratio=self.refinement_ratio,
+                load=new.cells_on_rank,  # the base level
+            )
+            for level in sorted(boxes):
+                for box, rank in zip(boxes[level], ranks[level], strict=True):
+                    new.add_patch(level, box, ranks=rank)
+        else:
+            for level in sorted(boxes):
+                for box in sorted(boxes[level], key=lambda b: -_shared_cells(b, b)):
+                    new.add_patch(level, box)
         for name, spec in self._field_specs.items():
             if spec["conservative"]:
                 self.restrict(name)

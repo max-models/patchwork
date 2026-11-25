@@ -16,6 +16,7 @@ from patchwork.mesh.regrid import (
     function_tags,
     gradient_tags,
     marker_tags,
+    morton_ranks,
     quadtree_boxes,
 )
 
@@ -29,6 +30,7 @@ __all__ = [
     "graded_nodes",
     "gradient_tags",
     "marker_tags",
+    "morton_ranks",
     "plot_patches",
     "quadtree_boxes",
 ]
