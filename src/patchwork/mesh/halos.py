@@ -674,7 +674,7 @@ class HaloExchange:
 
         def touching(regions: np.ndarray, level: int) -> tuple[list[Patch], np.ndarray]:
             """The patches of ``level`` and which of them overlap each region."""
-            candidates = hierarchy.patches_at_level(level)
+            candidates = list(hierarchy.patches_at_level(level))
             theirs = boxes(candidates)
             hit = np.zeros((regions.shape[0], theirs.shape[0]), dtype=bool)
             for shift in points.shifts(level):
@@ -693,6 +693,8 @@ class HaloExchange:
             own = boxes(mine)
             extended = own + np.array([-width, width], dtype=np.int64)
             same, hit = touching(extended, level)
+            below: list[Patch] = []
+            under = np.zeros((len(mine), 0), dtype=bool)
             if level > 0:
                 coarse = np.stack(
                     [extended[..., 0] // ratio - 1, -(-extended[..., 1] // ratio) + 2],
@@ -702,10 +704,14 @@ class HaloExchange:
             for n, patch in enumerate(mine):
                 key = (
                     _key(patch),
-                    tuple(_key(same[m]) for m in np.flatnonzero(hit[n])),
+                    tuple(_key(same[m]) for m in np.flatnonzero(hit[n]).tolist()),
                 )
                 if level > 0:
-                    key += (tuple(_key(below[m]) for m in np.flatnonzero(under[n])),)
+                    key += (
+                        tuple(
+                            _key(below[m]) for m in np.flatnonzero(under[n]).tolist()
+                        ),
+                    )
                 result[id(patch)] = key
         return result
 

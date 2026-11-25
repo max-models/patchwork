@@ -1015,7 +1015,7 @@ class AMRHierarchy:
         self,
         boxes: Mapping[int, Sequence[IndexBox]],
         placement: Any,
-        cost: Mapping[int, Any] | None,
+        cost: Mapping[Any, Any] | None,
         fill_halos: bool,
         fields: Sequence[str] | None = None,
     ) -> AMRHierarchy:
@@ -1054,7 +1054,7 @@ class AMRHierarchy:
                 ranks = curve_ranks(
                     boxes,
                     size,
-                    curve=new.placement,
+                    curve=str(new.placement),
                     ratio=self.refinement_ratio,
                     load=load,
                     weights=weights,
@@ -1117,7 +1117,7 @@ class AMRHierarchy:
         min_patch_size: int = 1,
         forbid: Any = None,
         placement: str | Callable[[int, IndexBox], Any] | None = None,
-        cost: Mapping[int, Any] | None = None,
+        cost: Mapping[Any, Any] | None = None,
         fill_halos: bool = False,
         fields: Sequence[str] | None = None,
     ) -> AMRHierarchy:
@@ -1230,7 +1230,7 @@ class AMRHierarchy:
     @sp.profile("patchwork.rebalance", tags=PROFILE_TAGS)
     def rebalance(
         self,
-        cost: Mapping[int, Any] | None = None,
+        cost: Mapping[Any, Any] | None = None,
         *,
         placement: str = "morton",
         fill_halos: bool = False,

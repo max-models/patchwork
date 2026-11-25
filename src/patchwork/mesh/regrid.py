@@ -883,7 +883,7 @@ def knapsack_ranks(
 def box_costs(
     hierarchy: AMRHierarchy,
     boxes: Mapping[int, Sequence[IndexBox]],
-    cost: Mapping[int, Any],
+    cost: Mapping[Any, Any],
 ) -> tuple[dict[int, list[float]], list[float]]:
     """The cost of each new box and of each rank's base patches.
 
