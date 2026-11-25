@@ -111,7 +111,7 @@ class Accumulation:
                 [[b1 - b0 for b0, b1 in a.layout.index_bounds] for a in arrays],
                 dtype=np.int64,
             ).reshape(len(local), ndim)
-            sizes_local = np.prod(shape, axis=1)
+            sizes_local = np.prod(shape, axis=1).astype(np.intp)  # np.repeat: intp
             which = np.repeat(np.arange(len(local)), sizes_local)  # local patch
             rest = np.arange(which.size) - np.repeat(
                 np.cumsum(sizes_local) - sizes_local, sizes_local
