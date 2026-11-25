@@ -11,7 +11,13 @@ from patchwork.mesh.grading import graded_nodes
 from patchwork.mesh.hierarchy import AMRHierarchy, IndexBox, Patch
 from patchwork.mesh.plotting import plot_patches
 from patchwork.mesh.reflux import FluxRegister
-from patchwork.mesh.regrid import cluster, function_tags, gradient_tags
+from patchwork.mesh.regrid import (
+    cluster,
+    function_tags,
+    gradient_tags,
+    marker_tags,
+    quadtree_boxes,
+)
 
 __all__ = [
     "AMRHierarchy",
@@ -20,7 +26,9 @@ __all__ = [
     "Patch",
     "cluster",
     "function_tags",
-    "gradient_tags",
     "graded_nodes",
+    "gradient_tags",
+    "marker_tags",
     "plot_patches",
+    "quadtree_boxes",
 ]
