@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -95,6 +96,20 @@ _PLACEMENTS = ("all", "balanced", "morton", "hilbert")
 
 #: Tag of the messages that carry a gathered patch field to another rank.
 _GATHER_TAG = 7311
+
+
+def _share_time(
+    times: dict, patches: Sequence[Any], owner: Any, seconds: float
+) -> None:
+    """Add ``seconds`` spent on markers of several patches to ``times``, split by markers."""
+    import numpy as np
+
+    if not owner.size:
+        return
+    numbers, counts = np.unique(owner, return_counts=True)
+    for number, count in zip(numbers.tolist(), counts.tolist(), strict=True):
+        key = (patches[number].level, patches[number].box)
+        times[key] = times.get(key, 0.0) + seconds * count / owner.size
 
 
 def _by_patch(found: Any) -> Iterator[tuple[int, Any]]:
@@ -1462,8 +1477,15 @@ class AMRHierarchy:
 
         blocks = self._schedule("blocks", name, _gather_blocks)
         patches = self.patches
-        result = np.full(found.shape, -1, dtype=np.int64)
-        for number, chosen in _by_patch(found):
+        # a patch on one rank: that rank, for all its markers at once
+        single = np.full(len(patches) + 1, -1, dtype=np.int64)
+        for number, (members, replicated) in blocks.items():
+            if len(members) == 1 and not replicated:
+                single[number] = members[0][0]
+        result = single[found]  # -1 (outside the domain) picks the last entry
+        several = np.flatnonzero((result < 0) & (found >= 0))
+        for number, part in _by_patch(found[several]):
+            chosen = several[part]
             members, replicated = blocks[number]
             if replicated:
                 raise ValueError(
@@ -1637,6 +1659,80 @@ class AMRHierarchy:
         start = [f + lo for f, lo in zip(first, lower, strict=True)]
         return block, self._grid(patch, start, block.shape)
 
+    def _linear_corners(
+        self, found: Any, cell: tuple[Any, ...], wrapped: Any, name: str
+    ) -> tuple[Any, list[tuple[Any, Any]], list[tuple[int, int, Any]], int]:
+        """The cloud-in-cell corners of all markers at once, in one buffer of the blocks.
+
+        Every marker in the domain reads or writes the ``2**ndim`` corners of its cell in
+        the stored block of its patch (`_stored_block`), with the weights of mpifield's
+        linear kernels: ``(1 - f)`` and ``f`` per axis, ``f`` the marker's place in its
+        cell. The blocks of the patches with markers are laid end to end in one flat
+        buffer. Returns the markers in the domain, ``(flat index, weight)`` per corner,
+        ``(patch number, offset, storage)`` per block, and the buffer's size.
+        """
+        import numpy as np
+
+        inside = np.flatnonzero(found >= 0)
+        numbers = np.flatnonzero(
+            np.bincount(found[inside], minlength=len(self.patches))
+        )
+        patches = self.patches
+        ndim = self.ndim
+        blocks = []
+        offset = 0
+        first = np.zeros((len(patches), ndim), dtype=np.int64)
+        start = np.zeros(len(patches), dtype=np.int64)
+        strides = np.zeros((len(patches), ndim), dtype=np.int64)
+        spacing = np.ones((len(patches), ndim))
+        for number in numbers.tolist():
+            patch = patches[number]
+            array = patch.field(name)
+            layout = array.layout
+            storage = array.local_with_halos
+            blocks.append((number, offset, storage))
+            start[number] = offset
+            first[number] = [
+                lo + b0 - h
+                for (lo, _), (b0, _), h in zip(
+                    patch.box, layout.index_bounds, layout.halo, strict=True
+                )
+            ]
+            stride = 1
+            for axis in range(ndim - 1, -1, -1):
+                strides[number, axis] = stride
+                stride *= storage.shape[axis]
+            spacing[number] = self.spacing(patch.level)
+            offset += storage.size
+        owner = found[inside]
+        origin = np.asarray(self.lower_bound, dtype=float)
+        # the flat index of each marker's lower corner, and the steps to the others
+        base = start - np.einsum("pa,pa->p", first, strides)
+        flat = base[owner]
+        steps, fraction = [], []
+        for axis in range(ndim):
+            index = np.asarray(cell[axis])[inside]
+            step = strides[owner, axis]
+            flat += index * step
+            steps.append(step)
+            fraction.append(
+                (np.asarray(wrapped[axis])[inside] - origin[axis])
+                * (1.0 / spacing)[owner, axis]
+                - index
+            )
+        corners = []
+        for corner in itertools.product((0, 1), repeat=ndim):
+            where = flat.copy()
+            weight = np.ones(inside.size)
+            for axis, up in enumerate(corner):
+                if up:
+                    where += steps[axis]
+                    weight *= fraction[axis]
+                else:
+                    weight *= 1.0 - fraction[axis]
+            corners.append((where, weight))
+        return inside, corners, blocks, offset
+
     def _shape(self, name: str, splines: Any, what: str) -> Any:
         """The `mpifield.Splines` of ``splines`` (a degree or one), checked against the halo."""
         from mpifield import splines as resolve
@@ -1685,7 +1781,9 @@ class AMRHierarchy:
         bilinear (cloud-in-cell) weights: the same weights as
         `CompositeNodes.deposit`,
         whose transposed interpolation the field gather is, and of
-        `interpolate`; mpifield's compiled kernels do the work. The values are
+        `interpolate`. These weights are added for the markers of all patches at
+        once (one ``bincount`` into a buffer of the blocks); a higher degree runs
+        mpifield's compiled kernels patch by patch. The values are
         charges, not a density. The markers must be on the ranks that
         `owner` gives (use `migrate`), so that the corners fall in
         the block or its halo, and the field needs a halo of at least one node.
@@ -1731,6 +1829,20 @@ class AMRHierarchy:
             for patch in self.local_patches:
                 patch.field(name).local_with_halos[...] = 0.0
         patches = self.patches
+        if shape.degree == 1:  # all patches in one pass over the markers
+            begin = time.perf_counter()
+            inside, corners, blocks, total = self._linear_corners(
+                found, cell, wrapped, name
+            )
+            charges = charge[inside]
+            buffer = np.zeros(total)
+            for flat, weight in corners:
+                buffer += np.bincount(flat, weights=charges * weight, minlength=total)
+            for _, offset, storage in blocks:
+                storage += buffer[offset : offset + storage.size].reshape(storage.shape)
+            if times is not None:
+                _share_time(times, patches, found[inside], time.perf_counter() - begin)
+            return
         for number, chosen in _by_patch(found):
             start = time.perf_counter()
             storage, grid = self._patch_block(patches[number], name, shape.degree)
@@ -1784,6 +1896,21 @@ class AMRHierarchy:
             )
         values = np.zeros(flat[0].size)
         patches = self.patches
+        if weights.degree == 1:  # all patches in one pass over the markers
+            begin = time.perf_counter()
+            inside, corners, blocks, total = self._linear_corners(
+                found, cell, wrapped, name
+            )
+            buffer = np.empty(total)
+            for _, offset, storage in blocks:
+                buffer[offset : offset + storage.size] = np.asarray(storage).reshape(-1)
+            gathered = np.zeros(inside.size)
+            for where, weight in corners:
+                gathered += weight * buffer[where]
+            values[inside] = gathered
+            if times is not None:
+                _share_time(times, patches, found[inside], time.perf_counter() - begin)
+            return values.reshape(shape)
         for number, chosen in _by_patch(found):
             start = time.perf_counter()
             storage, grid = self._patch_block(patches[number], name, weights.degree)

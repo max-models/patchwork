@@ -453,3 +453,42 @@ def test_the_node_grid_of_a_patch_holds_its_nodes() -> None:
         assert tuple(grid.num_gridpoints) == patch.node_shape
         assert grid.periodic == (False, False)
         assert grid.geometry == (i0 * dx, j0 * dy, dx, dy, *patch.node_shape, 0, 0)
+
+
+@pytest.mark.parametrize("periodic", [(False, False), (True, False)])
+def test_one_pass_linear_deposit_and_gather_equal_the_kernels_patch_by_patch(
+    periodic,
+) -> None:
+    from mpifield import splines
+
+    mesh = AMRHierarchy(base_shape=(8, 8), periodic=periodic)
+    mesh.add_patch(1, ((4, 12), (4, 12)), ranks=0)
+    mesh.add_patch(2, ((10, 18), (8, 16)), ranks=0)
+    mesh.allocate_field("q", centering="node")
+    rng = np.random.default_rng(WORLD.Get_rank())
+    x, y = rng.uniform(0, 1, (2, 2000))
+    charge = rng.uniform(0.5, 1.5, x.size)
+    x, y, charge = mesh.migrate(x, y, charge, name="q")
+    mesh.deposit(x, y, charge, "q")
+    gathered = mesh.interpolate(x, y, "q")
+    # the same with mpifield's compiled kernels, one patch at a time
+    linear = splines(1)
+    flat, _ = mesh._points((x, y))
+    found, _, wrapped = mesh._cells(flat)
+    expected_gather = np.zeros(x.size)
+    for patch in mesh.local_patches:
+        storage, grid = mesh._patch_block(patch, "q", 1)
+        reference = np.zeros_like(np.asarray(storage))
+        number = mesh.patches.index(patch)
+        chosen = np.flatnonzero(found == number)
+        positions = np.array([w[chosen] for w in wrapped])
+        linear.nodes.scatter_block(
+            positions, charge[chosen], reference[..., None], grid
+        )
+        np.testing.assert_allclose(storage, reference, rtol=1e-12, atol=1e-12)
+        result = np.zeros((1, chosen.size))
+        linear.nodes.gather_block(
+            positions, np.asarray(storage)[..., None], result, grid
+        )
+        expected_gather[chosen] = result[0]
+    np.testing.assert_allclose(gathered, expected_gather, rtol=1e-12, atol=1e-12)
