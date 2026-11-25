@@ -136,6 +136,40 @@ step, total:
   (~33 ms). The next step there: keep the `CopyPlan` of the kept patches, or set up the
   interpolation of all patches at once.
 
+## One gather per array, markers in one pass (2026-11-25, last)
+
+Against `devel` (with `regrid(fields=[])` on both sides): mpiarray's `CopyPlan` packs and
+unpacks with one gather and one scatter per array (flat storage indices found when the plan
+is built) and lays out its pieces with array operations; the cloud-in-cell deposit and
+gather add the markers of all patches in one pass (`bincount` into a buffer of the blocks,
+equal to mpifield's kernels to 1e-12); a marker's owner rank comes from a table where its
+patch is on one rank; and the halo signatures test all patches of a level against each
+other at once. Serial, median of 3 runs, ms per step:
+
+| mesh | | tag | regrid | migrate | deposit | solver | solve | halos | gather | total |
+|---|---|---|---|---|---|---|---|---|---|---|
+| cluster | before | 35.2 | 2.8 | 17.1 | 25.9 | 107.7 | 6.3 | 8.2 | 25.0 | 228 |
+| | after | 35.1 | 2.7 | 9.6 | 25.2 | 108.4 | 6.1 | 6.0 | 24.0 | 217 (−5%) |
+| cluster, `max_patch_size=16` | before | 35.7 | 18.5 | 30.3 | 69.1 | 122.9 | 12.6 | 108.5 | 52.5 | 450 |
+| | after | 38.3 | 19.4 | 11.9 | 43.9 | 118.5 | 12.8 | 83.7 | 27.0 | 356 (−21%) |
+| quadtree, block 8 | before | 36.3 | 88.0 | 34.8 | 106.6 | 108.9 | 21.7 | 193.4 | 70.7 | 661 |
+| | after | 36.9 | 93.6 | 14.7 | 69.5 | 110.9 | 22.3 | 108.3 | 29.4 | 486 (−26%) |
+| quadtree, block 16 | before | 37.4 | 15.2 | 31.8 | 68.5 | 133.5 | 12.4 | 62.2 | 54.6 | 416 |
+| | after | 35.5 | 14.5 | 11.4 | 39.9 | 131.5 | 12.0 | 37.5 | 25.8 | 308 (−26%) |
+| quadtree, block 32 | before | 36.2 | 6.2 | 26.3 | 52.1 | 205.8 | 12.7 | 23.5 | 43.4 | 406 |
+| | after | 37.3 | 6.7 | 10.8 | 34.3 | 210.2 | 13.0 | 16.9 | 25.3 | 355 (−13%) |
+
+- The `CopyPlan` of the halos of 392 patches (4422 copies) builds in 23 ms (43 before) and
+  executes in 0.7 ms (10 before); the halos of blocks of 8 take 108 ms per step, from 193.
+- Gather 71 → 29 ms and deposit 107 → 70 ms with blocks of 8; migrate about halves
+  everywhere (the owner check).
+- Since the first run of this benchmark (1263 ms per step with blocks of 8, all fields
+  moved), the cycle on blocks of 8 is 2.6 times faster; the clusters' 327 ms are now 217.
+- What is left with blocks of 8: the solver setup (111 ms: assembly and LU, which do not
+  depend on the patches), the halos (108: the interpolation records of the patches whose
+  neighbourhood changed, one per patch, and their copies), the regrid (94: the boxes and
+  the new hierarchy) and the deposit (70, of which the `accumulate_halos` schedule ~35).
+
 ## Fixed on the way
 
 The regrid's transfer compared every new patch with every old one of its level, and copied

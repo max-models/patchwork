@@ -30,6 +30,8 @@ import numpy as np
 from methodcard import ConvergenceProblem, method
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from patchwork.mesh.hierarchy import AMRHierarchy, Patch
 
 Box = tuple[tuple[int, int], ...]
@@ -542,19 +544,6 @@ def _key(patch: Patch) -> tuple:
     return (patch.level, patch.box, patch.ranks)
 
 
-def _within(points: _Points, level: int, box: Box) -> tuple:
-    """The keys of the patches of ``level`` that overlap ``box`` or one of its periodic images."""
-    shifts = points.shifts(level)
-    return tuple(
-        _key(other)
-        for other in points.near(level, box)
-        if any(
-            _overlap(box, _shift(points.own(other), shift)) is not None
-            for shift in shifts
-        )
-    )
-
-
 class _HaloRecord:
     """The halo geometry of one patch, its fields named by patch keys.
 
@@ -663,22 +652,68 @@ class HaloExchange:
         if interpolation is not None:
             self._interpolations.append(interpolation)
 
-    def _signature(self, points: _Points, patch: Patch) -> tuple:
-        """What a patch's halo geometry depends on: itself and the patches within reach.
+    def _signatures(self, points: _Points) -> dict[int, tuple]:
+        """What every patch's halo geometry depends on: itself and the patches within reach.
 
-        The patches of its level that may overlap its halo, and those of the level
-        below that may hold the coarse points of its interpolation, each as
-        ``(level, box, ranks)``.
+        The patches of its level that overlap its halo, and those of the level
+        below that may hold the coarse points of its interpolation (a margin of
+        one coarse cell and the stencil's), each as ``(level, box, ranks)``, in the
+        order of the patches. All patches of a level are tested against all of
+        the level and the one below at once, periodic images included. Keyed by
+        ``id`` of the patch.
         """
-        own = points.own(patch)
+        hierarchy = self._hierarchy
         width = self._width
-        extended = tuple((lo - width, hi + width) for lo, hi in own)
-        same = _within(points, patch.level, extended)
-        if patch.level == 0:
-            return (_key(patch), same)
         ratio = points.ratio
-        coarse = tuple((lo // ratio - 1, -(-hi // ratio) + 2) for lo, hi in extended)
-        return (_key(patch), same, _within(points, patch.level - 1, coarse))
+        result: dict[int, tuple] = {}
+
+        def boxes(patches: Sequence[Patch]) -> np.ndarray:
+            return np.array([points.own(p) for p in patches], dtype=np.int64).reshape(
+                len(patches), hierarchy.ndim, 2
+            )
+
+        def touching(regions: np.ndarray, level: int) -> tuple[list[Patch], np.ndarray]:
+            """The patches of ``level`` and which of them overlap each region."""
+            candidates = list(hierarchy.patches_at_level(level))
+            theirs = boxes(candidates)
+            hit = np.zeros((regions.shape[0], theirs.shape[0]), dtype=bool)
+            for shift in points.shifts(level):
+                moved = theirs + np.asarray(shift, dtype=np.int64)[None, :, None]
+                lower = np.maximum(regions[:, None, :, 0], moved[None, :, :, 0])
+                upper = np.minimum(regions[:, None, :, 1], moved[None, :, :, 1])
+                hit |= np.all(lower < upper, axis=-1)
+            return candidates, hit
+
+        for level in range(hierarchy.max_level + 1):
+            if self._level is not None and level != self._level:
+                continue
+            mine = hierarchy.patches_at_level(level)
+            if not mine:
+                continue
+            own = boxes(mine)
+            extended = own + np.array([-width, width], dtype=np.int64)
+            same, hit = touching(extended, level)
+            below: list[Patch] = []
+            under = np.zeros((len(mine), 0), dtype=bool)
+            if level > 0:
+                coarse = np.stack(
+                    [extended[..., 0] // ratio - 1, -(-extended[..., 1] // ratio) + 2],
+                    axis=-1,
+                )
+                below, under = touching(coarse, level - 1)
+            for n, patch in enumerate(mine):
+                key = (
+                    _key(patch),
+                    tuple(_key(same[m]) for m in np.flatnonzero(hit[n]).tolist()),
+                )
+                if level > 0:
+                    key += (
+                        tuple(
+                            _key(below[m]) for m in np.flatnonzero(under[n]).tolist()
+                        ),
+                    )
+                result[id(patch)] = key
+        return result
 
     def _record(self, points: _Points, patch: Patch, dtype: Any) -> _HaloRecord:
         """The halo geometry of one patch, with its fields as patch keys."""
@@ -805,10 +840,11 @@ class HaloExchange:
         self._pairs_used: dict[tuple, list] = {}
         used: dict[tuple, _HaloRecord] = {}
         patches = {_key(patch): patch for patch in hierarchy.patches}
+        signatures = self._signatures(points) if self._width else {}
         for patch in hierarchy.patches if self._width else ():
             if level is not None and patch.level != level:
                 continue
-            signature = self._signature(points, patch)
+            signature = signatures[id(patch)]
             record = known.get(signature)
             if record is None:
                 record = self._record(points, patch, dtype)

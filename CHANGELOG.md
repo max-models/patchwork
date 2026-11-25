@@ -7,6 +7,16 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Placement along a Hilbert curve (`placement="hilbert"`, cunumpy's `hilbert_encode`) next to
+  the Morton curve: `morton_ranks` is now `curve_ranks(..., curve="morton" | "hilbert")`.
+  `placement="balanced"` takes `cost` too, cut by `knapsack_ranks` (the largest cost first to
+  the least loaded rank). `cost` may also map a patch `(level, box)` to a measured cost, which
+  `deposit(..., times=...)` and `interpolate(..., times=...)` collect per patch;
+  `rebalance(cost, placement=...)` places by any of them.
+- The cloud-in-cell `deposit` and `interpolate` add the markers of all patches in one pass
+  (one `bincount` into a buffer of the blocks; higher B-spline degrees keep mpifield's kernels
+  per patch); a marker's owner comes from a table where its patch is on one rank; the halo
+  signatures test all patches of a level at once.
 - `regrid(..., fields=[...])`: the fields whose values are moved (default: all); the others
   are allocated on the new hierarchy and zero.
 - `CompositeNodes` finds the cells under finer patches from one coverage mask per level (it
@@ -33,7 +43,7 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with clusters, but all patches have one size and a regrid keeps most of them. Tutorial
   "Quadtree patches".
 - `placement="morton"`: `regrid` puts the patches on the ranks along a Morton curve
-  (`morton_ranks`), all levels on one curve keyed in cells of the finest level, cut into runs
+  (`curve_ranks`), all levels on one curve keyed in cells of the finest level, cut into runs
   of about equal cells with the base level's cells counted.
 - Morton cuts weighted by cost: `regrid(..., placement="morton", cost=...)` weighs every patch
   by its cells plus the cost of its leaf cells (`box_costs`), e.g. the markers of

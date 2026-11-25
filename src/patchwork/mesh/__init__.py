@@ -14,11 +14,12 @@ from patchwork.mesh.reflux import FluxRegister
 from patchwork.mesh.regrid import (
     box_costs,
     cluster,
+    curve_ranks,
     function_tags,
     gradient_tags,
+    knapsack_ranks,
     marker_counts,
     marker_tags,
-    morton_ranks,
     quadtree_boxes,
 )
 
@@ -29,12 +30,13 @@ __all__ = [
     "Patch",
     "box_costs",
     "cluster",
+    "curve_ranks",
     "function_tags",
     "graded_nodes",
     "gradient_tags",
+    "knapsack_ranks",
     "marker_counts",
     "marker_tags",
-    "morton_ranks",
     "plot_patches",
     "quadtree_boxes",
 ]
