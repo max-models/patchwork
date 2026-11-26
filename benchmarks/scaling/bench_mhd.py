@@ -53,7 +53,7 @@ def main() -> None:
         "density": 25.0 / (36.0 * np.pi),
         "velocity": (lambda x, y: -np.sin(k * y), lambda x, y: np.sin(k * x), 0.0),
         "pressure": 5.0 / (12.0 * np.pi),
-        "potential": lambda x, y: (
+        "vector_potential": lambda x, y: (
             (np.cos(2 * k * x) / (2 * k) + np.cos(k * y) / k) / np.sqrt(4 * np.pi)
         ),
     }
@@ -81,7 +81,9 @@ def main() -> None:
     )
     comm.Barrier()
     regrid = time.perf_counter() - start
-    leaf = model._cells.num_cells
+    from patchwork import CompositeCells
+
+    leaf = CompositeCells(model.hierarchy).num_cells
     peak = comm.allreduce(peak_mb())
     if comm.rank == 0:
         print(
