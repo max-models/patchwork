@@ -224,6 +224,77 @@ def test_the_compiled_deposit_is_the_transposed_evaluation(
         assert np.any(weights.sum(axis=1) == 0.0)
 
 
+@pytest.mark.parametrize("implementation", IMPLEMENTATIONS)
+@pytest.mark.parametrize(
+    "name",
+    ["nested", "periodic", "ell", "line", "bounded line", "box", "periodic box"],
+)
+def test_the_deposit_finds_the_patches_that_locate_finds(
+    name: str, implementation: str
+) -> None:
+    """``deposit(patches=)`` gives every point the patch of `AMRHierarchy.locate`."""
+    mesh = _meshes()[name]
+    nodes = CompositeNodes(mesh)
+    points = np.stack(_points(mesh))
+    patches = np.full(points.shape[1], -2, dtype=np.int64)
+    ones = np.ones(points.shape[1])
+    with xp.kernels.use_host_kernel_implementation(implementation):
+        charge = nodes.deposit(points, ones, patches=patches)
+        assert np.array_equal(charge, nodes.deposit(points, ones))
+    assert np.array_equal(patches, mesh.locate(*points))
+    with pytest.raises(ValueError, match="int64 array"):
+        nodes.deposit(points, ones, patches=patches[:-1])
+
+
+@pytest.mark.parametrize("name", ["nested", "periodic", "box", "periodic box"])
+def test_the_threaded_deposit_equals_the_serial_one(name: str) -> None:
+    """Enough points for the per-thread buffers: the charge and patches of NumPy's kernel."""
+    mesh = _meshes()[name]
+    nodes = CompositeNodes(mesh)
+    rng = np.random.default_rng(3)
+    lower = np.array([low for low, _ in mesh.bounds])
+    upper = np.array([high for _, high in mesh.bounds])
+    points = lower[:, None] + (upper - lower)[:, None] * rng.uniform(
+        -0.1, 1.1, size=(mesh.ndim, 60000)
+    )
+    charges = rng.normal(size=points.shape[1])
+    patches = np.empty(points.shape[1], dtype=np.int64)
+    expected_patches = np.empty(points.shape[1], dtype=np.int64)
+    with xp.kernels.use_host_kernel_implementation("numpy"):
+        expected = nodes.deposit(points, charges, patches=expected_patches)
+    charge = nodes.deposit(points, charges, patches=patches)
+    assert np.allclose(charge, expected, rtol=0.0, atol=1e-10)
+    assert np.array_equal(patches, expected_patches)
+    assert np.array_equal(patches, mesh.locate(*points))
+
+
+@pytest.mark.parametrize("implementation", IMPLEMENTATIONS)
+@pytest.mark.parametrize("name", ["nested", "line", "box"])
+def test_the_deposit_takes_the_first_points_of_a_store(
+    name: str, implementation: str
+) -> None:
+    """Points with more columns than charges: the first ones, as a copy of them."""
+    mesh = _meshes()[name]
+    nodes = CompositeNodes(mesh)
+    points = np.stack(_points(mesh))
+    count = points.shape[1] // 2
+    charges = np.random.default_rng(2).normal(size=count)
+    patches = np.empty(count, dtype=np.int64)
+    expected_patches = np.empty(count, dtype=np.int64)
+    with xp.kernels.use_host_kernel_implementation(implementation):
+        charge = nodes.deposit(points, charges, patches=patches)
+        expected = nodes.deposit(
+            np.array(points[:, :count]), charges, patches=expected_patches
+        )
+        # a store whose rows are not contiguous with the points: copied
+        strided = np.asfortranarray(points)
+        assert np.array_equal(nodes.deposit(strided, charges), expected)
+    assert np.array_equal(charge, expected)
+    assert np.array_equal(patches, expected_patches)
+    with pytest.raises(ValueError, match="points but"):
+        nodes.deposit(points[:, :count], np.ones(count + 1))
+
+
 def test_the_deposit_takes_a_single_point_with_any_strides() -> None:
     """A fancy-indexed (2, 1) column of an F-ordered array deposits like a C copy."""
     mesh = _meshes()["nested"]

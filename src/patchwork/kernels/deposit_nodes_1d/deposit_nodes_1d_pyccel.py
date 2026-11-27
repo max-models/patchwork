@@ -10,6 +10,7 @@ The line version of ``deposit_nodes`` (see there): ``points`` is ``(1, n)``, ``l
 on a node whose cell is outside the domain takes the cell below it. A periodic axis wraps;
 beyond a non-periodic face, or NaN, a point deposits nothing. Its charge is split between
 the two ends of its leaf cell with the linear weights of its position in the cell.
+``found`` gets the patch of every point (see ``deposit_nodes``).
 """
 
 from math import floor
@@ -26,11 +27,15 @@ def deposit_nodes_1d(
     cell_corners: "int[:,:]",
     cell_lower: "int[:,:]",
     cell_span: "int[:]",
+    cell_patch: "int[:]",
+    found: "int[:]",
     charge: "float[:]",
 ) -> None:
-    """Add the charges of the points to ``charge`` (see the module)."""
+    """Add the charges of the points to ``charge`` and find their patches (see the module)."""
     num_x = cells[0]
-    for point in range(points.shape[1]):
+    # the first charges.shape[0] columns: points may have room to spare
+    for point in range(charges.shape[0]):
+        found[point] = -1
         position_x = (points[0, point] - origin[0]) / spacing[0]
         # NaN (and infinite) positions deposit nothing (Pyccel folds x == x to True)
         if not (position_x > -1.0e300 and position_x < 1.0e300):
@@ -46,6 +51,8 @@ def deposit_nodes_1d(
             if cell_x > num_x - 1:
                 cell_x = num_x - 1
         leaf = leaf_map[cell_x]
+        if leaf >= 0:
+            found[point] = cell_patch[leaf]
         if leaf < 0 and local_x == floor(local_x) and cell_x > 0:
             leaf = leaf_map[cell_x - 1]
         if leaf < 0:

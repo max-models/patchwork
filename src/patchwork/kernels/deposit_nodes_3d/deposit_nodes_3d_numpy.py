@@ -14,9 +14,11 @@ def deposit_nodes_3d(
     cell_corners,
     cell_lower,
     cell_span,
+    cell_patch,
+    found,
     charge,
 ) -> None:
-    """Add the charges of the points to ``charge``."""
+    """Add the charges of the points to ``charge`` and their patches to ``found``."""
     deposit_nodes_any(
         points,
         charges,
@@ -28,5 +30,7 @@ def deposit_nodes_3d(
         cell_corners,
         cell_lower,
         cell_span,
+        cell_patch,
+        found,
         charge,
     )

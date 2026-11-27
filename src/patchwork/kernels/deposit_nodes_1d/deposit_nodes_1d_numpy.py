@@ -19,10 +19,17 @@ def deposit_nodes_any(
     cell_corners,
     cell_lower,
     cell_span,
+    cell_patch,
+    found,
     charge,
 ) -> None:
-    """Add the charges of the points to ``charge``, on a mesh of ``points.shape[0]`` axes."""
+    """Add the charges of the points to ``charge``, on a mesh of ``points.shape[0]`` axes.
+
+    ``found`` gets the patch of every point (``cell_patch`` of the leaf cell over its
+    lattice cell, before the lower-side rule; -1 outside the domain).
+    """
     ndim = points.shape[0]
+    points = points[:, : charges.shape[0]]  # points may have room to spare
     position = (points - origin[:, None]) / spacing[:, None]
     valid = np.isfinite(position).all(axis=0)
     cell, local = [], []
@@ -40,6 +47,7 @@ def deposit_nodes_any(
         cell.append(index)
         local.append(wrapped)
     leaf = leaf_map[tuple(cell)]
+    found[:] = np.where(valid & (leaf >= 0), cell_patch[np.maximum(leaf, 0)], -1)
     on_line = [(local[a] == np.floor(local[a])) & (cell[a] > 0) for a in range(ndim)]
     steps = sorted(
         (step for step in itertools.product((0, 1), repeat=ndim) if any(step)),
@@ -80,9 +88,11 @@ def deposit_nodes_1d(
     cell_corners,
     cell_lower,
     cell_span,
+    cell_patch,
+    found,
     charge,
 ) -> None:
-    """Add the charges of the points to ``charge``."""
+    """Add the charges of the points to ``charge`` and their patches to ``found``."""
     deposit_nodes_any(
         points,
         charges,
@@ -94,5 +104,7 @@ def deposit_nodes_1d(
         cell_corners,
         cell_lower,
         cell_span,
+        cell_patch,
+        found,
         charge,
     )

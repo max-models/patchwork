@@ -11,14 +11,20 @@ offset varying fastest, then y, then z. A point on a lattice plane whose cell is
 the domain takes a cell on the lower side: along x, y, z, then xy, xz, yz, then xyz. A
 periodic axis wraps; beyond a non-periodic face, or NaN, a point deposits nothing. Its
 charge is spread over the eight corners of its leaf cell with the trilinear weights.
+``found`` gets the patch of every point, and OpenMP splits the points over per-thread
+buffers, as in ``deposit_nodes``.
 """
 
 from math import floor
 
 from numpy import zeros
+from pyccel.stdlib.internal.openmp import omp_get_max_threads, omp_get_thread_num
+
+#: Fewest points worth the per-thread buffers.
+MIN_PARALLEL_POINTS = 20000
 
 
-def deposit_nodes_3d(
+def _deposit_chunk_3d(
     points: "float[:,:]",
     charges: "float[:]",
     origin: "float[:]",
@@ -29,13 +35,19 @@ def deposit_nodes_3d(
     cell_corners: "int[:,:]",
     cell_lower: "int[:,:]",
     cell_span: "int[:]",
-    charge: "float[:]",
+    cell_patch: "int[:]",
+    found: "int[:]",
+    buffer: "float[:,:]",
+    row: int,
+    first: int,
+    last: int,
 ) -> None:
-    """Add the charges of the points to ``charge`` (see the module)."""
+    """Deposit the points ``first`` to ``last`` into row ``row`` of ``buffer``, find their patches."""
     cell = zeros(3, dtype=int)
     local = zeros(3)
     line = zeros(3, dtype=int)
-    for point in range(points.shape[1]):
+    for point in range(first, last):
+        found[point] = -1
         skip = False
         for axis in range(3):
             position = (points[axis, point] - origin[axis]) / spacing[axis]
@@ -66,6 +78,8 @@ def deposit_nodes_3d(
         cy = cell[1]
         cz = cell[2]
         leaf = leaf_map[cx, cy, cz]
+        if leaf >= 0:
+            found[point] = cell_patch[leaf]
         # the lower neighbours across lattice planes, in the order of point_cells
         if leaf < 0 and line[0] == 1:
             leaf = leaf_map[cx - 1, cy, cz]
@@ -91,11 +105,72 @@ def deposit_nodes_3d(
         gy = 1.0 - fy
         gz = 1.0 - fz
         value = charges[point]
-        charge[cell_corners[leaf, 0]] += gx * gy * gz * value
-        charge[cell_corners[leaf, 1]] += fx * gy * gz * value
-        charge[cell_corners[leaf, 2]] += gx * fy * gz * value
-        charge[cell_corners[leaf, 3]] += fx * fy * gz * value
-        charge[cell_corners[leaf, 4]] += gx * gy * fz * value
-        charge[cell_corners[leaf, 5]] += fx * gy * fz * value
-        charge[cell_corners[leaf, 6]] += gx * fy * fz * value
-        charge[cell_corners[leaf, 7]] += fx * fy * fz * value
+        buffer[row, cell_corners[leaf, 0]] += gx * gy * gz * value
+        buffer[row, cell_corners[leaf, 1]] += fx * gy * gz * value
+        buffer[row, cell_corners[leaf, 2]] += gx * fy * gz * value
+        buffer[row, cell_corners[leaf, 3]] += fx * fy * gz * value
+        buffer[row, cell_corners[leaf, 4]] += gx * gy * fz * value
+        buffer[row, cell_corners[leaf, 5]] += fx * gy * fz * value
+        buffer[row, cell_corners[leaf, 6]] += gx * fy * fz * value
+        buffer[row, cell_corners[leaf, 7]] += fx * fy * fz * value
+
+
+def deposit_nodes_3d(
+    points: "float[:,:]",
+    charges: "float[:]",
+    origin: "float[:]",
+    spacing: "float[:]",
+    cells: "int[:]",
+    periodic: "int[:]",
+    leaf_map: "int[:,:,:]",
+    cell_corners: "int[:,:]",
+    cell_lower: "int[:,:]",
+    cell_span: "int[:]",
+    cell_patch: "int[:]",
+    found: "int[:]",
+    charge: "float[:]",
+) -> None:
+    """Add the charges of the points to ``charge`` and find their patches (see the module)."""
+    # the first charges.shape[0] columns: points may have room to spare
+    num_points = charges.shape[0]
+    num_nodes = charge.shape[0]
+    num_threads = int(omp_get_max_threads())
+    if num_points < MIN_PARALLEL_POINTS or num_points < num_nodes:
+        num_threads = 1
+    chunk = (num_points + num_threads - 1) // num_threads
+    buffer = zeros((num_threads, num_nodes))
+    # fmt: off
+    #$ omp parallel num_threads(num_threads) private(thread, first, last)
+    # fmt: on
+    thread = int(omp_get_thread_num())
+    first = min(thread * chunk, num_points)
+    last = min(first + chunk, num_points)
+    _deposit_chunk_3d(
+        points,
+        charges,
+        origin,
+        spacing,
+        cells,
+        periodic,
+        leaf_map,
+        cell_corners,
+        cell_lower,
+        cell_span,
+        cell_patch,
+        found,
+        buffer,
+        thread,
+        first,
+        last,
+    )
+    # fmt: off
+    #$ omp end parallel
+    # fmt: on
+    # fmt: off
+    #$ omp parallel for private(thread, total)
+    # fmt: on
+    for node in range(num_nodes):
+        total = 0.0
+        for thread in range(num_threads):
+            total += buffer[thread, node]
+        charge[node] += total
