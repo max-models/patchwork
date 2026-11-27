@@ -582,8 +582,9 @@ def test_points_outside_the_domain_deposit_nothing() -> None:
     nodes = CompositeNodes(_mesh("nested"))
     points = np.array([[1.5, -0.2, 0.5], [0.5, 0.5, 2.0]])
     assert not nodes.deposit(points, np.ones(3)).any()
+    # more charges than points; fewer take the first points (a store with room)
     with pytest.raises(ValueError, match="charges"):
-        nodes.deposit(points, np.ones(2))
+        nodes.deposit(points, np.ones(4))
 
 
 @pytest.mark.parametrize("layout", ["nested", "level jump"])

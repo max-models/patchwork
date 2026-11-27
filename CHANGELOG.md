@@ -7,6 +7,14 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `CompositeNodes.deposit(..., patches=out)` gives every point its patch (what
+  `AMRHierarchy.locate` returns) in the same pass as the deposit, from the new
+  `CompositeNodes.cell_patch`; and `points` may have more columns than there are charges
+  (the first are deposited), so a marker store with room to spare needs no copy. The 2D
+  and 3D deposit kernels split the points over the OpenMP threads, each into its own row of
+  a buffer summed in thread order (reproducible for a given number of threads), and
+  `locate_points` runs its loop in parallel. On picnic's 2D spoke case (570 000 markers,
+  6 patches, 4 threads) locate plus deposit took 25 ms, the fused deposit takes 3 ms.
 - Placement along a Hilbert curve (`placement="hilbert"`, cunumpy's `hilbert_encode`) next to
   the Morton curve: `morton_ranks` is now `curve_ranks(..., curve="morton" | "hilbert")`.
   `placement="balanced"` takes `cost` too, cut by `knapsack_ranks` (the largest cost first to

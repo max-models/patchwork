@@ -22,6 +22,8 @@ domain, or NaN, gets -1.
 Outputs: ``found`` (the patch index, -1 outside), ``cell`` ``(3, n)`` (the cell on the
 patch's level, 0 outside) and ``wrapped`` ``(3, n)`` (the coordinates wrapped into the
 domain on periodic axes).
+
+With OpenMP the points are split over the threads (every point is independent).
 """
 
 
@@ -53,6 +55,9 @@ def locate_points(
     length_x = high_x - low_x
     length_y = high_y - low_y
     length_z = high_z - low_z
+    # fmt: off
+    #$ omp parallel for private(x, y, z, shifted, fine_x, fine_y, fine_z, level, index_x, index_y, index_z, offset_x, offset_y, offset_z, owner)
+    # fmt: on
     for point in range(count):
         x = points[0, point]
         y = points[1, point]

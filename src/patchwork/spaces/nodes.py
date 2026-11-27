@@ -45,19 +45,25 @@ def _corner_offsets(ndim: int) -> np.ndarray:
     )
 
 
-def _c_order(array: np.ndarray) -> np.ndarray:
-    """``array`` with C strides, copied only when it has other strides.
+def _has_c_strides(array: np.ndarray) -> bool:
+    """Whether ``array`` has the strides of a C-ordered array of its shape.
 
     A ``(2, 1)`` slice is flagged C-contiguous but can keep F strides, which the
-    compiled kernels refuse; a copy of a large array costs as much as the deposit.
+    compiled kernels refuse.
     """
     strides, step = [], array.itemsize
     for size in reversed(array.shape):
         strides.append(step)
         step *= size
-    if array.flags.c_contiguous and array.strides == tuple(reversed(strides)):
-        return array
-    return np.array(array, order="C")
+    return array.flags.c_contiguous and array.strides == tuple(reversed(strides))
+
+
+def _c_order(array: np.ndarray) -> np.ndarray:
+    """``array`` with C strides, copied only when it has other strides.
+
+    A copy of a large array costs as much as the deposit.
+    """
+    return array if _has_c_strides(array) else np.array(array, order="C")
 
 
 def _deposit_kernel(ndim: int) -> Any:
@@ -379,8 +385,8 @@ class CompositeNodes:
                     True
                 )
             under[level] = mask
-        lowers, spans, owners = [], [], []
-        for patch in hierarchy.patches:
+        lowers, spans, owners, patch_of = [], [], [], []
+        for number, patch in enumerate(hierarchy.patches):
             span = ratio ** (finest - patch.level)
             if patch.level in under:
                 covered = under[patch.level][
@@ -398,6 +404,7 @@ class CompositeNodes:
                 )
             )
             spans.append(np.full(index[0].size, span, dtype=np.int64))
+            patch_of.append(np.full(index[0].size, number, dtype=np.int64))
             # a patch on several ranks: its rows of cells split over them as
             # its arrays are (near-even, along the first axis)
             chunks = np.array_split(np.arange(patch.shape[0]), len(patch.ranks))
@@ -410,6 +417,8 @@ class CompositeNodes:
             owners.append(row_rank[index[0]])
         self.cell_lower = np.concatenate(lowers)
         self.cell_span = np.concatenate(spans)
+        #: The patch of every leaf cell: its index in ``hierarchy.patches``.
+        self.cell_patch = np.concatenate(patch_of)
         self.cell_ranks = np.concatenate(owners)
 
         offsets = _corner_offsets(ndim)
@@ -752,7 +761,13 @@ class CompositeNodes:
         ),
         symbolic=_deposit_rules,
     )
-    def deposit(self, points: np.ndarray, charges: np.ndarray) -> np.ndarray:
+    def deposit(
+        self,
+        points: np.ndarray,
+        charges: np.ndarray,
+        *,
+        patches: np.ndarray | None = None,
+    ) -> np.ndarray:
         """The charges of point particles at ``points`` ``(ndim, k)`` on the nodes: ``(n,)``.
 
         Each charge is spread over the corners of its leaf cell with the
@@ -764,14 +779,34 @@ class CompositeNodes:
         nodes they hang from with the transposed interpolation, so the total
         charge is kept. Points outside the domain deposit nothing. A compiled
         kernel (``deposit_nodes_1d``, ``deposit_nodes``, ``deposit_nodes_3d``) makes one
-        pass over the points.
+        pass over the points, split over the OpenMP threads.
+
+        ``points`` may have more columns than there are ``charges``, ``k``: only
+        the first ``k`` are deposited, so a marker store with room to spare
+        (C-ordered) is passed without a copy.
+
+        ``patches``, an int64 array of ``k``, gets the patch of every point in the
+        same pass: what `AMRHierarchy.locate` returns for it (-1 outside the
+        domain), without a second pass over the points.
         """
         points = np.asarray(points, dtype=float)
         charges = np.asarray(charges, dtype=float).reshape(-1)
-        if charges.shape[0] != points.shape[1]:
-            raise ValueError(f"{points.shape[1]} points but {charges.shape[0]} charges")
+        count = charges.shape[0]
+        if count > points.shape[1]:
+            raise ValueError(f"{points.shape[1]} points but {count} charges")
         charge = np.zeros(self.num_nodes)
-        if points.shape[1]:
+        if patches is None:
+            patches = np.empty(count, dtype=np.int64)
+        elif patches.shape != (count,) or patches.dtype != np.int64:
+            raise ValueError(
+                f"patches must be an int64 array of {count}, got "
+                f"{patches.dtype} {patches.shape}"
+            )
+        if count:
+            if count < points.shape[1] and (
+                self.hierarchy.graded or not _has_c_strides(points)
+            ):
+                points = points[:, :count]  # copied anyway: only the points needed
             # one pass of the compiled kernel, the same cells and weights
             deposit_nodes = _deposit_kernel(self.ndim)
             deposit_nodes(
@@ -785,6 +820,8 @@ class CompositeNodes:
                 self.cell_corners,
                 self.cell_lower,
                 self.cell_span,
+                self.cell_patch,
+                patches,
                 charge,
             )
         return charge

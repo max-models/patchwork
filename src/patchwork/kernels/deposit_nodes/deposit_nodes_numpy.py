@@ -14,9 +14,12 @@ def deposit_nodes(
     cell_corners,
     cell_lower,
     cell_span,
+    cell_patch,
+    found,
     charge,
 ) -> None:
-    """Add the charges of the points to ``charge``."""
+    """Add the charges of the points to ``charge`` and their patches to ``found``."""
+    points = points[:, : charges.shape[0]]  # points may have room to spare
     position = (points - origin[:, None]) / spacing[:, None]
     valid = ~np.isnan(position).any(axis=0)
     cell, local = [], []
@@ -34,6 +37,7 @@ def deposit_nodes(
         cell.append(index)
         local.append(wrapped)
     leaf = leaf_map[cell[0], cell[1]]
+    found[:] = np.where(valid & (leaf >= 0), cell_patch[np.maximum(leaf, 0)], -1)
     on_line = [(local[a] == np.floor(local[a])) & (cell[a] > 0) for a in range(2)]
     for step in ((1, 0), (0, 1), (1, 1)):
         missing = leaf < 0
