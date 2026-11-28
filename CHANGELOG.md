@@ -45,6 +45,16 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `exchange_halos(name, interpolation="quadratic")`: the halo points filled from the level
+  below take three coarse points per axis (Lagrange, biquadratic in 2D, triquadratic in 3D,
+  quadratic in 1D; one-sided next to a non-periodic wall, across periodic faces as before)
+  instead of two, for node and cell fields. The halo values are third order, so the 5-point
+  Laplacian of a node potential at a coarse-fine edge (the current of an MHD potential) is
+  first order in the maximum norm instead of O(1): its largest error at the edge goes 8.1,
+  3.9, 1.9, 0.97, 0.48 for 8 to 128 base cells, against about 38 for all of them with the
+  bilinear halos. The patch's own points, the nodes it shares with the level below included,
+  keep their values; where a coarse point of the stencil is on no patch, the point falls back
+  to the bilinear weights. Bilinear stays the default. New tutorial "Halo interpolation".
 - Quadtree regridding: `AMRHierarchy.regrid(method="quadtree", block_size=16)` places the
   patches as the blocks of a quadtree (an octree in 3D) instead of Berger-Rigoutsos clusters:
   every level is cut into aligned square blocks of `block_size` cells, a block holding a tag is
