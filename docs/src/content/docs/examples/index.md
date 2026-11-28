@@ -38,6 +38,9 @@ Step by step, from a first hierarchy to stencils on patches:
 13. [Quadtree patches](/patchwork/examples/13-quadtree-patches/): `regrid(method="quadtree")`,
     patches as the equal blocks of a quadtree, refinement by the number of markers per cell
     (`marker_tags`), and how much of the mesh a regrid keeps.
+14. [Halo interpolation](/patchwork/examples/14-halo-interpolation/): bilinear and quadratic
+    halos from the level below, and the error of the Laplacian of a node potential at a
+    coarse-fine edge with each.
 
 Every notebook in `tutorials/` is executed when the site is built and published here with its
 outputs. Download a notebook from its page to run the steps yourself.

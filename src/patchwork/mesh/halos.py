@@ -7,7 +7,9 @@ the rest of the hierarchy:
 1. from the patches of the same level that the halo overlaps, across periodic
    faces too (a patch along a whole periodic axis from itself);
 2. where no patch of the same level is there, by linear (1D) or bilinear (2D)
-   interpolation of the level below;
+   interpolation of the level below, or on request (bi)quadratic: three coarse
+   points per axis, so that a second difference across the coarse-fine edge
+   (a Laplacian, the current of a potential) stays consistent;
 3. between the ranks inside each patch, with mpiarray's own ``update_halos``.
 
 Halo points outside the domain are left as they are: they belong to the
@@ -111,6 +113,59 @@ class _BoxIndex:
             for key in self._keys(box):
                 found.update(self._bins.get(key, ()))
         return sorted(found)
+
+
+def _quadratic_problem() -> ConvergenceProblem:
+    """A smooth node field interpolated quadratically into the halo of a level-1 patch."""
+    from patchwork.mesh.hierarchy import AMRHierarchy
+
+    def function(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+        return np.sin(np.pi * x) * np.cos(1.3 * y)
+
+    def error(spacing: float) -> float:
+        n = round(1.0 / spacing)
+        mesh = AMRHierarchy(base_shape=(n, n))
+        fine = mesh.add_patch(level=1, box=((n // 2, 3 * n // 2),) * 2)
+        mesh.allocate_field("u", halo=1, centering="node")
+        exact = {}
+        for patch in mesh.patches:
+            (i0, i1), (j0, j1) = patch.box
+            dx, dy = mesh.spacing(patch.level)
+            i, j = np.meshgrid(
+                np.arange(i0 - 1, i1 + 2), np.arange(j0 - 1, j1 + 2), indexing="ij"
+            )
+            exact[patch.level] = function(i * dx, j * dy)
+            storage = patch.field("u").local_with_halos
+            storage[...] = 0.0
+            storage[1:-1, 1:-1] = exact[patch.level][1:-1, 1:-1]
+        mesh.exchange_halos("u", interpolation="quadratic")
+        halo = np.ones(exact[1].shape, dtype=bool)
+        halo[1:-1, 1:-1] = False
+        values = np.asarray(fine.field("u").local_with_halos)
+        return float(np.abs(values - exact[1])[halo].max())
+
+    return ConvergenceProblem(error, steps=[1 / 16, 1 / 32, 1 / 64])
+
+
+@method(
+    equations={
+        "weights": r"w_0 = \tfrac12 (t - 1)(t - 2), \quad w_1 = -t\,(t - 2), \quad w_2 = \tfrac12 t\,(t - 1), \qquad t = X - X_0",
+        "stencil": r"X_0 = \mathrm{round}(X) - 1 \ \text{(half way: } \lfloor X \rfloor - 1\text{)}, \quad 0 \le X_0 \le n - 3 \text{ at a wall}",
+        "tensor": r"u_f = \sum_{k \in \{0,1,2\}^d} \Big(\prod_a w_{k_a}(t_a)\Big)\, u_{X_0 + k}",
+    },
+    order=3,
+    assumptions=(
+        "a fine point that coincides with a coarse one along an axis takes it unchanged along that axis",
+        "where a coarse point of the stencil is on no patch, the point falls back to the (renormalised) bilinear weights",
+        "the order is that of the interpolated halo values of a smooth field, maximum norm; a second difference across the halo is first order",
+    ),
+    problem=_quadratic_problem,
+)
+def _lagrange(t: np.ndarray) -> np.ndarray:
+    """The quadratic Lagrange weights of points 0, 1, 2 at ``t``, one row per point."""
+    return np.stack(
+        [0.5 * (t - 1.0) * (t - 2.0), -t * (t - 2.0), 0.5 * t * (t - 1.0)], axis=-1
+    )
 
 
 class _Points:
@@ -227,6 +282,28 @@ class _Points:
             lower = np.clip(lower, 0, count - 2)
         return lower, position - lower
 
+    def quadratic_stencil(
+        self, fine: np.ndarray, axis: int, level: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """The three coarse points around fine points along one axis, and their weights.
+
+        ``level`` is the coarse level. Returns the first of the three coarse
+        indices and the Lagrange weights of the three (one row per point), centred on
+        the coarse point nearest each fine point (the lower one when half way).
+        Next to a wall of a non-periodic axis the three points inside are taken
+        (a one-sided stencil).
+        """
+        if self.nodal:
+            position = fine / self.ratio
+        else:
+            position = (fine + 0.5) / self.ratio - 0.5
+        lower = np.floor(position).astype(np.int64)
+        first = np.where(position - lower <= 0.5, lower - 1, lower)
+        count = self.hierarchy.level_shape(level)[axis] + (1 if self.nodal else 0)
+        if not self.periodic[axis] and count >= 3:
+            first = np.clip(first, 0, count - 3)
+        return first, _lagrange(position - first)
+
 
 def _coarse_buffer(
     hierarchy: AMRHierarchy,
@@ -284,7 +361,10 @@ def _storage_index(
 
 
 class _Bilinear:
-    """Points of an array computed as weighted sums of corners of a buffer (2 or 4)."""
+    """Points of an array computed as weighted sums of points of a buffer.
+
+    Two, four or eight of them (bilinear), or three, nine or 27 (quadratic).
+    """
 
     def __init__(self, array: Any, index: tuple, buffer: Any, flat: Any, weights: Any):
         self.array, self.index, self.buffer = array, index, buffer
@@ -293,6 +373,9 @@ class _Bilinear:
     def apply(self) -> None:
         values = np.asarray(self.buffer.local_with_halos).reshape(-1)[self.flat]
         self.array.local_with_halos[self.index] = (values * self.weights).sum(axis=1)
+
+
+INTERPOLATIONS = ("bilinear", "quadratic")
 
 
 def interpolate_from_below(
@@ -304,17 +387,20 @@ def interpolate_from_below(
     index: tuple[np.ndarray, ...],
     dtype: Any,
     copies: list,
+    interpolation: str = "bilinear",
 ) -> _Bilinear | None:
-    """(Bi)linear interpolation of the level below ``patch`` at its points ``index``.
+    """(Bi)linear or (bi)quadratic interpolation of the level below ``patch`` at its points ``index``.
 
     ``index`` holds the level indices of points of ``patch`` (own or halo), one array per axis,
     ``field_of(coarse)`` the array of a patch of the level below (``None``
     where this rank does not hold it) and ``array`` the patch's own array
     (``None`` likewise). Appends to ``copies`` the copies that bring the coarse
     values into a buffer on the patch's ranks; the weights leave out coarse
-    points on no patch and are renormalised. Returns what to compute after the
-    copies (see `apply_interpolations`) on the ranks that hold some of
-    the points, else ``None``.
+    points on no patch and are renormalised. ``interpolation="quadratic"``
+    takes the tensor product of three coarse points per axis (`_lagrange`)
+    where all of them are on a patch, and the bilinear weights elsewhere.
+    Returns what to compute after the copies (see `apply_interpolations`) on
+    the ranks that hold some of the points, else ``None``.
     """
     if not index[0].size:
         return None
@@ -322,9 +408,23 @@ def interpolate_from_below(
     stencils = [
         points.stencil(values, axis, below) for axis, values in enumerate(index)
     ]
+    quadratic = interpolation == "quadratic"
+    wide = (
+        [
+            points.quadratic_stencil(values, axis, below)
+            for axis, values in enumerate(index)
+        ]
+        if quadratic
+        else []
+    )
     buffer_box = tuple(
         (int(lower.min()), int(lower.max()) + 2) for lower, _ in stencils
     )
+    if quadratic:
+        buffer_box = tuple(
+            (min(lo, int(first.min())), max(hi, int(first.max()) + 3))
+            for (lo, hi), (first, _) in zip(buffer_box, wide, strict=True)
+        )
     shape = tuple(hi - lo for lo, hi in buffer_box)
     buffer, available = _coarse_buffer(
         hierarchy, points, patch, field_of, buffer_box, dtype, copies
@@ -343,16 +443,49 @@ def interpolate_from_below(
         corners.append((np.ravel_multi_index(tuple(at), shape), weight))
     total = np.sum([weight for _, weight in corners], axis=0)
     keep = total > 0.0
+    flat = np.stack([where for where, _ in corners], axis=1)
+    weights = np.stack(
+        [
+            np.divide(weight, total, where=keep, out=np.zeros_like(weight))
+            for _, weight in corners
+        ],
+        axis=1,
+    )
+    if quadratic:
+        # the three points per axis where all of them are there, else the bilinear ones
+        columns, products = [], []
+        complete = np.ones(index[0].shape, dtype=bool)
+        for point in itertools.product(range(3), repeat=len(index)):
+            weight = np.ones(index[0].shape)
+            at = []
+            for (first, lagrange), k, (start, _) in zip(
+                wide, point, buffer_box, strict=True
+            ):
+                weight = weight * lagrange[:, k]
+                at.append(first + k - start)
+            complete &= available[tuple(at)]
+            columns.append(np.ravel_multi_index(tuple(at), shape))
+            products.append(weight)
+        padding = len(columns) - flat.shape[1]
+        flat = np.where(
+            complete[:, None],
+            np.stack(columns, axis=1),
+            np.pad(flat, ((0, 0), (0, padding))),
+        )
+        weights = np.where(
+            complete[:, None],
+            np.stack(products, axis=1),
+            np.pad(weights, ((0, 0), (0, padding))),
+        )
+        keep |= complete
     if not keep.any() or array is None:
         return None
-    flat = np.stack([where[keep] for where, _ in corners], axis=1)
-    weights = np.stack([weight[keep] / total[keep] for _, weight in corners], axis=1)
     mine, storage = _storage_index(
         array, patch, tuple(values[keep] for values in index)
     )
     if not mine.any():
         return None
-    return _Bilinear(array, storage, buffer, flat[mine], weights[mine])
+    return _Bilinear(array, storage, buffer, flat[keep][mine], weights[keep][mine])
 
 
 def _minmod(*values: np.ndarray) -> np.ndarray:
@@ -648,6 +781,7 @@ class HaloExchange:
             tuple(values[keep] for values in index),
             dtype,
             copies,
+            self._interpolation,
         )
         if interpolation is not None:
             self._interpolations.append(interpolation)
@@ -696,8 +830,13 @@ class HaloExchange:
             below: list[Patch] = []
             under = np.zeros((len(mine), 0), dtype=bool)
             if level > 0:
+                # a quadratic stencil is one coarse point wider, and one-sided at walls
+                margin = 2 if self._interpolation == "quadratic" else 1
                 coarse = np.stack(
-                    [extended[..., 0] // ratio - 1, -(-extended[..., 1] // ratio) + 2],
+                    [
+                        extended[..., 0] // ratio - margin,
+                        -(-extended[..., 1] // ratio) + 1 + margin,
+                    ],
                     axis=-1,
                 )
                 below, under = touching(coarse, level - 1)
@@ -811,11 +950,17 @@ class HaloExchange:
         *,
         level: int | None = None,
         below: str | None = None,
+        interpolation: str = "bilinear",
     ) -> None:
         """Find where every halo point comes from (one ``allgather``).
 
         With ``level``, only for the patches of that level; with ``below``,
         interpolating field ``below`` of the level below instead of ``name``.
+        ``interpolation`` is ``"bilinear"`` (two coarse points per axis) or
+        ``"quadratic"`` (three, `_lagrange`): the halo points no patch of the
+        same level covers take it from the level below. The patch's own
+        points, those it shares with the level below included, are not
+        touched.
 
         The geometry of each patch's halo (which points come from which patch,
         and the interpolation weights) is kept on the hierarchy, by centering,
@@ -828,6 +973,11 @@ class HaloExchange:
         self._name = name
         self._below = name if below is None else below
         self._level = level
+        if interpolation not in INTERPOLATIONS:
+            raise ValueError(
+                f"interpolation must be one of {INTERPOLATIONS}, got {interpolation!r}"
+            )
+        self._interpolation = interpolation
         self._width = int(spec["halo"])
         nodal = spec["centering"] == "node"
         points = _Points(hierarchy, nodal)
@@ -835,8 +985,10 @@ class HaloExchange:
         self._interpolations: list[_Bilinear] = []
         dtype = spec["dtype"]
         kind = ("halo", nodal, self._width, np.dtype(dtype).str, repr(spec["split"]))
-        known = hierarchy._halo_records.get(kind, {})
+        # the copies within a level do not depend on the interpolation
         self._pairs_known = hierarchy._halo_records.get(("pairs", *kind), {})
+        kind += (interpolation,)
+        known = hierarchy._halo_records.get(kind, {})
         self._pairs_used: dict[tuple, list] = {}
         used: dict[tuple, _HaloRecord] = {}
         patches = {_key(patch): patch for patch in hierarchy.patches}
@@ -855,7 +1007,7 @@ class HaloExchange:
         pairs = self._pairs_used
         if level is not None:
             pairs = {**self._pairs_known, **pairs}
-        hierarchy._halo_records[("pairs", *kind)] = pairs
+        hierarchy._halo_records[("pairs", *kind[:-1])] = pairs
         del self._pairs_known, self._pairs_used
         self._plan = mpa.CopyPlan(self._copies, comm=hierarchy.comm)
         del self._copies

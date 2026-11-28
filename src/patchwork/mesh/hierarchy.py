@@ -970,12 +970,17 @@ class AMRHierarchy:
 
     @sp.profile("patchwork.exchange_halos", tags=PROFILE_TAGS)
     def exchange_halos(
-        self, name: str, *, level: int | None = None, below: str | None = None
+        self,
+        name: str,
+        *,
+        level: int | None = None,
+        below: str | None = None,
+        interpolation: str = "bilinear",
     ) -> None:
         """Fill the halo of every patch of field ``name`` from the rest of the hierarchy.
 
         From the patches of the same level the halo overlaps (across periodic
-        faces too), else by bilinear interpolation of the level below, and
+        faces too), else by interpolation of the level below, and
         between the ranks of each patch. Halo points outside the domain are
         left for the boundary conditions. Collective over ``comm``; the
         schedule is built at the first call and kept until a patch is added.
@@ -986,10 +991,18 @@ class AMRHierarchy:
         of field ``below`` (of the same centering) instead: for a level that
         takes several time steps for one of the level below (subcycling), a
         field that holds the level below at the time in between.
+
+        ``interpolation="quadratic"`` interpolates the level below with three
+        points per axis (biquadratic in 2D, triquadratic in 3D) instead of two:
+        the halo values are third order, so a second difference across a
+        coarse-fine edge (the 5-point Laplacian of a node potential, its
+        current) is first order instead of O(1). The patch's own points,
+        among them the nodes it shares with the level below, keep their
+        values. Each interpolation has its own schedule.
         """
         from patchwork.mesh.halos import HaloExchange
 
-        if level is None and below is None:
+        if level is None and below is None and interpolation == "bilinear":
             self._schedule("halo", name, HaloExchange).execute()
             return
         if below is not None and self.centering(below) != self.centering(name):
@@ -999,9 +1012,11 @@ class AMRHierarchy:
             )
 
         def build(hierarchy: AMRHierarchy, field: str) -> HaloExchange:
-            return HaloExchange(hierarchy, field, level=level, below=below)
+            return HaloExchange(
+                hierarchy, field, level=level, below=below, interpolation=interpolation
+            )
 
-        self._schedule(f"halo/{level}/{below}", name, build).execute()
+        self._schedule(f"halo/{level}/{below}/{interpolation}", name, build).execute()
 
     @sp.profile("patchwork.restrict", tags=PROFILE_TAGS)
     def restrict(self, name: str, *, level: int | None = None) -> None:

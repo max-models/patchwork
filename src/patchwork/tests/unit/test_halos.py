@@ -299,3 +299,143 @@ def test_the_halo_schedule_of_many_patches_matches_their_neighbours() -> None:
             np.testing.assert_allclose(
                 with_halo[inner, -1], expected[:, -1], atol=1e-12
             )
+
+
+def _quadratic(*x):
+    """A full quadratic polynomial in 1, 2 or 3 variables."""
+    value = 1.0 + 0.5 * x[0] - 0.8 * x[0] ** 2
+    for axis, xa in enumerate(x[1:], start=1):
+        value = value + (axis - 2.5) * xa + 0.3 * axis * xa**2 - 0.7 * x[0] * xa
+    if len(x) == 3:
+        value = value + 1.1 * x[1] * x[2]
+    return value
+
+
+def _fill_levels(mesh, function, nodal, halo, offset=None):
+    """``function`` at the own points of every patch (plus ``offset[level]``), halos at the sentinel.
+
+    Returns the exact values on each local patch's storage, by patch.
+    """
+    exact = {}
+    shift = 0.0 if nodal else 0.5
+    for patch in mesh.local_patches:
+        h = mesh.spacing(patch.level)
+        lower = mesh.lower_bound
+        axes = [
+            x0 + (np.arange(b0 - halo, b1 + halo + (1 if nodal else 0)) + shift) * dx
+            for (b0, b1), dx, x0 in zip(patch.box, h, lower, strict=True)
+        ]
+        values = function(*np.meshgrid(*axes, indexing="ij"))
+        storage = patch.field("u").local_with_halos
+        storage[...] = SENTINEL
+        inner = (slice(halo, -halo),) * mesh.ndim
+        storage[inner] = values[inner] + (offset or {}).get(patch.level, 0.0)
+        exact[id(patch)] = values
+    return exact
+
+
+@pytest.mark.parametrize("centering", ["node", "cell"])
+@pytest.mark.parametrize("ndim", [1, 2, 3])
+def test_quadratic_halos_reproduce_quadratic_polynomials(centering, ndim) -> None:
+    nodal = centering == "node"
+    base = (8, 6, 4)[:ndim]
+    mesh = AMRHierarchy(base_shape=base, comm=WORLD)
+    # one patch at the lower walls, one inside
+    mesh.add_patch(level=1, box=tuple((0, 6) for _ in range(ndim)))
+    mesh.add_patch(level=1, box=((10, 14),) + tuple((2, 6) for _ in range(ndim - 1)))
+    mesh.allocate_field("u", halo=HALO, centering=centering, split=None)
+    exact = _fill_levels(mesh, _quadratic, nodal, HALO)
+
+    mesh.exchange_halos("u", interpolation="quadratic")
+
+    for patch in mesh.local_patches:
+        values = np.asarray(patch.field("u").local_with_halos)
+        inside = values != SENTINEL
+        # the halo points in the domain are filled, and exactly
+        own = np.prod([hi - lo + (1 if nodal else 0) for lo, hi in patch.box])
+        assert patch.level == 0 or inside.sum() > own
+        np.testing.assert_allclose(
+            values[inside], exact[id(patch)][inside], rtol=0, atol=1e-12
+        )
+    # the bilinear halos are not exact for it
+    mesh.exchange_halos("u")
+    errors = [
+        np.abs(np.asarray(p.field("u").local_with_halos) - exact[id(p)]).max()
+        for p in mesh.local_patches
+        if p.level == 1
+    ]
+    assert WORLD.allreduce(max(errors, default=0.0), op=MPI.MAX) > 1e-4
+
+
+def test_quadratic_halos_keep_the_shared_nodes() -> None:
+    mesh = AMRHierarchy(base_shape=(8, 8), comm=WORLD)
+    mesh.add_patch(level=1, box=((4, 12), (4, 12)))
+    mesh.allocate_field("u", halo=HALO, centering="node", split=None)
+    # the fine level disagrees with the coarse one by 5: its own nodes, those it
+    # shares with the coarse level included, must keep their values
+    _fill_levels(mesh, _quadratic, True, HALO, offset={1: 5.0})
+    before = {
+        id(p): np.array(p.field("u").local_with_halos) for p in mesh.local_patches
+    }
+
+    mesh.exchange_halos("u", interpolation="quadratic")
+
+    for patch in mesh.local_patches:
+        values = np.asarray(patch.field("u").local_with_halos)
+        own = (slice(HALO, -HALO),) * 2
+        np.testing.assert_array_equal(values[own], before[id(patch)][own])
+        if patch.level == 1:
+            # halo nodes on coarse nodes take the coarse value (no offset)
+            halo = np.ones(values.shape, dtype=bool)
+            halo[own] = False
+            assert np.all(np.abs(values[halo] - before[id(patch)][halo]) > 1.0)
+
+
+def _laplacian_error(n: int, interpolation: str, periodic: bool) -> float:
+    """Max error of the 5-point Laplacian at the edge nodes of a fine node patch."""
+
+    def function(x, y):
+        return np.sin(2.0 * np.pi * x + 0.3) * np.cos(2.0 * np.pi * y - 0.2)
+
+    mesh = AMRHierarchy(base_shape=(n, n), periodic=(periodic,) * 2, comm=WORLD)
+    # inside, or at the upper corner of a periodic domain (halos across the seam)
+    box = ((n, 2 * n),) * 2 if periodic else ((n // 2, 3 * n // 2),) * 2
+    mesh.add_patch(level=1, box=box)
+    mesh.allocate_field("u", halo=1, centering="node", split=None)
+    exact = _fill_levels(mesh, function, True, 1)
+    mesh.exchange_halos("u", interpolation=interpolation)
+    error = 0.0
+    for patch in mesh.local_patches:
+        if patch.level != 1:
+            continue
+        u = np.asarray(patch.field("u").local_with_halos)
+        h = mesh.spacing(1)[0]
+        lap = (
+            u[2:, 1:-1] + u[:-2, 1:-1] + u[1:-1, 2:] + u[1:-1, :-2] - 4 * u[1:-1, 1:-1]
+        ) / h**2
+        expected = -8.0 * np.pi**2 * exact[id(patch)][1:-1, 1:-1]
+        edge = np.ones(lap.shape, dtype=bool)
+        edge[1:-1, 1:-1] = False  # the nodes on the coarse-fine edge
+        error = max(error, float(np.abs(lap - expected)[edge].max()))
+    return WORLD.allreduce(error, op=MPI.MAX)
+
+
+@pytest.mark.parametrize("periodic", [False, True], ids=["bounded", "periodic"])
+def test_the_laplacian_at_a_coarse_fine_edge_converges_with_quadratic_halos(
+    periodic,
+) -> None:
+    sizes = (8, 16, 32)
+    bilinear = [_laplacian_error(n, "bilinear", periodic) for n in sizes]
+    quadratic = [_laplacian_error(n, "quadratic", periodic) for n in sizes]
+    # bilinear: O(1), does not go down; quadratic: first order or better
+    assert bilinear[-1] > 0.5 * bilinear[0]
+    assert bilinear[-1] > 1.0
+    orders = np.log2(np.array(quadratic[:-1]) / np.array(quadratic[1:]))
+    assert np.all(orders > 0.9), (quadratic, orders)
+    assert quadratic[-1] < 0.1 * bilinear[-1]
+
+
+def test_an_unknown_interpolation_is_refused() -> None:
+    mesh = hierarchy("node")
+    with pytest.raises(ValueError, match="interpolation must be one of"):
+        mesh.exchange_halos("u", interpolation="cubic")
