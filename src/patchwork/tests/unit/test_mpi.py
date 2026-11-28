@@ -43,6 +43,7 @@ def test_patches_on_some_ranks_give_what_one_rank_gives(ranks: int) -> None:
     "tests",
     [
         "test_halos.py",
+        "test_staggered.py",
         "test_regrid.py",
         "test_quadtree.py",
         "test_markers.py",
