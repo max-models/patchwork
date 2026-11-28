@@ -31,6 +31,45 @@ DIMENSIONS = (1, 2, 3)
 #: axisymmetric ``(r, z)`` plane of a body of revolution (``"cylindrical"``).
 GEOMETRIES = ("cartesian", "cylindrical")
 
+#: Where the values of a field sit: the cell centres, the nodes (cell corners), the faces
+#: normal to an axis or the edges along one (`staggering`).
+CENTERINGS = (
+    "cell",
+    "node",
+    "x-face",
+    "y-face",
+    "z-face",
+    "x-edge",
+    "y-edge",
+    "z-edge",
+)
+
+
+def staggering(centering: str, ndim: int) -> tuple[bool, ...]:
+    """Whether the points of a field of ``centering`` are nodes along each axis.
+
+    ``False`` along an axis: the points sit at the cell centres of that axis.
+    A cell-centered field is ``False`` along every axis, a node-centered one
+    ``True``; an ``x``-face is a node along ``x`` and a cell centre along the
+    others, an ``x``-edge the opposite. In 2D the ``z``-edges are the nodes and
+    the ``x``-edges the ``y``-faces; in 1D the ``x``-faces are the nodes and the
+    ``x``-edges the cells. A patch of ``n`` cells along an axis holds ``n + 1``
+    points along it where they are nodes, ``n`` where they are cell centres.
+    """
+    if centering not in CENTERINGS:
+        raise ValueError(f"centering must be one of {CENTERINGS}, got {centering!r}")
+    if centering in ("cell", "node"):
+        return (centering == "node",) * ndim
+    kind = centering[2:]
+    axis = "xyz".index(centering[0])
+    if kind == "face":
+        if axis >= ndim:
+            raise ValueError(f"a {ndim}D hierarchy has no {centering}s")
+        return tuple(a == axis for a in range(ndim))
+    if axis >= ndim and ndim != 2:
+        raise ValueError(f"a {ndim}D hierarchy has no {centering}s")
+    return tuple(a != axis for a in range(ndim))
+
 
 def _box(value: Sequence[Sequence[int]], ndim: int = 2) -> IndexBox:
     """Normalize and validate a half-open integer box of ``ndim`` axes."""
@@ -246,6 +285,32 @@ class Patch:
             axes.append(0.5 * (nodes[:-1] + nodes[1:]))
         return tuple(np.meshgrid(*axes, indexing="ij"))
 
+    def local_coordinates(self, hierarchy: AMRHierarchy, name: str) -> tuple[Any, ...]:
+        """Coordinates of this rank's points of field ``name``, of any centering.
+
+        One array per axis of the shape of ``field(name).local``, for filling
+        it: the nodes along the axes where the field's points are nodes
+        (`staggering`), the cell centres along the others.
+        """
+        import numpy as np
+
+        layout = self.field(name).layout
+        nodal = staggering(hierarchy.centering(name), hierarchy.ndim)
+        axes = []
+        for axis, ((i0, _), (b0, b1), on_nodes) in enumerate(
+            zip(self.box, layout.index_bounds, nodal, strict=True)
+        ):
+            if on_nodes:
+                axes.append(
+                    hierarchy.node_positions(self.level, axis)[i0 + b0 : i0 + b1]
+                )
+            else:
+                nodes = hierarchy.node_positions(self.level, axis)[
+                    i0 + b0 : i0 + b1 + 1
+                ]
+                axes.append(0.5 * (nodes[:-1] + nodes[1:]))
+        return tuple(np.meshgrid(*axes, indexing="ij"))
+
     def node_coordinates(self, hierarchy: AMRHierarchy) -> tuple[Any, ...]:
         """Coordinates of the nodes of the whole patch along each axis (1D arrays)."""
         return tuple(
@@ -332,8 +397,8 @@ class AMRHierarchy:
     Patch coordinates are integer cell bounds on their own refinement level.
     A child patch's bounds must align with the parent level and lie within the
     patches of that level. The refinement ratio is two by default. Fields
-    are cell-centered, or node-centered (one value per cell corner, see
-    `allocate_field`). ``periodic`` flags the axes on which the last
+    are cell-centered, node-centered (one value per cell corner), or on the
+    faces or edges (see `allocate_field`). ``periodic`` flags the axes on which the last
     cell neighbours the first; the node-centered solver
     (`NodalPoisson`) uses it. Without an MPI launcher,
     mpiarray supplies a serial communicator and the same interface works with a
@@ -845,7 +910,8 @@ class AMRHierarchy:
 
     def _zeros(self, patch: Patch, spec: dict[str, Any]) -> DistributedArray:
         """A zero array for one patch of a field with allocation ``spec``."""
-        shape = patch.node_shape if spec["centering"] == "node" else patch.shape
+        nodal = staggering(spec["centering"], self.ndim)
+        shape = tuple(n + on for n, on in zip(patch.shape, nodal, strict=True))
         return mpa.zeros(
             shape,
             dtype=spec["dtype"],
@@ -909,7 +975,7 @@ class AMRHierarchy:
         return patch
 
     def centering(self, name: str) -> str:
-        """``"cell"`` or ``"node"``: where the values of field ``name`` sit."""
+        """Where the values of field ``name`` sit: one of `CENTERINGS` (see `staggering`)."""
         try:
             return self._field_specs[name]["centering"]
         except KeyError as exc:
@@ -934,6 +1000,18 @@ class AMRHierarchy:
         ``(nx, ny)`` cells holds ``(nx + 1, ny + 1)`` of them, and patches that
         touch or nest share the nodes they have in common.
 
+        A face- or edge-centered field (``"x-face"``, ``"y-edge"``, ...;
+        `staggering`) is a node along some axes and a cell centre along the
+        others: an ``x``-face of a patch of ``(nx, ny, nz)`` cells holds
+        ``(nx + 1, ny, nz)`` values, an ``x``-edge ``(nx, ny + 1, nz + 1)``.
+        Patches share the faces and edges on their common boundaries as they do
+        the nodes. `exchange_halos`, `restrict` and `regrid` treat each axis by
+        its kind: restriction takes the mean of the fine points over the cell
+        axes and the coinciding fine point along the node axes (the mean value
+        over a coarse face, the mean along a coarse edge), so with a vector
+        potential on the edges the flux of its curl through a coarse face is
+        the sum of the fine fluxes. They are Cartesian only.
+
         A ``conservative`` field is an amount per area, such as a density, whose
         integral (`integral`) `regrid` keeps: it is restricted
         before a regrid, and the cells of new patches are filled from the level
@@ -942,8 +1020,11 @@ class AMRHierarchy:
         """
         if not name or name in self._field_specs:
             raise ValueError(f"field name must be non-empty and unique, got {name!r}")
-        if centering not in ("cell", "node"):
-            raise ValueError(f"centering must be 'cell' or 'node', got {centering!r}")
+        staggering(centering, self.ndim)  # checks it
+        if self.cylindrical and centering not in ("cell", "node"):
+            raise NotImplementedError(
+                f"{centering}-centered fields are Cartesian only, not in r–z"
+            )
         if conservative and centering != "cell":
             raise ValueError("a conservative field must be cell-centered")
         spec = {

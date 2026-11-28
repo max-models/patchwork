@@ -49,6 +49,7 @@ from patchwork.mesh.halos import (
     conservative_from_below,
     interpolate_from_below,
 )
+from patchwork.mesh.hierarchy import staggering
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -188,6 +189,10 @@ def gradient_tags(
     spec = hierarchy._field_specs.get(name)
     if spec is None:
         raise KeyError(f"hierarchy has no field {name!r}")
+    if spec["centering"] not in ("cell", "node"):
+        raise NotImplementedError(
+            f"gradient_tags takes cell- or node-centered fields, not {spec['centering']}s"
+        )
     nodal = spec["centering"] == "node"
     points = _Points(hierarchy, nodal)
     tags = {
@@ -962,13 +967,14 @@ def transfer(old: AMRHierarchy, new: AMRHierarchy, name: str) -> None:
     """Fill field ``name`` of ``new`` from ``old``, level by level (collective).
 
     A point of a new patch takes the value of an old patch of the same level
-    that has it, else the bilinear interpolation of the new level below (for a
+    that has it, else the (bi/tri)linear interpolation of the new level below,
+    per axis by its kind for a face or edge field (for a
     conservative field, the conservative one of
     `conservative_from_below`). Only the patches' own
     points are written; the halos stay zero.
     """
     spec = new._field_specs[name]
-    nodal = spec["centering"] == "node"
+    nodal = staggering(spec["centering"], new.ndim)
     conservative = spec["conservative"]
     old_points = _Points(old, nodal)
     points = _Points(new, nodal)

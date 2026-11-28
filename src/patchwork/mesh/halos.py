@@ -31,6 +31,8 @@ import mpiarray as mpa
 import numpy as np
 from methodcard import ConvergenceProblem, method
 
+from patchwork.mesh.hierarchy import staggering
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -169,11 +171,17 @@ def _lagrange(t: np.ndarray) -> np.ndarray:
 
 
 class _Points:
-    """The points a field of one centering has on a hierarchy, level by level."""
+    """The points a field of one centering has on a hierarchy, level by level.
 
-    def __init__(self, hierarchy: AMRHierarchy, nodal: bool) -> None:
+    ``nodal`` says, per axis, whether the points are nodes along it (else cell
+    centres): `patchwork.mesh.hierarchy.staggering`; a bool for all axes.
+    """
+
+    def __init__(self, hierarchy: AMRHierarchy, nodal: bool | Sequence[bool]) -> None:
         self.hierarchy = hierarchy
-        self.nodal = nodal
+        if isinstance(nodal, bool):
+            nodal = (nodal,) * hierarchy.ndim
+        self.nodal = tuple(bool(on) for on in nodal)
         self.ratio = hierarchy.refinement_ratio
         self.periodic = hierarchy.periodic
         self._domains: dict[int, np.ndarray] = {}
@@ -182,8 +190,9 @@ class _Points:
 
     def own(self, patch: Patch) -> Box:
         """The patch's points as a half-open box of level indices."""
-        extra = 1 if self.nodal else 0
-        return tuple((lo, hi + extra) for lo, hi in patch.box)
+        return tuple(
+            (lo, hi + on) for (lo, hi), on in zip(patch.box, self.nodal, strict=True)
+        )
 
     def near(self, level: int, box: Box) -> list[Patch]:
         """The patches of ``level`` that may overlap ``box`` or one of its periodic images.
@@ -232,22 +241,19 @@ class _Points:
         """Whether points (level indices, possibly beyond the domain) are in it.
 
         ``index`` holds one array per axis. A cell is if it is a cell of the
-        domain; a node if one of the cells around it is.
+        domain; a node if one of the cells around it is (along each axis on
+        which the points are nodes).
         """
         cells = self._domain(level)
         shape = cells.shape
         if self._whole(level):  # the domain fills its box: a bounds check
             inside = np.ones(index[0].shape, dtype=bool)
-            top = 1 if self.nodal else 0
             for axis, values in enumerate(index):
                 if not self.periodic[axis]:
-                    inside &= (values >= 0) & (values < shape[axis] + top)
+                    top = shape[axis] + self.nodal[axis]
+                    inside &= (values >= 0) & (values < top)
             return inside
-        offsets = (
-            itertools.product((0, -1), repeat=len(index))
-            if self.nodal
-            else [(0,) * len(index)]
-        )
+        offsets = itertools.product(*(((0, -1) if on else (0,)) for on in self.nodal))
         inside = np.zeros(index[0].shape, dtype=bool)
         for offset in offsets:
             where, valid = [], np.ones(index[0].shape, dtype=bool)
@@ -272,12 +278,12 @@ class _Points:
         one of the two would lie beyond it, the two points inside are taken and
         the value is extrapolated linearly (a weight outside [0, 1]).
         """
-        if self.nodal:
+        if self.nodal[axis]:
             position = fine / self.ratio
         else:
             position = (fine + 0.5) / self.ratio - 0.5
         lower = np.floor(position).astype(np.int64)
-        count = self.hierarchy.level_shape(level)[axis] + (1 if self.nodal else 0)
+        count = self.hierarchy.level_shape(level)[axis] + self.nodal[axis]
         if not self.periodic[axis] and count >= 2:
             lower = np.clip(lower, 0, count - 2)
         return lower, position - lower
@@ -293,13 +299,13 @@ class _Points:
         Next to a wall of a non-periodic axis the three points inside are taken
         (a one-sided stencil).
         """
-        if self.nodal:
+        if self.nodal[axis]:
             position = fine / self.ratio
         else:
             position = (fine + 0.5) / self.ratio - 0.5
         lower = np.floor(position).astype(np.int64)
         first = np.where(position - lower <= 0.5, lower - 1, lower)
-        count = self.hierarchy.level_shape(level)[axis] + (1 if self.nodal else 0)
+        count = self.hierarchy.level_shape(level)[axis] + self.nodal[axis]
         if not self.periodic[axis] and count >= 3:
             first = np.clip(first, 0, count - 3)
         return first, _lagrange(position - first)
@@ -979,7 +985,7 @@ class HaloExchange:
             )
         self._interpolation = interpolation
         self._width = int(spec["halo"])
-        nodal = spec["centering"] == "node"
+        nodal = staggering(spec["centering"], hierarchy.ndim)
         points = _Points(hierarchy, nodal)
         self._copies: list[tuple] = []
         self._interpolations: list[_Bilinear] = []
@@ -1026,6 +1032,7 @@ class HaloExchange:
     equations={
         "cells": r"u_c = \frac{\sum_{f \subset c} V_f\, u_f}{\sum_{f \subset c} V_f}",
         "nodes": r"u_c = u_f \quad \text{at the coinciding fine node}",
+        "faces_and_edges": r"u_c = \frac{1}{r^{k}} \sum_{f} u_f \quad \text{over the } r^k \text{ fine points that tile it along its } k \text{ cell axes}",
     },
     assumptions=(
         "finest level first, or one level; volume-weighted in $(r, z)$, a plain mean in the plane",
@@ -1037,7 +1044,9 @@ class Restriction:
 
     Cell-centered: the mean of the fine cells of each coarse cell, weighted by
     their volumes in r–z (where they grow with the radius).
-    Node-centered: the fine node at each coarse node. Only the points of each
+    Node-centered: the fine node at each coarse node. On faces and edges: the
+    coinciding fine points along the node axes, their mean over the cell axes
+    (the mean value over a coarse face, or along a coarse edge). Only the points of each
     rank's block are written; the halos follow with `HaloExchange`.
     Collective over the hierarchy's communicator, as is `execute`.
     """
@@ -1056,7 +1065,8 @@ class Restriction:
         ratio = self._ratio
         spec = hierarchy._field_specs[name]
         under = tuple(
-            (lo // ratio, hi // ratio + (1 if nodal else 0)) for lo, hi in fine.box
+            (lo // ratio, hi // ratio + on)
+            for (lo, hi), on in zip(fine.box, nodal, strict=True)
         )
         for coarse in points.near(fine.level - 1, under):
             # across a periodic face too: a node on it is also the one at the start
@@ -1065,10 +1075,10 @@ class Restriction:
                 if part is None:
                     continue
                 back = _shift(part, tuple(-d for d in shift))
-                if nodal:
-                    region = tuple((s * ratio, (e - 1) * ratio + 1) for s, e in back)
-                else:
-                    region = tuple((s * ratio, e * ratio) for s, e in back)
+                region = tuple(
+                    (s * ratio, (e - 1) * ratio + 1) if on else (s * ratio, e * ratio)
+                    for (s, e), on in zip(back, nodal, strict=True)
+                )
                 shape = tuple(e - s for s, e in region)
                 buffer = (
                     mpa.zeros(shape, dtype=spec["dtype"], split=None, comm=coarse.comm)
@@ -1093,7 +1103,7 @@ class Restriction:
     def __init__(self, hierarchy: AMRHierarchy, name: str) -> None:
         """Find where every fine region goes (one ``allgather``)."""
         spec = hierarchy._field_specs[name]
-        nodal = spec["centering"] == "node"
+        nodal = staggering(spec["centering"], hierarchy.ndim)
         points = _Points(hierarchy, nodal)
         ratio = hierarchy.refinement_ratio
         self._name = name
@@ -1116,15 +1126,23 @@ class Restriction:
         hierarchy = self._hierarchy
         for array, target, buffer, (level, first) in writes:
             fine = np.asarray(buffer.local_with_halos)
-            if self._nodal:
+            nodal = self._nodal
+            if all(nodal):
                 coarse = fine[(slice(None, None, r),) * fine.ndim]
             else:
-                counts = [size // r for size in fine.shape]
-                blocks = [part for n in counts for part in (n, r)]
-                # the axes of the fine cells within each coarse cell
+                # along the node axes the coinciding fine points, over the cell axes
+                # the mean of the fine points within each coarse one
+                fine = fine[
+                    tuple(slice(None, None, r) if on else slice(None) for on in nodal)
+                ]
+                blocks = [
+                    part
+                    for size, on in zip(fine.shape, nodal, strict=True)
+                    for part in ((size, 1) if on else (size // r, r))
+                ]
                 within = tuple(range(1, 2 * fine.ndim, 2))
                 if hierarchy.cylindrical:
-                    n, m = counts
+                    n, m = (size // r for size in fine.shape)
                     # the fine cells of a coarse cell differ only in their radius
                     weight = hierarchy.cell_volumes(
                         level, first + np.arange(n * r), np.zeros(1, dtype=np.int64)

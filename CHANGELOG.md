@@ -5,6 +5,17 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Face- and edge-centered patch fields: `allocate_field(..., centering="x-face")` (a node
+  along x, a cell centre along the other axes), `"x-edge"` (the opposite), and the same for y
+  and z (`CENTERINGS`, `staggering`). Halo exchange (same level, periodic images, linear or
+  quadratic interpolation of the level below), restriction and the regrid transfer take each
+  axis by its kind; restriction averages over the cell axes and takes the coinciding fine
+  point along the node axes, so the curl of a restricted edge potential has the fine fluxes
+  through every coarse face (constrained transport on the composite mesh in 3D). Cartesian
+  only. `Patch.local_coordinates` gives the points of a field of any centering.
+
 ### Changed
 
 - `CompositeNodes.deposit(..., patches=out)` gives every point its patch (what

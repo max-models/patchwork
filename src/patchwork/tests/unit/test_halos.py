@@ -12,6 +12,7 @@ import pytest
 from maybempi import MPI
 
 from patchwork import AMRHierarchy
+from patchwork.mesh.hierarchy import staggering
 
 WORLD = MPI.COMM_WORLD
 SIZE = WORLD.Get_size()
@@ -46,9 +47,13 @@ def periodic(x, y):
     return 1.0 + 2.0 * x + 0.3 * np.cos(2.0 * np.pi * y)
 
 
-def own_points(mesh: AMRHierarchy, patch, nodal: bool):
-    extra = 1 if nodal else 0
-    return tuple((lo, hi + extra) for lo, hi in patch.box)
+#: The centerings of the 2D checks: cells, nodes and the two kinds of faces (the
+#: x-faces are the y-edges in 2D, the y-faces the x-edges).
+CENTERINGS_2D = ["cell", "node", "x-face", "y-face"]
+
+
+def own_points(mesh: AMRHierarchy, patch, nodal: tuple[bool, ...]):
+    return tuple((lo, hi + on) for (lo, hi), on in zip(patch.box, nodal, strict=True))
 
 
 def contains(mesh, level, i, j, nodal):
@@ -76,8 +81,7 @@ def storage_points(mesh, patch, nodal):
 
 def coordinates(mesh, level, i, j, nodal):
     dx, dy = mesh.spacing(level)
-    shift = 0.0 if nodal else 0.5
-    return (i + shift) * dx, (j + shift) * dy
+    return (i + 0.5 * (not nodal[0])) * dx, (j + 0.5 * (not nodal[1])) * dy
 
 
 def fill(mesh, function, nodal, interior_only=True):
@@ -95,8 +99,8 @@ def complete_stencil(mesh, level, i, j, nodal):
     ratio = mesh.refinement_ratio
     ok = np.ones(i.shape, dtype=bool)
     stencil = []
-    for values in (i, j):
-        position = values / ratio if nodal else (values + 0.5) / ratio - 0.5
+    for values, on in zip((i, j), nodal, strict=True):
+        position = values / ratio if on else (values + 0.5) / ratio - 0.5
         lower = np.floor(position).astype(int)
         stencil.append((lower, position - lower))
     (ci, wi), (cj, wj) = stencil
@@ -105,16 +109,16 @@ def complete_stencil(mesh, level, i, j, nodal):
         for b in (0, 1):
             weight = (wi if a else 1 - wi) * (wj if b else 1 - wj)
             pi, pj = ci + a, cj + b
-            inside = (pi >= 0) & (pi < n_x + (1 if nodal else 0))
+            inside = (pi >= 0) & (pi < n_x + nodal[0])
             there = contains(mesh, level - 1, np.clip(pi, 0, None), pj, nodal) & inside
             ok &= (weight == 0.0) | there
     return ok
 
 
-@pytest.mark.parametrize("centering", ["cell", "node"])
+@pytest.mark.parametrize("centering", CENTERINGS_2D)
 @pytest.mark.parametrize("function", [linear, periodic], ids=["linear", "periodic"])
 def test_every_halo_point_gets_its_value(centering, function) -> None:
-    nodal = centering == "node"
+    nodal = staggering(centering, 2)
     mesh = hierarchy(centering)
     fill(mesh, function, nodal)
 
@@ -129,7 +133,7 @@ def test_every_halo_point_gets_its_value(centering, function) -> None:
         (x0, x1), (y0, y1) = own_points(mesh, patch, nodal)
         ghost = ~((i >= x0) & (i < x1) & (j >= y0) & (j < y1))
         n_x = mesh.level_shape(level)[0]
-        outside = (i < 0) | (i >= n_x + (1 if nodal else 0))
+        outside = (i < 0) | (i >= n_x + nodal[0])
         copied = ghost & ~outside & contains(mesh, level, i, j, nodal)
         rest = ghost & ~outside & ~copied
 
@@ -155,9 +159,9 @@ def test_every_halo_point_gets_its_value(centering, function) -> None:
     assert all(totals.values()), totals  # every kind of halo point was seen
 
 
-@pytest.mark.parametrize("centering", ["cell", "node"])
+@pytest.mark.parametrize("centering", CENTERINGS_2D)
 def test_restriction_goes_down_level_by_level(centering) -> None:
-    nodal = centering == "node"
+    nodal = staggering(centering, 2)
     mesh = hierarchy(centering)
     by_level = {
         0: lambda x, y: np.full_like(x, SENTINEL),
@@ -173,6 +177,24 @@ def test_restriction_goes_down_level_by_level(centering) -> None:
     mesh.restrict("u")
 
     ratio = mesh.refinement_ratio
+
+    def children(i, j, scale):
+        """The fine points a coarse point takes: coinciding along node axes, all along cell axes."""
+        offsets = [(0,) if on else range(scale) for on in nodal]
+        return [(i * scale + a, j * scale + b) for a in offsets[0] for b in offsets[1]]
+
+    def under(level, i, j):
+        """Whether all the points of ``level + 1`` that a point of ``level`` takes are there."""
+        found = np.ones(i.shape, dtype=bool)
+        for ci, cj in children(i, j, ratio):
+            found &= contains(mesh, level + 1, ci, cj, nodal)
+        return found
+
+    def level1(ci, cj):
+        """A level-1 point after the restriction: level 2's mean where under it."""
+        own = linear(*coordinates(mesh, 1, ci, cj, nodal))
+        return np.where(under(1, ci, cj), own, own + 100.0)
+
     for patch in mesh.local_patches:
         if patch.level == 2:
             continue
@@ -181,46 +203,16 @@ def test_restriction_goes_down_level_by_level(centering) -> None:
         i, j = i[inner], j[inner]
         values = np.asarray(patch.field("u").local_with_halos)[inner]
         expected = by_level[patch.level](*coordinates(mesh, patch.level, i, j, nodal))
-        # under level-2 patches: the fine values, through level 1 for level 0
-        for finer in range(patch.level + 1, 3):
-            scale = ratio ** (finer - patch.level)
-            if nodal:
-                fi, fj = i * scale, j * scale
-                under = contains(mesh, finer, fi, fj, nodal)
-                value = linear if finer == 2 else by_level[1]
-                fine_value = value(*coordinates(mesh, finer, fi, fj, nodal))
-            else:
-                children = [
-                    (i * scale + a, j * scale + b)
-                    for a in range(scale)
-                    for b in range(scale)
-                ]
-                under = np.ones(i.shape, dtype=bool)
-                for ci, cj in children:
-                    under &= contains(mesh, finer, ci, cj, nodal)
-                fine_value = linear(*coordinates(mesh, patch.level, i, j, nodal))
-                if finer == 1:
-                    # a level-0 cell under level 1: the mean of its level-1 cells,
-                    # each the mean of level 2 (exact) or level 1's own value
-                    level1 = np.zeros(i.shape)
-                    for ci, cj in children:
-                        own = linear(*coordinates(mesh, 1, ci, cj, nodal))
-                        deeper = np.ones(i.shape, dtype=bool)
-                        for a in range(ratio):
-                            for b in range(ratio):
-                                deeper &= contains(
-                                    mesh, 2, ci * ratio + a, cj * ratio + b, nodal
-                                )
-                        level1 += np.where(deeper, own, own + 100.0)
-                    fine_value = level1 / len(children)
-            expected = np.where(under, fine_value, expected)
-            if nodal and finer == 1:
-                # a level-0 node under a level-2 node gets the level-2 value
-                deep = contains(mesh, 2, i * ratio**2, j * ratio**2, nodal) & under
-                expected = np.where(
-                    deep, linear(*coordinates(mesh, 0, i, j, nodal)), expected
-                )
+        covered = under(patch.level, i, j)
+        if patch.level == 1:
+            # the mean of a linear function over the fine points is its value
+            fine = linear(*coordinates(mesh, 1, i, j, nodal))
+        else:
+            parts = children(i, j, ratio)
+            fine = sum(level1(ci, cj) for ci, cj in parts) / len(parts)
+        expected = np.where(covered, fine, expected)
         np.testing.assert_allclose(values, expected, rtol=0, atol=1e-9)
+        assert covered.any() or patch.level == 1 or SIZE > 1
 
 
 def test_schedules_are_kept_until_a_patch_is_added() -> None:
@@ -311,19 +303,19 @@ def _quadratic(*x):
     return value
 
 
-def _fill_levels(mesh, function, nodal, halo, offset=None):
+def _fill_levels(mesh, function, centering, halo, offset=None):
     """``function`` at the own points of every patch (plus ``offset[level]``), halos at the sentinel.
 
     Returns the exact values on each local patch's storage, by patch.
     """
     exact = {}
-    shift = 0.0 if nodal else 0.5
+    nodal = staggering(centering, mesh.ndim)
     for patch in mesh.local_patches:
         h = mesh.spacing(patch.level)
         lower = mesh.lower_bound
         axes = [
-            x0 + (np.arange(b0 - halo, b1 + halo + (1 if nodal else 0)) + shift) * dx
-            for (b0, b1), dx, x0 in zip(patch.box, h, lower, strict=True)
+            x0 + (np.arange(b0 - halo, b1 + halo + on) + 0.5 * (not on)) * dx
+            for (b0, b1), dx, x0, on in zip(patch.box, h, lower, nodal, strict=True)
         ]
         values = function(*np.meshgrid(*axes, indexing="ij"))
         storage = patch.field("u").local_with_halos
@@ -334,17 +326,17 @@ def _fill_levels(mesh, function, nodal, halo, offset=None):
     return exact
 
 
-@pytest.mark.parametrize("centering", ["node", "cell"])
+@pytest.mark.parametrize("centering", ["node", "cell", "x-face", "x-edge"])
 @pytest.mark.parametrize("ndim", [1, 2, 3])
 def test_quadratic_halos_reproduce_quadratic_polynomials(centering, ndim) -> None:
-    nodal = centering == "node"
+    nodal = staggering(centering, ndim)
     base = (8, 6, 4)[:ndim]
     mesh = AMRHierarchy(base_shape=base, comm=WORLD)
     # one patch at the lower walls, one inside
     mesh.add_patch(level=1, box=tuple((0, 6) for _ in range(ndim)))
     mesh.add_patch(level=1, box=((10, 14),) + tuple((2, 6) for _ in range(ndim - 1)))
     mesh.allocate_field("u", halo=HALO, centering=centering, split=None)
-    exact = _fill_levels(mesh, _quadratic, nodal, HALO)
+    exact = _fill_levels(mesh, _quadratic, centering, HALO)
 
     mesh.exchange_halos("u", interpolation="quadratic")
 
@@ -352,7 +344,9 @@ def test_quadratic_halos_reproduce_quadratic_polynomials(centering, ndim) -> Non
         values = np.asarray(patch.field("u").local_with_halos)
         inside = values != SENTINEL
         # the halo points in the domain are filled, and exactly
-        own = np.prod([hi - lo + (1 if nodal else 0) for lo, hi in patch.box])
+        own = np.prod(
+            [hi - lo + on for (lo, hi), on in zip(patch.box, nodal, strict=True)]
+        )
         assert patch.level == 0 or inside.sum() > own
         np.testing.assert_allclose(
             values[inside], exact[id(patch)][inside], rtol=0, atol=1e-12
@@ -373,7 +367,7 @@ def test_quadratic_halos_keep_the_shared_nodes() -> None:
     mesh.allocate_field("u", halo=HALO, centering="node", split=None)
     # the fine level disagrees with the coarse one by 5: its own nodes, those it
     # shares with the coarse level included, must keep their values
-    _fill_levels(mesh, _quadratic, True, HALO, offset={1: 5.0})
+    _fill_levels(mesh, _quadratic, "node", HALO, offset={1: 5.0})
     before = {
         id(p): np.array(p.field("u").local_with_halos) for p in mesh.local_patches
     }
@@ -402,7 +396,7 @@ def _laplacian_error(n: int, interpolation: str, periodic: bool) -> float:
     box = ((n, 2 * n),) * 2 if periodic else ((n // 2, 3 * n // 2),) * 2
     mesh.add_patch(level=1, box=box)
     mesh.allocate_field("u", halo=1, centering="node", split=None)
-    exact = _fill_levels(mesh, function, True, 1)
+    exact = _fill_levels(mesh, function, "node", 1)
     mesh.exchange_halos("u", interpolation=interpolation)
     error = 0.0
     for patch in mesh.local_patches:
